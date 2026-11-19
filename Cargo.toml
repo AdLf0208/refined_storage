@@ -1,0 +1,25 @@
+[package]
+# Port of Refined Storage 2.0.9 (refinedmods/refinedstorage2, MIT), Minecraft
+# Java 1.21.1 NeoForge; the port targets Horizon 26.3 at the pin in
+# horizon-mod.toml. Clean-room Rust rewrite from the mod's behaviour
+# (FINDINGS.md); local-only until publishing is approved, publishable under MIT
+# with this source.
+#
+# Cargo's name and version are not the mod's identity: horizon-mod.toml is.
+name = "refinedstorage"
+version = "0.2.0"
+edition = "2024"
+license = "MIT"
+description = "Refined Storage for Horizon: the item network core"
+publish = false
+
+[dependencies]
+# The pinned SDK's API crate, fetched into .horizon/sdk/ by any `cargo horizon-mod` command
+# (the launcher builds against its own copy of the same build). Any other registry dependency
+# must be pinned with `horizon-launcher native-lock .` before building.
+horizon-mod-api = { path = ".horizon/sdk/api/crates/horizon-mod-api" }
+# No second path dependency. The launcher removes the API's path dependency and supplies it as
+# an `--extern`; it supplies no `horizon_core`, so a direct path to it made `native-build` fail
+# with `error: No such file or directory (os error 2)`. Saved-compound keys are read with
+# `support::field` (`Tag::get(&str)`'s shape over the compound) and written with `KEY.into()`,
+# which `Compound::insert` accepts; the API re-exports `Compound`/`Tag` for both.
