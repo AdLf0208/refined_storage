@@ -1,0 +1,9 @@
+{
+  "type": "minecraft:smelting",
+  "ingredient": "#c:gems/quartz",
+  "experience": 0.5,
+  "cookingtime": 200,
+  "result": {
+    "id": "refinedstorage:silicon"
+  }
+}

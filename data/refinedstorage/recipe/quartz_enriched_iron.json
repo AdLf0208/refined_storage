@@ -1,0 +1,15 @@
+{
+  "type": "minecraft:crafting_shaped",
+  "pattern": [
+    "II",
+    "IQ"
+  ],
+  "key": {
+    "I": "#c:ingots/iron",
+    "Q": "#c:gems/quartz"
+  },
+  "result": {
+    "id": "refinedstorage:quartz_enriched_iron",
+    "count": 4
+  }
+}

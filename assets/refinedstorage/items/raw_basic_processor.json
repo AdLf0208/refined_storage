@@ -1,0 +1,6 @@
+{
+  "model": {
+    "model": "refinedstorage:item/raw_basic_processor",
+    "type": "minecraft:model"
+  }
+}

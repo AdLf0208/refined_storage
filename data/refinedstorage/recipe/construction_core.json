@@ -1,0 +1,10 @@
+{
+  "type": "minecraft:crafting_shapeless",
+  "ingredients": [
+    "refinedstorage:basic_processor",
+    "#c:dusts/glowstone"
+  ],
+  "result": {
+    "id": "refinedstorage:construction_core"
+  }
+}

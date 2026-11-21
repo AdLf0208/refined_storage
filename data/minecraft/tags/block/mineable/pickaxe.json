@@ -2,6 +2,7 @@
   "values": [
     "refinedstorage:controller",
     "refinedstorage:disk_drive",
-    "refinedstorage:grid"
+    "refinedstorage:grid",
+    "refinedstorage:machine_casing"
   ]
 }

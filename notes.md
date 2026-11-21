@@ -19,10 +19,10 @@ the network; no entities, renderers, dimensions or new vanilla hooks.
 Ported now because it is the **#1 core base** of the core-first queue: 13
 pending ATM10 mods depend on it (`ports/tools/port_queue.py`).
 
-Status: **slice 1 migrated to the SDK format (0.2.0)** — Controller + Cable +
-Disk Drive + 1k Storage Disk + Grid: the item-storage network core, now one
-flat `.hmod` with `api = "0.2"` (see `## Migration to the SDK format` at the
-end). Everything else is the gap list below, not a claim.
+Status: **slice 2 — the crafting chain (0.2.2)** — the network core of slice 1 plus the
+Refined Storage crafting chain it needs (14 items and the `machine_casing` block) and the
+21 recipes that reach the five shipped blocks/items, every one of them crafted in game (see
+`## Slice 2` at the end). Everything else is the gap list below, not a claim.
 
 > The sections from `## Behaviour` to `### Verification after the repairs`
 > describe the **retired `.hnmod`** layout. They are kept as history: the
@@ -117,10 +117,13 @@ and in the gaps below.
    grids, autocrafting, fluid storage and disks, the other disk sizes (4k/16k/
    64k/creative), storage blocks, upgrades, the config file, and the coloured
    variants of every block (the slice has the default colour only).
-3. **No recipes.** Every recipe of the five items needs Refined Storage's own
+3. ~~**No recipes.** Every recipe of the five items needs Refined Storage's own
    chain (`quartz_enriched_iron`, `machine_casing`, processors, cores,
    `1k_storage_part`, `storage_housing`) and NeoForge `#c:` tags; the items come
-   from creative until that chain is ported.
+   from creative until that chain is ported.~~ **Resolved in slice 2 (0.2.2):**
+   the chain and all 21 recipes are carried and proven in game — see
+   `## Slice 2` at the end. The `#c:` tags the recipes test are declared by this
+   package (vanilla members), not inherited from NeoForge's tag data.
 4. **Disk capacity is fixed at 1k** and the disk is one item; the storage
    reference is a component of this port's own shape, not upstream's UUID into a
    world-level repository.
@@ -640,8 +643,139 @@ Evidence: `ports/_shared/evidence/refinedstorage/` (`launcher-build-before.log`
 
 - `ports/tools/upstream_ready.py refinedstorage` still reads the retired layout
   (gap 2 above); the SDK gate is `cargo horizon-mod check` + `fits`, both green.
-- The gap list from slice 1 stands unchanged: no energy, no recipes, no
+- The gap list from slice 1 stands, except recipes (slice 2): no energy, no
   crafters/exporters/importers, one disk size, 54 grid entries, command-driven
   search.
 
 Skills: superpowers/using-superpowers,systematic-debugging,test-driven-development,verification-before-completion; BeautifulRust/rust-best-practices,rust-port
+
+## Slice 2 — the crafting chain, every recipe proven in game (2026-11-21) — version 0.2.2
+
+Gap line this slice answers — §"Gaps / deviations (slice 1)" item 3: *"**No recipes.** Every
+recipe of the five items needs Refined Storage's own chain (`quartz_enriched_iron`,
+`machine_casing`, processors, cores, `1k_storage_part`, `storage_housing`) and NeoForge `#c:`
+tags; the items come from creative until that chain is ported."* It is also the first of the
+*"What is still not done"* gaps, and the parity rule's sharpest case: a carried recipe that is
+never crafted is dead data, and until this slice the five shipped blocks existed only from
+creative.
+
+Pin **`0a875da91dbb0fdcb7ba8c42c11341aa229af51a`**, mixins
+`e59da9094f0c2fdda6c627fe9eff22dec6a906f0`, SDK `0a875da`, launcher 0.2.92, game 26.3
+(0.2.1 was built at `0b14f8a` and migrated here). Class `content` / tier **deep**, shape
+**machines**, unchanged: recipes are data-tier *content*, so this slice adds a family below the
+tier and cannot exceed it. No new pin API and no third-party mod: every ingredient is vanilla
+or a chain item this package declares.
+
+`src/runtime.rs` is **untouched** (`79b72b93…`, byte-identical in the package): this is a
+mechanical carry from the jar, so there is no new runtime rule to unit-test. The red proof is
+therefore the in-game one below, against the previous package.
+
+### What was carried (from `refinedstorage-neoforge-2.0.9.jar`, MIT, tag v2.0.9)
+
+| family | carried |
+|---|---|
+| items | 14: `quartz_enriched_iron`, `quartz_enriched_copper`, `silicon`, `processor_binding`, `raw_/basic_/improved_/advanced_processor` (raw + cooked, 6), `construction_core`, `destruction_core`, `1k_storage_part`, `storage_housing` — `minecraft:paper` template, own texture, model, item definition, lang, creative tab |
+| block | `machine_casing` (a block upstream): `minecraft:stone` template, cube-column model from the jar, own textures, loot table, pickaxe tag, tab |
+| recipes | 21: the 15 chain recipes and the 6 that reach the shipped things (`controller`, `cable` ×12, `disk_drive`, `grid`, `1k_storage_disk`, the shapeless `1k_storage_disk_from_storage_housing` alternative) |
+| tags | 14 `c:` tags the recipes test, with vanilla members; plus upstream's own `c:ingots` (both enriched ingots) and `c:silicon` contributions, as upstream writes them |
+
+The jar's 1.21.1 NeoForge ingredients (`{"item": …}` / `{"tag": …}`) are written in the pin's
+shape (`"id"` / `"#tag"`); smelting keeps upstream's `experience` and 200-tick time.
+
+### Red proof — the same driver against the previous package (0.2.1 at `0b14f8a`)
+
+`tools/recipe_check.py` reads this package's **own** `data/refinedstorage/recipe/*.json`, so a
+recipe that is not crafted fails the run. Against 0.2.1 the chain does not exist, and the
+first recipe of the alphabetical run fails in the game:
+
+```
+recipe 1k_storage_disk (minecraft:crafting_shaped)
+  1k_storage_disk -> None x0
+…
+FAIL: no refinedstorage:1k_storage_part in the inventory to place
+FAIL: no refinedstorage:quartz_enriched_iron in the inventory to place
+FAIL: 1k_storage_disk: expected refinedstorage:1k_storage_disk x1, got None x0
+```
+
+62 assertions failed, `EXIT:1` (`ports/_shared/evidence/refinedstorage-e2e/e2e-red-recipes-0b14f8a.log`).
+Before the driver existed the same gap was `no recipes under 0.2.1`'s recipe directory
+(`e2e-red-recipes-0b14f8a-nodata.log`), and the first full-repo attempt exposed two driver
+defects of my own (a tag read as an item id; a `jq` field on a string) — kept as
+`red-recipes-driver-bug-intermediate.txt`, not as exit evidence.
+
+### Green — the in-game leg (one slot lease, `launcher-game.sh` build at `0a875da`)
+
+```
+== the crafting chain: every carried recipe crafts in game ==
+recipe PASS: 21 of 21 carried recipes craft in game with their declared output and count,
+             their ingredients are consumed, 10 wrong-ingredient controls leave the result
+             empty, and #c:stones takes cobblestone as well as stone
+  machine casing drops: {"refinedstorage:machine_casing":1}
+  refinedstorage:no_such_item refused, refinedstorage:no_such_block did not place (minecraft:air)
+…
+PASS: every carried recipe crafts in game … and the disk kept its 3 gold across a relaunch
+EXIT:0
+```
+
+The driver asserts, per recipe: the result slot's **id and count**, that a shift-click leaves
+the 3×3 grid empty (the ingredients were consumed) and the crafted stack in the inventory, and
+a counterfactual (one ingredient replaced by a non-ingredient → no result). Every control is
+per-recipe, plus the `#c:stones` differential below, so the assertions can fail — and did,
+twice, before the content was right (the tag's missing cobblestone; the loot table's 26.3
+shape).
+
+| Step | Command | Result |
+|---|---|---|
+| runtime + glue tests | `cargo test --offline` | **31 passed**, 0 failed (`sdk-test.log`) |
+| lints | `cargo clippy --all-targets --offline -- -D warnings` | exit 0, **0 warnings** |
+| formatting | `rustfmt --edition 2024 --check src/{lib,support,runtime}.rs` | clean |
+| SDK check | `cargo horizon-mod check` | *"…354 items of the API (… 13 hooks …). Made for 0a875da."* |
+| package | `rm -f Cargo.lock && cargo horizon-mod build` ×2 | **byte-identical**, **116,902 B**, SHA-256 `3c26f5a4986847a1090f9582a65cd0341ee6e60efaad30687e86c678d99d1ad4`, **165 entries**, no `Cargo.lock` |
+| package check | `cargo horizon-mod check refinedstorage.hmod` | `0.2.2 (native-mod, format native-1/0a875da…/e59da909…, for 26.3) 116902 bytes` |
+| fits (pin) | `… fits refinedstorage.hmod --build 0a875da` | *"0a875da made for"* (a tautology on its own) |
+| fits (other build) | `… fits refinedstorage.hmod --build 0b14f8a` | *"0b14f8a fits"* — the one that proves something |
+| launcher build | `launcher-game.sh build refinedstorage --rebuild` | exit 0, `native-0a875da-0e04cf451395` |
+| in-game leg | `build-slot.sh run --step e2e -- bash tools/e2e.sh` | **PASS** + **`EXIT:0`** |
+| control (same Nightly, no package) | `GAME=$CONTROL_GAME …` | **FAIL** + `EXIT:1` — *"the block at 41,64,0 is minecraft:air, expected west=true"* |
+| selftest (flipped assertion) | `SELFTEST=1 …` | **FAIL** + `EXIT:1` — the offline grid lists the gold |
+| log gate | `check-e2e-logs.py refinedstorage-e2e --strict` | `logs=6 ok=6 missing-exit=0 bad-exit=0` |
+| package gate | `verify-sdk-package.py refinedstorage` | **1/1** (runtime byte-identical, 165 entries, no `Cargo.lock`, 31 tests, 0 warnings, skills PASS) |
+
+### Coverage (parity rule) — this slice's families
+
+| family | state |
+|---|---|
+| 14 chain items | **tested** — given, crafted and taken; each is an ingredient of the recipe that declares it |
+| `machine_casing` block | **tested** — crafted, placed, read back (`refinedstorage:machine_casing`), broken in survival, **drops itself** |
+| 15 chain recipes (12 shaped/shapeless + 3 smelting) | **tested** — `recipe_check.py`, output id + count + ingredients consumed; each has a wrong-ingredient control |
+| 6 shipped-item recipes | **tested** — `controller` 1, `cable` 12, `disk_drive` 1, `grid` 1, `1k_storage_disk` 1 (shaped and from the housing) |
+| the `c:` tags | **tested** — every tag-consuming recipe crafts, and `#c:stones` makes the casing from **cobblestone**, not only from its first entry (stone) |
+| unknown ids | **tested** — `give refinedstorage:no_such_item` refused; `setblock … refinedstorage:no_such_block` leaves air |
+| the rest of the jar (crafters, exporters/importers, external storage, interfaces, relays, security, wireless, fluid storage, the other disk sizes, coloured variants, upgrades) | **not ported** — slice-1 gap 2, unchanged |
+
+### Deviations and traps
+
+1. **The package declares the `c:` tags it references.** Upstream inherits NeoForge's common
+   tag data; a lone package in a game without it would leave the recipes unresolvable. The
+   values are the vanilla minimum per tag (`c:glass_blocks` = glass + tinted glass, `c:stones` =
+   stone/cobblestone/granite/diorite/andesite/deepslate/cobbled deepslate/tuff/calcite), and
+   every file is `"replace": false`, so a pack that also ships them merges additively. A modded
+   glass that is not vanilla will not satisfy `c:glass_blocks` unless its own pack adds it.
+2. **26.3 loot tables use a singular `condition` on the pool**, not 1.21.1's `conditions` list:
+   the first build of the casing's table used the list and the block broke **empty**
+   (`drops: {}`), while the port's older tables (already singular) dropped. Fixed; recorded
+   here because the same trap will bite the next carried block.
+3. **`machine_casing` is carried as a block** (as upstream), not an item: it places, drops
+   itself, and is in `#minecraft:mineable/pickaxe`.
+4. **Upstream's `c:ingots` contribution is kept as upstream writes it**: both
+   `quartz_enriched_iron` and `quartz_enriched_copper` are ingots in that tag.
+5. The chain is what makes the five blocks reachable in survival; it does not make the disk's
+   contents world-level storage, and it does not add energy — both remain slice-1 gaps.
+
+Skills: superpowers/using-superpowers,brainstorming,writing-plans,test-driven-development,systematic-debugging,verification-before-completion; BeautifulRust/rust-best-practices
+
+Evidence: `ports/_shared/evidence/refinedstorage/` — `plan-slice2-recipes.md`, `sdk-test.log`,
+`sdk-clippy.log`, `sdk-check-fits.log`, `sdk-package.log` (older), and
+`ports/_shared/evidence/refinedstorage-e2e/` — `e2e-red-recipes-0b14f8a.log` (red),
+`e2e-red-recipes-0b14f8a-nodata.log` (the family absent), `e2e-launcher-0a875da.log` (green),
+`e2e-launcher-control.log`, `e2e-launcher-selftest.log`, `launcher-build-0a875da.log`.

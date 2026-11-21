@@ -1,0 +1,12 @@
+{
+  "type": "minecraft:crafting_shapeless",
+  "ingredients": [
+    "refinedstorage:processor_binding",
+    "#c:ingots/iron",
+    "#c:silicon",
+    "#c:dusts/redstone"
+  ],
+  "result": {
+    "id": "refinedstorage:raw_basic_processor"
+  }
+}

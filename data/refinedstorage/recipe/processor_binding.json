@@ -1,0 +1,16 @@
+{
+  "type": "minecraft:crafting_shaped",
+  "pattern": [
+    "   ",
+    "SLS",
+    "   "
+  ],
+  "key": {
+    "S": "#c:strings",
+    "L": "#c:slime_balls"
+  },
+  "result": {
+    "id": "refinedstorage:processor_binding",
+    "count": 8
+  }
+}

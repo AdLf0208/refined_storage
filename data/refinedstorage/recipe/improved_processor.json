@@ -1,0 +1,9 @@
+{
+  "type": "minecraft:smelting",
+  "ingredient": "refinedstorage:raw_improved_processor",
+  "experience": 0.5,
+  "cookingtime": 200,
+  "result": {
+    "id": "refinedstorage:improved_processor"
+  }
+}

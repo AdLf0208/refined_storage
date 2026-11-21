@@ -34,7 +34,7 @@ set -euo pipefail
 export LC_ALL=C
 
 CLONE=$(cd "$(dirname "$0")/../.." && pwd)
-PORT=$CLONE/ports/refinedstorage
+PORT=$(cd "$(dirname "$0")/.." && pwd)
 SHARED=$CLONE/ports/_shared/bin/horizon-1d63e0a5
 CTL=${CTL:-$SHARED/horizon-ctl}
 # Since the SDK migration (2026-11-18) the mod is one flat `.hmod` the launcher
@@ -362,6 +362,45 @@ ctl command "execute in minecraft:the_end run setblock 56 64 0 minecraft:barrel"
 ctl wait 6
 expect_info 56 64 0 "No Refined Storage network block there."
 
+echo "== the crafting chain: every carried recipe crafts in game =="
+# Slice 2. The driver reads this package's own data/refinedstorage/recipe/*.json,
+# so a carried recipe that is not crafted here fails the run. Shaped/shapeless
+# recipes go into a crafting table at 36,64,8, smelting into a furnace at 38,64,8;
+# both sit beside the network's arena, on its stone floor.
+python3 "$PORT/tools/recipe_check.py" "$SOCK" "$CTL" 36 64 8 || fail "the recipe check failed"
+ctl command "clear @s" >/dev/null
+# The chain's one block: placed, read back, and broken for itself.
+ctl command "execute in minecraft:the_end run setblock 44 64 8 refinedstorage:machine_casing" >/dev/null
+ctl wait 6
+[ "$(block 44 64 8)" = "refinedstorage:machine_casing" ] \
+    || fail "machine_casing did not place: $(block 44 64 8)"
+echo "  block(44,64,8): $(block 44 64 8)"
+ctl command "gamemode survival" >/dev/null
+ctl give minecraft:diamond_pickaxe 1 >/dev/null
+ctl wait 4
+ctl select minecraft:diamond_pickaxe >/dev/null
+ctl command "execute in minecraft:the_end run tp @s 43.5 64 8.5" >/dev/null
+ctl wait 6
+broken=$(ctl break 44 64 8) || fail "cannot break the machine casing"
+echo "  machine casing drops: $(echo "$broken" | jq -c '.drops')"
+[ "$(echo "$broken" | jq -r '.drops["refinedstorage:machine_casing"] // 0')" -ge 1 ] \
+    || fail "the machine casing did not drop itself: $(echo "$broken" | jq -c '.drops')"
+ctl command "gamemode creative" >/dev/null
+ctl command "clear @s" >/dev/null
+ctl wait 4
+
+echo "== an unknown id in this namespace is refused =="
+if ctl give refinedstorage:no_such_item 1 >/dev/null 2>&1; then
+    fail "give refinedstorage:no_such_item succeeded"
+fi
+ctl command "execute in minecraft:the_end run setblock 45 64 8 refinedstorage:no_such_block" >/dev/null 2>&1 || true
+ctl wait 4
+unknown_state=$(block 45 64 8)
+case "$unknown_state" in
+    refinedstorage:no_such_block*) fail "setblock accepted refinedstorage:no_such_block" ;;
+esac
+echo "  refinedstorage:no_such_item refused, refinedstorage:no_such_block did not place ($unknown_state)"
+
 echo "== the disk keeps its contents across a relaunch =="
 ctl command "execute in minecraft:the_end run tp @s 42.5 64 2.5"
 ctl save
@@ -377,5 +416,5 @@ expect_slots '[{"slot":300,"item":"minecraft:gold_ingot","count":3}]'
 ctl close
 ctl wait 4
 
-echo "PASS: two grids on one network never offered the same items twice, the cable follows its neighbours and the grid is active with a controller, the disk went into the drive and the grid listed what was deposited through its menu, the search filtered it, a shift-click withdrew the diamonds, breaking the controller took the network offline and putting it back restored the disk's gold, a network without a drive listed nothing, a stick did not enter the drive, a vanilla barrel is not a network block, and the disk kept its 3 gold across a relaunch"
+echo "PASS: every carried recipe crafts in game with its declared output and count (and its wrong-ingredient control leaves the result empty), the machine casing places, reads back and drops itself, two grids on one network never offered the same items twice, the cable follows its neighbours and the grid is active with a controller, the disk went into the drive and the grid listed what was deposited through its menu, the search filtered it, a shift-click withdrew the diamonds, breaking the controller took the network offline and putting it back restored the disk's gold, a network without a drive listed nothing, a stick did not enter the drive, a vanilla barrel is not a network block, and the disk kept its 3 gold across a relaunch"
 # The cleanup trap prints EXIT:<status> as the last line.
