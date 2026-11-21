@@ -5,7 +5,10 @@
 //! component, a **Disk Drive** holds nine **1k Storage Disks** (the items live
 //! in the disk item's own component, so they travel with the disk), and the
 //! **Grid** is a 9×6 menu that shows the network's resources and withdraws
-//! from or deposits into them.
+//! from or deposits into them. A **Wireless Transmitter** joins a network
+//! through its facing side only and answers whether a player may use that
+//! network — the same dimension, online, within its 16-block range — which is
+//! the admission a wireless grid asks before it opens.
 //!
 //! [`runtime`] is the pure model (the component, the disks, the grid's view and
 //! the reconciliation of its menu slots); [`support`] is the game glue. See

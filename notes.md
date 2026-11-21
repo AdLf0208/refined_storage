@@ -19,10 +19,12 @@ the network; no entities, renderers, dimensions or new vanilla hooks.
 Ported now because it is the **#1 core base** of the core-first queue: 13
 pending ATM10 mods depend on it (`ports/tools/port_queue.py`).
 
-Status: **slice 2 — the crafting chain (0.2.2)** — the network core of slice 1 plus the
-Refined Storage crafting chain it needs (14 items and the `machine_casing` block) and the
-21 recipes that reach the five shipped blocks/items, every one of them crafted in game (see
-`## Slice 2` at the end). Everything else is the gap list below, not a claim.
+Status: **slice 3 — the wireless transmitter (0.2.3)** — the network core of slice 1, the
+crafting chain of slice 2, and the finite-range, same-dimension transmitter an add-on's whole
+content relaxes: its block and item, the rule that it joins a network through its facing side
+only, the admission it answers (same dimension, online, within 16 blocks), the `/refinedstorage
+wireless` readout of that admission, its recipe, and the `refinedstorage:wireless` advancement.
+Everything else is the gap list below, not a claim.
 
 > The sections from `## Behaviour` to `### Verification after the repairs`
 > describe the **retired `.hnmod`** layout. They are kept as history: the
@@ -113,10 +115,14 @@ and in the gaps below.
    upstream has four energy levels. No FE hook is needed or used.
 2. **The rest of the mod does not exist**: crafters, exporters/importers,
    external storage, interfaces, relays, network transmitters/receivers,
-   security manager, wireless transmitter/grid, portable grid, crafting/pattern
+   security manager, ~~wireless transmitter~~ (**done in slice 3, 0.2.3** — the
+   block, its item, the facing-only connection rule, the same-dimension/16-block
+   admission, its recipe and the `refinedstorage:wireless` advancement), the
+   wireless grid, portable grid, crafting/pattern
    grids, autocrafting, fluid storage and disks, the other disk sizes (4k/16k/
    64k/creative), storage blocks, upgrades, the config file, and the coloured
-   variants of every block (the slice has the default colour only).
+   variants of every block (the slice has the default colour only — the
+   transmitter is the plain variant, and its tag is ready for the dyed ones).
 3. ~~**No recipes.** Every recipe of the five items needs Refined Storage's own
    chain (`quartz_enriched_iron`, `machine_casing`, processors, cores,
    `1k_storage_part`, `storage_housing`) and NeoForge `#c:` tags; the items come
@@ -779,3 +785,232 @@ Evidence: `ports/_shared/evidence/refinedstorage/` — `plan-slice2-recipes.md`,
 `ports/_shared/evidence/refinedstorage-e2e/` — `e2e-red-recipes-0b14f8a.log` (red),
 `e2e-red-recipes-0b14f8a-nodata.log` (the family absent), `e2e-launcher-0a875da.log` (green),
 `e2e-launcher-control.log`, `e2e-launcher-selftest.log`, `launcher-build-0a875da.log`.
+
+## Slice 3 — the wireless transmitter, and the rule an add-on relaxes (2026-11-21) — version 0.2.3
+
+Gap line this slice answers — §"Gaps / deviations (slice 1)" item 2, verbatim: *"The rest of the
+mod does not exist: … network transmitters/receivers, security manager, **wireless
+transmitter/grid**, portable grid, …"*. It is the surface
+`ports/interdimensionalwirelesstransmitter` binds to: that mod stopped the same day at
+`blocked(no-parent-addon-surface)` because its whole content is **four lines** relaxing this
+block's rule (the coordinates never read, so any dimension and any distance), its 49 parent
+classes have no counterpart here, and its main recipe's base item (`refinedstorage:wireless_transmitter`)
+was unregistered. This slice registers that id and the rule it relaxes.
+
+Pin **`0a875da91dbb0fdcb7ba8c42c11341aa229af51a`**, mixins
+`e59da9094f0c2fdda6c627fe9eff22dec6a906f0`, SDK `0a875da`, launcher 0.2.92, game 26.3. Class
+`content` / tier **deep**, shape **machines**, unchanged: one block, one block entity and a rule
+are below the tier. No new pin API and no third-party mod: every ingredient is vanilla or a chain
+item slice 2 already carries.
+
+### What the jar says (the artefact wins over the brief's prose)
+
+| upstream (`refinedstorage2` v2.0.9, MIT) | what this slice carries |
+|---|---|
+| `WirelessTransmitterBlock` (`AbstractActiveColoredDirectionalBlock`, `DefaultDirectionType.FACE_CLICKED`) | states **`direction` (6) + `active` (2)**; one 4×4×10 nub per face (`box(6,0,6,10,10,10)` for down, rotated for the rest) |
+| `WirelessTransmitterConnectionStrategy` | a network node that joins **through its facing side only**: `addOutgoingConnections` → `relative(direction)`; `canAcceptIncomingConnection` → `incomingDirection == myDirection` |
+| `WirelessTransmitterNetworkNodeContainer.isValid(PlayerCoordinates)` | dimension equal → `node.isActive()` → `distance(pos, playerPosition) <= getRange()` |
+| `DefaultEnergyUsage` | `WIRELESS_TRANSMITTER_BASE_RANGE = 16`, `WIRELESS_TRANSMITTER = 16 FE/t` |
+| `data/refinedstorage/recipe/wireless_transmitter.json` | `EPE/EME/EAE`: `E = quartz_enriched_iron`, `P = #c:ender_pearls`, `M = machine_casing`, `A = advanced_processor` |
+| `data/refinedstorage/advancement/wireless.json` | a child of `refinedstorage:root`; criteria `wireless_grid` **and** a member of `#refinedstorage:wireless_transmitters` |
+| `data/refinedstorage/tags/item/{wireless_transmitters,controllers}.json` | the tag the advancement tests, and the tag its parent's criteria tests |
+
+**The brief's "the transmitter block with its six connection faces (reuse the parent's existing
+cable/nub shapes)" is not what the jar has.** The jar's blockstate declares `active` and
+`direction` only — no six boolean connection states — and its model is a torch-like cross
+(`inactive`/`active`), not the cable's nubs; the connection rule is *one* face, not six. The
+artefact wins (AGENTS.md: *"when a brief and the artefact disagree, the artefact wins"*), so the
+port carries the jar's shape and its one-face rule. The `shapes` are upstream's own six voxel
+boxes, selected by the `facing` property.
+
+### What was implemented
+
+- **runtime.rs** (pure, tests first): `Kind::WirelessTransmitter`; `Face` (offset, opposite,
+  property value, from a property value or a unit offset); `Node { kind, face }` and the
+  connection rule in `network()` (every block joins on all six sides, a transmitter through its
+  facing side only, and only when the neighbour on that side is the one asking);
+  `WIRELESS_RANGE = 16`, `distance(from, block)` and `admit(online, same_dimension, distance,
+  range)` with `Refusal` naming the reason in upstream's check order (dimension, then activeness,
+  then range, boundary inclusive).
+- **support.rs** (glue): the transmitter is a block of the mod's one block-entity type; its tick
+  writes `active` from its component's online state; `BlockPart::state_for_placement` sets
+  `facing` from the clicked face (upstream's `FACE_CLICKED`, and it removes the end-rod template's
+  chaining quirk); `network_at`/`network_in` read a level by handle, so the same rule answers in
+  another dimension; `/refinedstorage info` names a transmitter and its range;
+  `/refinedstorage wireless <pos> <dimension>` asks the admission and prints either
+  `accepted (<d> of 16 blocks, online network)` or `refused (<reason>)`.
+- **Content** (from the jar, MIT): the block declaration (end-rod template: `facing`, plus our
+  `active`, six shapes), blockstate (12 variants), the two models and the item model, the three
+  textures, the item, the loot table, the pickaxe tag, the lang keys, the creative tab, the
+  recipe, `data/c/tags/item/ender_pearls.json`, the two item tags, and the `root` + `wireless`
+  advancements.
+
+### Upstream defects fixed
+
+**`shapes` boxes are block units, not pixels — the port's cable carried pixels.** The block
+declaration's `shapes` values are `[min_x, min_y, min_z, max_x, max_y, max_z]` **in block units**
+(`horizon/docs/modpacks.md`), while the jar's voxel shapes and the port's cable declaration used
+pixels (`[6,6,6,10,10,10]`). Measured: a vanilla outline row is `[[0.0,0.0,0.0,1.0,1.0,1.0]]` or
+`[[0.4375,0.8125,0.4375,0.5625,1.0,0.5625]]`, never 6..10. The consequence is not cosmetic: the
+cable's selection/collision shape sat **outside** its own cell, so the block could not be hit by
+a ray — `ctl break` on any small block failed with *"no face of block … is visible from here:
+minecraft:stone at … is in the way"* (measured while writing this slice's loot assertion). Fixed
+in both declarations by dividing every box by 16 (`cable` → `0.375..0.625`; the transmitter → its
+six nubs); the cable is now hittable and the transmitter breaks and drops itself. Nothing else
+read the cable's shape, and no earlier assertion depended on it.
+
+### Deviations (recorded, not defects)
+
+1. **Template `minecraft:end_rod`.** The pin's block declaration has no `direction` placement
+   rule of its own, so the template supplies `facing` (six values) and the placement hook sets it
+   from the clicked face; the shape is selected by that template property. The jar's `direction`
+   property name and its 16 dyed variants are not carried (the port has no colour variants for any
+   block).
+2. **`root` is carried too, because `wireless` needs a parent.** Upstream's tree has 28
+   advancements; this package ships the two that reach the transmitter. `root`'s icon is upstream's
+   `creative_controller` (unported) → this package's `controller`, its background is vanilla's
+   stone panel instead of the jar's `textures/gui/advancements.png`, and its criteria test this
+   package's own `#refinedstorage:controllers` tag.
+3. **`wireless`'s icon and criteria are this package's, not the wireless grid's.** The jar's icon is
+   `refinedstorage:wireless_grid` (next slice) and its criteria need both a grid and a transmitter;
+   as carried, the advancement could never be obtained. It tests
+   `#refinedstorage:wireless_transmitters` (which holds the transmitter until the dyed variants
+   exist) and draws the transmitter. The tag is load-bearing: it is the reason the criterion fires.
+4. **No network energy.** Parent gap 1: the controller consumes and stores nothing, so the
+   transmitter's 16 FE/t is not charged. The admission rule is **independent of energy** — the
+   node's activeness is the component's controller rule — so the rule is provable without it (this
+   is the state `interdimensionalwirelesstransmitter` needs; its own 100 FE/t stays a gap).
+5. **`/refinedstorage wireless` is a harness/behaviour addition, like `/refinedstorage info` and
+   `/refinedstorage filter`.** Upstream asks that question from the wireless grid item through
+   `NetworkItemPlayerValidator`; with no grid in this package, the command is how the *same*
+   function is exercised. It takes the transmitter's position and dimension and answers for the
+   acting player, so a cross-dimension use is nameable.
+6. **The transmitter has no menu.** Upstream opens a 0-container-slot menu that shows the range; the
+   pin's mod menus take 1–256 slots (`horizon/docs/mods.md`), so the range is in
+   `/refinedstorage info` instead (`Wireless transmitter at x,y,z: range 16 blocks, active`).
+
+### Red proof — the rule as tests, before the glue
+
+Written first against stubs (`links` answered `true` for every pair, `admit` answered `Ok(())`),
+then run: **5 failed of 39** (`ports/_shared/evidence/refinedstorage/runtime-red-slice3-transmitter.log`):
+
+```
+---- runtime::tests::a_transmitter_joins_the_network_through_its_facing_side_only stdout ----
+assertion `left == right` failed: a transmitter that faces nothing is alone
+  left: [(WirelessTransmitter, [2, 64, 0]), (Cable, [1, 64, 0]), (Controller, [0, 64, 0])]
+ right: [(WirelessTransmitter, [2, 64, 0])]
+---- runtime::tests::a_use_in_another_dimension_is_refused_as_such_even_when_offline stdout ----
+assertion `left == right` failed: upstream checks the dimension before the node's activeness
+  left: Ok(())
+ right: Err(DifferentDimension)
+---- runtime::tests::an_offline_transmitter_refuses_a_use_within_its_range stdout ----
+  left: Ok(())
+ right: Err(Offline)
+---- runtime::tests::a_use_beyond_the_range_is_refused_naming_the_distance stdout ----
+  left: Ok(())
+ right: Err(OutOfRange { distance: 16.5, range: 16 })
+---- runtime::tests::the_range_boundary_itself_is_accepted stdout ----
+assertion failed: admit(true, true, 16.000_1, WIRELESS_RANGE).is_err()
+test result: FAILED. 34 passed; 5 failed; 0 ignored; 0 measured; 0 filtered out
+```
+
+One test of my own was wrong and the run said so: two transmitters "facing each other" were
+written facing away (`facing=east` on the west one), and the fill answered 3 nodes instead of 4 —
+the test was rewritten so each faces the other (`a_transmitter_takes_the_side_it_faces_when_the_neighbour_is_the_one_asking`).
+Green after the two rules: **39 passed, 0 failed** (`sdk-test.log`).
+
+### Green — the ladder and the in-game leg (one launcher build at `0a875da`)
+
+| Step | Command | Result |
+|---|---|---|
+| runtime + glue tests | `cargo test --offline` | **39 passed**, 0 failed (`sdk-test.log`) |
+| lints | `cargo clippy --all-targets --offline -- -D warnings` | exit 0, **0 warnings** (`sdk-clippy.log`) |
+| formatting | `rustfmt --edition 2024 --check src/{lib,support,runtime}.rs` | clean |
+| SDK check | `cargo horizon-mod check` | *"…404 items of the API (… 14 hooks …). Made for 0a875da."* |
+| package | `rm -f Cargo.lock && cargo horizon-mod build` ×2 | **byte-identical**, **129,923 B**, SHA-256 `a36d3a5d7378cfc3283558fb382daa59e9337c2f939d73be363000e3d8ac02da`, **182 entries**, no `Cargo.lock` |
+| package check | `cargo horizon-mod check refinedstorage.hmod` | `0.2.3 (native-mod, format native-1/0a875da…/e59da909…, for 26.3) 129923 bytes` (`sdk-check.log`) |
+| fits (pin) | `… fits refinedstorage.hmod --build 0a875da` | *"0a875da made for"* |
+| fits (other build) | `… fits refinedstorage.hmod --build 0b14f8a` | *"0b14f8a fits"* (`sdk-check-fits.log`) |
+| launcher build | `launcher-game.sh build refinedstorage --rebuild` | exit 0, **`Compiling refinedstorage (1 of 1)`**, `native-0a875da-4f02f2698214` |
+| in-game leg | `build-slot.sh run --step e2e -- bash tools/e2e.sh` | **PASS** + **`EXIT:0`** (`e2e-launcher-slice3.log`) |
+| control (same Nightly, no package) | `GAME=$CONTROL_GAME …` | **FAIL** + `EXIT:1` — *"the block at 41,64,1 is minecraft:air, expected facing=north"* |
+| selftest (flipped range) | `SELFTEST=1 …` | **FAIL** + `EXIT:1` — *"expected … 'accepted (17.0 of 16 blocks', got '… refused (out of range: 17.0 > 16 blocks)'"* |
+| selftest (flipped offline) | `SELFTEST=offline …` | **FAIL** + `EXIT:1` — *"the grid's view is [], expected [3 gold]"* |
+| log gate | `check-e2e-logs.py refinedstorage-e2e --strict` | `logs=10 ok=10 missing-exit=0 bad-exit=0` |
+| package gate | `verify-sdk-package.py refinedstorage` | **1/1** |
+
+The scenario (quoted from `e2e-launcher-slice3.log`):
+
+```
+  block(41,64,1): refinedstorage:wireless_transmitter[active=true,facing=north]      (overworld)
+  info(41,64,1): … online (3 nodes, 1 controller, 0 drive, 0 grid, 1 transmitter); 0 disks, …
+  block(54,64,4): refinedstorage:wireless_transmitter[active=false,facing=east]      (facing away: alone)
+  info(54,64,4): … offline (1 nodes, 0 controller, 0 drive, 0 grid, 1 transmitter); …
+  block(54,64,4): refinedstorage:wireless_transmitter[active=true,facing=west]       (facing the cable)
+  info(54,64,4): … online (3 nodes, 1 controller, 0 drive, 0 grid, 1 transmitter); …
+  info(54,64,4): Wireless transmitter at 54,64,4: range 16 blocks, active
+  info(53,64,4): Refined Storage network at 53,64,4: … (no range line on a cable)
+  /refinedstorage wireless 54 64 4 minecraft:the_end -> … accepted (2.5 of 16 blocks, online network)
+  /refinedstorage wireless 54 64 4 minecraft:the_end -> … accepted (16.0 of 16 blocks, online network)
+  /refinedstorage wireless 54 64 4 minecraft:the_end -> … refused (out of range: 17.0 > 16 blocks)
+  /refinedstorage wireless 54 64 4 minecraft:the_end -> … refused (the network is offline)
+  /refinedstorage wireless 52 64 4 minecraft:the_end -> No wireless transmitter there.
+  /refinedstorage wireless 41 64 1 minecraft:overworld -> … refused (different dimension)
+  /execute in minecraft:overworld run refinedstorage wireless 41 64 1 minecraft:overworld -> … accepted (1.6 of 16 blocks, online network)
+  block(55,64,5): refinedstorage:wireless_transmitter[active=false,facing=north]     (placed by the item)
+  advancement after the give: {"criteria":{"wireless_transmitter_in_inventory":"…"},"done":true}
+  transmitter drops: {"refinedstorage:wireless_transmitter":1}
+```
+
+Every assertion has a differential or a counterfactual: the same position offline vs online (the
+facing rule), a cable's info without a range line, the boundary at 16.0 vs 17.0, an offline
+transmitter, a position with no transmitter, and — for the dimension — **the same command, the
+same arguments and the same player coordinates**, refused as `different dimension` from the End and
+accepted under `execute in minecraft:overworld` (the overworld network sits at the same
+coordinates, force-loaded with `/forceload`, so only the use's dimension differs). The advancement
+is proven twice: the game announced `[Wireless]` and the player's saved progress carries
+`refinedstorage:wireless: done=true` (and `"absent"` before the item was obtained).
+
+### Harness facts learned here
+
+- `ctl break` aims at the block's **centre** and needs a face of the block's *own* shape to be
+  visible; a 4×4×10 nub is grazed by a ray from 1.6 blocks above it (`1.62` eye height), and a
+  shape declared in pixels is outside the cell entirely (the defect above). Stand level with the
+  block, on the side its shape faces.
+- `ctl tp` sets exact doubles; `tp @s <ints>` **centres** x/z on the block (`54` → `54.5`), so a
+  distance that must be exactly 16 is only reachable with `ctl tp`.
+- `/forceload add` keeps a dimension's chunks loaded while the player is in another one, which is
+  what makes a cross-dimension read of a *ticking* network possible.
+- A command's own chat lines are best isolated with `events --since <seq>` (`last` from a previous
+  `events` call): a count of "the last N lines" matches earlier phases (`botanypots`'s false
+  proof), and a player-chat marker never reaches `messages .chat`.
+- The player's advancements file is `saves/<world>/players/advancements/<uuid>.json` under the
+  game's **launch directory** (the script's `$SCRATCH`), not `HORIZON_HOME`; `ctl save` writes it,
+  and the game writes two copies (client and server player).
+
+### Coverage (parity rule) — every family this slice ships
+
+| family | state |
+|---|---|
+| the `wireless_transmitter` block | **tested** — placed by `setblock` and by the item, read back with its `facing`/`active`, broken in survival, **drops itself** |
+| its six shapes and the `facing` placement rule | **tested** — `interact … north` places `facing=north`; the shape is what makes the block breakable (the units defect above) |
+| its connection rule (facing side only) | **tested** — the same block at 54,64,4 is `active=false` facing away and `active=true` facing the cable, and the census is 1 node vs 3 |
+| the range and same-dimension admission | **tested** — 2.5 / 16.0 accepted, 17.0 refused with the distance, offline refused, no transmitter refused, cross-dimension refused with `execute in` as the differential |
+| the `wireless_transmitter` item | **tested** — given, selected, placed against the clicked face; `refinedstorage:no_such_item` still refused by the legacy phase |
+| its recipe | **tested** — `recipe_check.py` crafts it in a table (output id + count, ingredients consumed) with a wrong-ingredient control (`#c:ender_pearls` → dirt) |
+| the `root` and `wireless` advancements | **tested** — `refinedstorage:wireless` absent before the give, `done=true` after it, and the `[Wireless]` announcement in chat |
+| the `wireless_transmitters` / `controllers` item tags | **tested** — the advancement criterion fires through `#refinedstorage:wireless_transmitters`; `root`'s through `#refinedstorage:controllers` |
+| its loot table | **tested** — the break above |
+| network energy (upstream 16 FE/t) | **not ported** — parent gap 1 (no FE on the network); the rule is energy-independent and proven without it |
+| the transmitter's menu/screen (range readout) | **not ported** — the pin has no 0-container-slot mod menu; `/refinedstorage info` prints the range |
+| the wireless grid, the portable grid, the dyed transmitters | **not ported** — the next slices (see the report's `## Next slice`) |
+| the `interdimensionalwirelesstransmitter` add-on | **not ported here** — its own dispatch; this slice is the surface it binds to (its `isValid` override, its recipe's base item, its `parent: refinedstorage:wireless`) |
+
+Skills: superpowers/using-superpowers,brainstorming,writing-plans,test-driven-development,systematic-debugging,verification-before-completion; BeautifulRust/rust-best-practices
+
+Evidence: `ports/_shared/evidence/refinedstorage/` — `plan-slice3-transmitter.md`,
+`runtime-red-slice3-transmitter.log`, `sdk-test.log`, `sdk-clippy.log`, `sdk-check.log`,
+`sdk-check-fits.log`, `refinedstorage.hmod` (the delivered bytes) — and
+`ports/_shared/evidence/refinedstorage-e2e/` — `e2e-launcher-slice3.log` (green),
+`e2e-launcher-slice3-control.log`, `e2e-launcher-slice3-selftest.log`,
+`e2e-launcher-slice3-selftest-offline.log`.

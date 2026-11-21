@@ -28,8 +28,25 @@
 #    so);
 #  - the disk keeps its contents across `save` + relaunch.
 #
-# SELFTEST=1 flips the "offline lists nothing" assertion (it must FAIL), which
-# proves the scenario can fail.
+# Slice 3 (the wireless transmitter):
+#  - it joins the network through its facing side only: the same block at the
+#    same position is offline facing away and active facing the cable;
+#  - `/refinedstorage info` on it names it and prints `range 16 blocks`, and a
+#    cable's info prints no range;
+#  - a use 2.5 blocks away and one exactly 16 blocks away are accepted, 17
+#    blocks away is refused `out of range: 17.0 > 16 blocks`, an offline
+#    transmitter refuses `the network is offline`, and a position with no
+#    transmitter refuses `No wireless transmitter there.`;
+#  - a use from the End against the overworld transmitter (same coordinates,
+#    force-loaded chunks) is refused `different dimension`, and the same
+#    command under `execute in minecraft:overworld` is accepted;
+#  - the item places against the clicked face, the block drops itself, and the
+#    `refinedstorage:wireless` advancement is granted when the item is obtained
+#    (and was absent before).
+#
+# SELFTEST=1 flips the wireless range assertion (a use 17 blocks out must be
+# accepted, so the run FAILS); SELFTEST=offline flips the older "offline lists
+# nothing" assertion the same way.
 set -euo pipefail
 export LC_ALL=C
 
@@ -96,6 +113,28 @@ info() { # info X Y Z: the /refinedstorage info line
     ctl wait 4 >/dev/null
     ctl messages 6 | jq -r '.chat[]' | grep -m1 -E 'Refined Storage network|No Refined Storage' || true
 }
+# Only the chat lines a command printed: `events --since <seq>` names the
+# sequence from before the command, so an earlier phase's feedback can neither
+# satisfy nor break an assertion.
+event_seq() { ctl events | jq -r '.last'; }
+since_seq() { ctl events --since "$1" | jq -r '.events[] | select(.event == "chat") | .text'; }
+# A /refinedstorage command's parsed reply: the lines it printed, oldest first.
+reply() { # reply "command text"
+    local seq
+    seq=$(event_seq)
+    say "$1"
+    ctl wait 4 >/dev/null
+    since_seq "$seq"
+}
+expect_reply() { # expect_reply "command text" "text the reply must contain"
+    local line
+    line=$(reply "$1")
+    echo "  /$1 -> $line"
+    case "$line" in
+        *"$2"*) ;;
+        *) fail "expected '$1' to answer '$2', got '$line'" ;;
+    esac
+}
 expect_info() { # expect_info X Y Z TEXT
     local line
     line=$(info "$1" "$2" "$3")
@@ -105,6 +144,10 @@ expect_info() { # expect_info X Y Z TEXT
         *) fail "expected /refinedstorage info to say '$4', got '$line'" ;;
     esac
 }
+# The player's saved advancement progress (`players/advancements/<uuid>.json`),
+# written by `ctl save`. The game's data folder is the launch directory
+# (`$SCRATCH`), not `HORIZON_HOME`.
+adv_file() { ls -t "$SCRATCH"/saves/*/players/advancements/*.json 2>/dev/null | head -1; }
 block() { ctl block "$1" "$2" "$3" | jq -r '.state'; }
 expect_state() { # expect_state X Y Z TEXT
     local got
@@ -161,6 +204,36 @@ echo "== launch (The End arena, the flat package) =="
 launch
 arena
 
+echo "== the wireless advancement starts unobtained =="
+ctl save
+ctl wait 10
+before=$(adv_file)
+[ -n "$before" ] || fail "no player advancements file under $SCRATCH/saves"
+echo "  advancement before the give: $(jq -c '.["refinedstorage:wireless"] // "absent"' "$before")"
+if jq -e 'has("refinedstorage:wireless")' "$before" >/dev/null; then
+    fail "the player already had refinedstorage:wireless before obtaining a transmitter"
+fi
+
+echo "== the overworld transmitter, for the cross-dimension use =="
+# The player starts in the overworld; the network there is built and ticked now,
+# then the chunks are force-loaded so a use from the End can still find it.
+ctl command "execute in minecraft:overworld run tp @s 41.5 70 2.5"
+ctl wait 40
+ctl command "execute in minecraft:overworld run fill 32 63 -8 56 63 24 minecraft:stone"
+ctl command "execute in minecraft:overworld run fill 32 64 -8 56 74 24 minecraft:air"
+ctl wait 10
+ctl command "execute in minecraft:overworld run setblock 40 64 0 refinedstorage:controller"
+ctl command "execute in minecraft:overworld run setblock 41 64 0 refinedstorage:cable"
+ctl command "execute in minecraft:overworld run setblock 41 64 1 refinedstorage:wireless_transmitter[facing=north]"
+ctl command "execute in minecraft:overworld run forceload add 32 0 48 8"
+ctl wait 12
+expect_state 41 64 1 'facing=north'
+expect_state 41 64 1 'active=true'
+expect_info 41 64 1 "online (3 nodes, 1 controller, 0 drive, 0 grid, 1 transmitter)"
+# Back to the End: everything after this reads the End.
+ctl command "execute in minecraft:the_end run tp @s 40.5 64 3.5"
+ctl wait 20
+
 echo "== the network is built: controller, cable, disk drive, grid =="
 ctl command "execute in minecraft:the_end run setblock 40 64 0 refinedstorage:controller"
 ctl command "execute in minecraft:the_end run setblock 41 64 0 refinedstorage:cable"
@@ -172,6 +245,116 @@ expect_state 41 64 0 'east=true'
 expect_state 41 64 0 'north=false'
 expect_state 43 64 0 'active=true'
 expect_info 43 64 0 "online (4 nodes, 1 controller, 1 drive, 1 grid); 0 disks, 0 items in 0 resources"
+
+echo "== the wireless transmitter joins through its facing side only =="
+ctl command "execute in minecraft:the_end run setblock 52 64 4 refinedstorage:controller"
+ctl command "execute in minecraft:the_end run setblock 53 64 4 refinedstorage:cable"
+ctl command "execute in minecraft:the_end run setblock 54 64 4 refinedstorage:wireless_transmitter[facing=east]"
+ctl wait 12
+# Facing away from the cable (east, nothing there): its own offline component.
+expect_state 54 64 4 'facing=east'
+expect_state 54 64 4 'active=false'
+expect_info 54 64 4 "offline (1 nodes, 0 controller, 0 drive, 0 grid, 1 transmitter)"
+# Turned to face the cable (west): the controller's network, so active.
+ctl command "execute in minecraft:the_end run setblock 54 64 4 refinedstorage:wireless_transmitter[facing=west]"
+ctl wait 12
+expect_state 54 64 4 'facing=west'
+expect_state 54 64 4 'active=true'
+expect_info 54 64 4 "online (3 nodes, 1 controller, 0 drive, 0 grid, 1 transmitter)"
+
+echo "== /refinedstorage info names the transmitter and its range =="
+transmitter_lines=$(reply "refinedstorage info 54 64 4")
+echo "$transmitter_lines" | sed 's/^/  info(54,64,4): /'
+echo "$transmitter_lines" | grep -q 'Wireless transmitter at 54,64,4: range 16 blocks, active' \
+    || fail "the transmitter's info line does not name its range: $transmitter_lines"
+# The differential: the same command on the cable names no range at all.
+cable_lines=$(reply "refinedstorage info 53 64 4")
+echo "$cable_lines" | sed 's/^/  info(53,64,4): /'
+if echo "$cable_lines" | grep -q 'range'; then
+    fail "a cable's info named a range: $cable_lines"
+fi
+
+echo "== a use in range is accepted, beyond it refused naming the reason =="
+ctl tp 54.5 64 6.5 # exact coordinates: `tp @s` would centre them
+ctl wait 6
+expect_reply "refinedstorage wireless 54 64 4 minecraft:the_end" "accepted (2.5 of 16 blocks"
+# The boundary is inclusive: exactly 16 blocks out (z = 4 + 16), same y, same x.
+ctl tp 54 64 20
+ctl wait 6
+expect_reply "refinedstorage wireless 54 64 4 minecraft:the_end" "accepted (16.0 of 16 blocks"
+ctl tp 54 64 21
+ctl wait 6
+if [ "$SELFTEST" = 1 ]; then
+    echo "(selftest: asserting a use 17 blocks out is accepted)"
+    expect_reply "refinedstorage wireless 54 64 4 minecraft:the_end" "accepted (17.0 of 16 blocks"
+else
+    expect_reply "refinedstorage wireless 54 64 4 minecraft:the_end" "refused (out of range: 17.0 > 16 blocks"
+fi
+
+echo "== an offline transmitter refuses a use within its range =="
+ctl tp 54.5 64 6.5 # exact coordinates: `tp @s` would centre them
+ctl command "execute in minecraft:the_end run setblock 54 64 4 refinedstorage:wireless_transmitter[facing=east]"
+ctl wait 12
+expect_state 54 64 4 'active=false'
+expect_reply "refinedstorage wireless 54 64 4 minecraft:the_end" "refused (the network is offline)"
+ctl command "execute in minecraft:the_end run setblock 54 64 4 refinedstorage:wireless_transmitter[facing=west]"
+ctl wait 12
+expect_state 54 64 4 'active=true'
+# A position that holds no transmitter is not a wireless use at all.
+expect_reply "refinedstorage wireless 52 64 4 minecraft:the_end" "No wireless transmitter there."
+
+echo "== a use from another dimension is refused, and only the dimension differs =="
+# The overworld network sits at the same coordinates as this End spot, so the
+# two commands below differ in the dimension the use happens in and nothing else.
+ctl command "execute in minecraft:the_end run tp @s 41.5 64 2.5"
+ctl wait 6
+expect_reply "refinedstorage wireless 41 64 1 minecraft:overworld" "refused (different dimension)"
+expect_reply "execute in minecraft:overworld run refinedstorage wireless 41 64 1 minecraft:overworld" "accepted (1.6 of 16 blocks"
+
+echo "== the item places with the clicked face, drops itself, and grants the advancement =="
+# The advancement before the item is obtained: the player's saved progress has no
+# entry (the pre-check ran right after the arena).
+ctl command "execute in minecraft:the_end run setblock 55 64 6 minecraft:stone"
+ctl command "execute in minecraft:the_end run tp @s 56.5 64 5.5"
+ctl wait 6
+ctl give refinedstorage:wireless_transmitter 1
+ctl wait 4
+ctl select refinedstorage:wireless_transmitter
+ctl wait 4
+ctl interact 55 64 6 north
+ctl wait 8
+expect_state 55 64 5 'refinedstorage:wireless_transmitter'
+expect_state 55 64 5 'facing=north'
+ctl wait 20
+ctl save
+ctl wait 10
+after=$(adv_file)
+[ -n "$after" ] || fail "no player advancements file under $SCRATCH/saves"
+echo "  advancement after the give: $(jq -c '.["refinedstorage:wireless"] // "absent"' "$after")"
+jq -e '.["refinedstorage:wireless"].done == true' "$after" >/dev/null \
+    || fail "obtaining the transmitter did not grant refinedstorage:wireless: $(jq -c '.["refinedstorage:wireless"] // "absent"' "$after")"
+# The same event, from the announcement the game printed when the criterion fired.
+ctl messages 20 | jq -r '.chat[]' | grep -q 'made the advancement \[Wireless\]' \
+    || fail "no '[Wireless]' advancement announcement in chat"
+
+echo "== the transmitter block drops itself =="
+# The stone the item was placed against is removed, and the player stands two
+# blocks south: `ctl break` aims at the block's centre, and the nub is 4x4x10,
+# so a ray from above grazes past it (measured: "no face ... is visible").
+ctl command "execute in minecraft:the_end run setblock 55 64 6 minecraft:air"
+ctl command "gamemode survival"
+ctl give minecraft:diamond_pickaxe 1
+ctl wait 4
+ctl select minecraft:diamond_pickaxe
+ctl command "execute in minecraft:the_end run tp @s 55.5 64 7.5"
+ctl wait 6
+broken=$(ctl break 55 64 5) || fail "cannot break the transmitter: $broken"
+echo "  transmitter drops: $(echo "$broken" | jq -c '.drops')"
+[ "$(echo "$broken" | jq -r '.drops["refinedstorage:wireless_transmitter"] // 0')" -ge 1 ] \
+    || fail "the transmitter did not drop itself: $(echo "$broken" | jq -c '.drops')"
+ctl command "gamemode creative"
+ctl command "clear @s"
+ctl wait 4
 
 echo "== the grid opens its 9x6 menu, empty with no disk =="
 ctl command "execute in minecraft:the_end run tp @s 42.5 64 2.5"
@@ -266,7 +449,7 @@ ctl command "gamemode creative"
 ctl wait 4
 ctl interact 43 64 0
 ctl wait 8
-if [ "$SELFTEST" = 1 ]; then
+if [ "$SELFTEST" = offline ]; then
     echo "(selftest: asserting the offline grid still lists the gold)"
     expect_slots '[{"slot":300,"item":"minecraft:gold_ingot","count":3}]'
 else
@@ -416,5 +599,5 @@ expect_slots '[{"slot":300,"item":"minecraft:gold_ingot","count":3}]'
 ctl close
 ctl wait 4
 
-echo "PASS: every carried recipe crafts in game with its declared output and count (and its wrong-ingredient control leaves the result empty), the machine casing places, reads back and drops itself, two grids on one network never offered the same items twice, the cable follows its neighbours and the grid is active with a controller, the disk went into the drive and the grid listed what was deposited through its menu, the search filtered it, a shift-click withdrew the diamonds, breaking the controller took the network offline and putting it back restored the disk's gold, a network without a drive listed nothing, a stick did not enter the drive, a vanilla barrel is not a network block, and the disk kept its 3 gold across a relaunch"
+echo "PASS: the wireless transmitter joined its network through the facing side only (offline facing away, active facing the cable), /refinedstorage info named it and its range 16 blocks, a use 2.5 blocks away and one exactly 16 blocks away were accepted, 17 blocks away was refused naming the distance, an offline transmitter refused and a position without one answered so, a use from the End against the overworld transmitter was refused as a different dimension while the same command under execute in was accepted, the item placed against the clicked face, the block dropped itself and the refinedstorage:wireless advancement was granted (and was absent before), every carried recipe crafts in game with its declared output and count (and its wrong-ingredient control leaves the result empty), the machine casing places, reads back and drops itself, two grids on one network never offered the same items twice, the cable follows its neighbours and the grid is active with a controller, the disk went into the drive and the grid listed what was deposited through its menu, the search filtered it, a shift-click withdrew the diamonds, breaking the controller took the network offline and putting it back restored the disk's gold, a network without a drive listed nothing, a stick did not enter the drive, a vanilla barrel is not a network block, and the disk kept its 3 gold across a relaunch"
 # The cleanup trap prints EXIT:<status> as the last line.

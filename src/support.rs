@@ -18,15 +18,16 @@ use std::sync::{Mutex, OnceLock};
 use mod_api::item::containers::ModBlockEntityFields;
 use mod_api::{
     self, BlockEntityEvent, BlockEntityPart, BlockEntityTickEvent, BlockEntityTicksEvent, BlockKey,
-    BlockPart, Command, CommandArgumentValue, Component, Compound, Flow, Host, HostSide,
-    HostTransaction, ItemKey, ItemStack, LevelSide, ModBlockEntityView, ModContainer,
-    RegisterCommandsEvent, Registrar, RegistrationContext, RightClickBlockEvent,
-    RunModCommandEvent, Screen, ScreenEvent, ServerHost, Tag, Text, WorldPhase,
+    BlockPart, BlockState, Command, CommandArgumentValue, CommandInvocation, CommandSource,
+    Component, Compound, Flow, Host, HostSide, HostTransaction, ItemKey, ItemStack, LevelHost,
+    LevelRef, LevelSide, ModBlockEntityView, ModContainer, RegisterCommandsEvent, Registrar,
+    RegistrationContext, RightClickBlockEvent, RunModCommandEvent, Screen, ScreenEvent, ServerHost,
+    StateForPlacementEvent, Tag, Text, WorldPhase,
 };
 
 use crate::runtime::{
-    self, CAPACITY_1K, DRIVE_SLOTS, Delta, Disk, GRID_SLOTS, Kind, Stored, extract, insert,
-    network, view_with,
+    self, CAPACITY_1K, DRIVE_SLOTS, Delta, Disk, Face, GRID_SLOTS, Kind, Node, Stored,
+    WIRELESS_RANGE, extract, insert, network, view_with,
 };
 
 /// The five content ids of the slice, exactly as the content declares them.
@@ -35,6 +36,9 @@ const CABLE: &str = "refinedstorage:cable";
 const DISK_DRIVE: &str = "refinedstorage:disk_drive";
 const GRID: &str = "refinedstorage:grid";
 const DISK: &str = "refinedstorage:1k_storage_disk";
+/// The wireless transmitter (slice 3): a network node that joins through its
+/// facing side and answers whether a player may use its network.
+const TRANSMITTER: &str = "refinedstorage:wireless_transmitter";
 /// The block-entity type this mod declares for the four network blocks.
 const BE_TYPE: &str = "refinedstorage:network";
 /// The item component that carries a disk's contents.
@@ -61,18 +65,20 @@ struct Keys {
     cable: BlockKey,
     disk_drive: BlockKey,
     grid: BlockKey,
+    transmitter: BlockKey,
     disk: ItemKey,
 }
 
 impl Keys {
     /// The network kind of a loaded block, none when it is not one of the
-    /// slice's four.
+    /// five.
     fn kind_of(self, block: BlockKey) -> Option<Kind> {
         [
             (self.controller, Kind::Controller),
             (self.cable, Kind::Cable),
             (self.disk_drive, Kind::DiskDrive),
             (self.grid, Kind::Grid),
+            (self.transmitter, Kind::WirelessTransmitter),
         ]
         .into_iter()
         .find_map(|(key, kind)| (key == block).then_some(kind))
@@ -95,12 +101,13 @@ pub(crate) fn register(registrar: &mut dyn Registrar, _cx: &RegistrationContext)
         cable: registrar.block_key(CABLE),
         disk_drive: registrar.block_key(DISK_DRIVE),
         grid: registrar.block_key(GRID),
+        transmitter: registrar.block_key(TRANSMITTER),
         disk: registrar.item_key(DISK),
     };
     let _ = KEYS.set(keys);
     let kind = registrar
         .block_entity_type(BE_TYPE)
-        .blocks(&[CONTROLLER, CABLE, DISK_DRIVE, GRID])
+        .blocks(&[CONTROLLER, CABLE, DISK_DRIVE, GRID, TRANSMITTER])
         .build();
     registrar
         .block_entity_part(&kind, Network)
@@ -286,9 +293,38 @@ fn kind_at(host: &dyn Host, pos: [i32; 3]) -> Option<Kind> {
     keys().kind_of(block)
 }
 
-/// The network the block at `start` belongs to, read from the loaded level.
+/// The node at `pos` in `level`: its kind, and for a wireless transmitter the
+/// face its `facing` state points at (upstream joins the network through that
+/// side only).
+fn node_at(host: &dyn Host, level: mod_api::LevelRef, pos: [i32; 3]) -> Option<Node> {
+    if !level.is_loaded(host, pos) {
+        return None;
+    }
+    let block = level.block(host, pos)?;
+    let kind = keys().kind_of(block)?;
+    if kind != Kind::WirelessTransmitter {
+        return Some(Node::plain(kind));
+    }
+    let face = level
+        .block_property(host, pos, "facing")
+        .as_deref()
+        .and_then(Face::from_property)?;
+    Some(Node::facing(kind, face))
+}
+
+/// The network the block at `start` belongs to in `level`, read from the
+/// loaded level (`level_in_place` is false for a parked level, whose blocks
+/// can still be read, so the same read answers in another dimension).
+fn network_in(host: &dyn Host, level: mod_api::LevelRef, start: [i32; 3]) -> runtime::Network {
+    network(start, |pos| node_at(host, level, pos))
+}
+
+/// The network the block at `start` belongs to, in the level in place.
 fn network_at(host: &dyn Host, start: [i32; 3]) -> runtime::Network {
-    network(start, |pos| kind_at(host, pos))
+    let Some(level) = host.level(host.dimension()) else {
+        return runtime::Network::default();
+    };
+    network_in(host, level, start)
 }
 
 // --- the Part: the four network blocks ------------------------------------
@@ -298,7 +334,25 @@ fn network_at(host: &dyn Host, start: [i32; 3]) -> runtime::Network {
 struct Network;
 
 #[mod_api::horizon_part]
-impl BlockPart for Network {}
+impl BlockPart for Network {
+    /// The transmitter faces the face it was placed against (upstream's
+    /// `DefaultDirectionType.FACE_CLICKED`).
+    fn state_for_placement(
+        &self,
+        level: &dyn LevelHost,
+        event: &mut StateForPlacementEvent<'_>,
+    ) -> Option<Option<BlockState>> {
+        let block = level.state_block(event.state)?;
+        if Kind::from_block(block) != Some(Kind::WirelessTransmitter) {
+            return None;
+        }
+        let face = Face::from_offset(event.context.face.normal())?;
+        Some(Some(level.block_state_id(&format!(
+            "{block}[facing={}]",
+            face.property()
+        ))?))
+    }
+}
 
 #[mod_api::horizon_part]
 impl BlockEntityPart for Network {
@@ -311,12 +365,13 @@ impl BlockEntityPart for Network {
         Some(Compound::new())
     }
 
-    /// The cable (its connections), the drive (its disks) and the grid (its
-    /// view) tick; the controller holds no state yet.
+    /// The cable (its connections), the drive (its disks), the grid (its
+    /// view) and the transmitter (its `active` state) tick; the controller
+    /// holds no state.
     fn block_entity_ticks(&self, _host: &dyn Host, event: &mut BlockEntityTicksEvent<'_>) {
         event.ticks = matches!(
             Kind::from_block(event.block),
-            Some(Kind::Cable | Kind::DiskDrive | Kind::Grid)
+            Some(Kind::Cable | Kind::DiskDrive | Kind::Grid | Kind::WirelessTransmitter)
         );
     }
 
@@ -327,6 +382,7 @@ impl BlockEntityPart for Network {
             Some(Kind::Cable) => cable_tick(host, pos),
             Some(Kind::DiskDrive) => drive_tick(host, pos, &mut event.entity),
             Some(Kind::Grid) => grid_tick(host, pos, &mut event.entity),
+            Some(Kind::WirelessTransmitter) => transmitter_tick(host, pos),
             Some(Kind::Controller) | None => {}
         }
     }
@@ -368,7 +424,7 @@ impl BlockEntityPart for Network {
                     ..Screen::default()
                 })
             }
-            Kind::Controller | Kind::Cable => None,
+            Kind::Controller | Kind::Cable | Kind::WirelessTransmitter => None,
         }
     }
 }
@@ -662,6 +718,20 @@ fn grid_tick(host: &mut dyn ServerHost, pos: [i32; 3], entity: &mut ModBlockEnti
     }
 }
 
+/// A transmitter's tick: `active` is whether the network it joins has a
+/// controller. It joins through its facing side only, so a transmitter placed
+/// with its face away from a cable is offline and answers no use.
+fn transmitter_tick(host: &mut dyn ServerHost, pos: [i32; 3]) {
+    let online = network_at(host, pos).online();
+    let key = (host.dimension().to_owned(), pos);
+    let previous = with_core(|core| core.active.get(&key).copied());
+    if previous == Some(online) {
+        return;
+    }
+    host.set_block_property(pos, "active", if online { "true" } else { "false" });
+    with_core(|core| core.active.insert(key, online));
+}
+
 /// Every cache key a set of drives can hold.
 fn drive_keys(dimension: &str, drives: &[[i32; 3]]) -> Vec<DiskKey> {
     drives
@@ -801,13 +871,20 @@ fn tell(host: &mut dyn ServerHost, uuid: u128, line: &str) {
 
 // --- commands --------------------------------------------------------------
 
-/// `/refinedstorage info|filter` (`register_commands`).
+/// `/refinedstorage info|filter|wireless` (`register_commands`).
 pub(crate) fn on_register_commands(event: &mut RegisterCommandsEvent<'_>) {
     event
         .commands
         .push(Command::new("refinedstorage info <pos:block_pos>"));
     event.commands.push(Command::new(
         "refinedstorage filter <pos:block_pos> [text:text]",
+    ));
+    // The use a wireless grid will make: does this player, here, reach the
+    // network this transmitter exposes? (Upstream asks the same question through
+    // `NetworkItemPlayerValidator`; with no wireless grid in the package yet,
+    // this is how the rule is exercised.)
+    event.commands.push(Command::new(
+        "refinedstorage wireless <pos:block_pos> <dimension:dimension>",
     ));
 }
 
@@ -825,7 +902,7 @@ pub(crate) fn on_run_mod_command(
     let Some(CommandArgumentValue::BlockPos(pos)) = event.command.argument("pos") else {
         feedback(
             host,
-            "Usage: /refinedstorage <info|filter> <x> <y> <z> [text]",
+            "Usage: /refinedstorage <info|filter|wireless> <x> <y> <z> [text|dimension]",
         );
         return Flow::Cancel;
     };
@@ -841,6 +918,19 @@ pub(crate) fn on_run_mod_command(
                 _ => String::new(),
             };
             filter_at(host, pos, &filter);
+            Flow::Cancel
+        }
+        "wireless" => {
+            let Some(CommandArgumentValue::Dimension(level)) =
+                event.command.argument("dimension").cloned()
+            else {
+                feedback(
+                    host,
+                    "Usage: /refinedstorage wireless <x> <y> <z> <dimension>",
+                );
+                return Flow::Cancel;
+            };
+            wireless(host, event.source, event.command, pos, level);
             Flow::Cancel
         }
         _ => Flow::Continue,
@@ -872,21 +962,95 @@ fn info(host: &mut dyn ServerHost, pos: [i32; 3]) {
         })
     };
     let online = net.online();
+    let mut census = format!(
+        "{} nodes, {} controller, {} drive, {} grid",
+        net.nodes.len(),
+        net.count(Kind::Controller),
+        drives.len(),
+        net.count(Kind::Grid),
+    );
+    let transmitters = net.count(Kind::WirelessTransmitter);
+    if transmitters > 0 {
+        census.push_str(&format!(", {transmitters} transmitter"));
+    }
     feedback(
         host,
         &format!(
-            "Refined Storage network at {},{},{}: {state} ({} nodes, {} controller, {} drive, {} grid); {} disks, {items} items in {resources} resources",
+            "Refined Storage network at {},{},{}: {state} ({census}); {} disks, {items} items in {resources} resources",
             pos[0],
             pos[1],
             pos[2],
-            net.nodes.len(),
-            net.count(Kind::Controller),
-            drives.len(),
-            net.count(Kind::Grid),
             disks,
             state = if online { "online" } else { "offline" },
         ),
     );
+    if kind_at(host, pos) == Some(Kind::WirelessTransmitter) {
+        feedback(
+            host,
+            &format!(
+                "Wireless transmitter at {},{},{}: range {WIRELESS_RANGE} blocks, {}",
+                pos[0],
+                pos[1],
+                pos[2],
+                if online { "active" } else { "inactive" },
+            ),
+        );
+    }
+}
+
+/// The body of `/refinedstorage wireless <pos> <dimension>`: the admission a
+/// wireless grid asks of a transmitter before it answers the player's use —
+/// the same dimension, an online network, and within the transmitter's range
+/// (`NetworkItemPlayerValidator.isValid`).
+fn wireless(
+    host: &mut dyn ServerHost,
+    source: &CommandSource,
+    command: &CommandInvocation,
+    pos: [i32; 3],
+    level: LevelRef,
+) {
+    if node_at(host, level, pos).map(|node| node.kind) != Some(Kind::WirelessTransmitter) {
+        feedback(host, "No wireless transmitter there.");
+        return;
+    }
+    let online = network_in(host, level, pos).online();
+    // Upstream hands the validator the *player's* coordinates; the command's
+    // own dimension is the dimension the use happens in (`execute in` moves it),
+    // and a player's real position is used for the distance so a rewritten
+    // execution position cannot fake a range pass.
+    let from = match source {
+        CommandSource::Player { player, .. } => player.entity().position(host),
+        _ => Some(command.position),
+    };
+    let Some(from) = from else {
+        feedback(host, "No position for this use.");
+        return;
+    };
+    let distance = runtime::distance(from, pos);
+    match runtime::admit(
+        online,
+        command.dimension == level.dimension(),
+        distance,
+        WIRELESS_RANGE,
+    ) {
+        Ok(()) => feedback(
+            host,
+            &format!(
+                "Wireless access at {},{},{}: accepted ({distance:.1} of {WIRELESS_RANGE} blocks, {} network)",
+                pos[0],
+                pos[1],
+                pos[2],
+                if online { "online" } else { "offline" },
+            ),
+        ),
+        Err(refusal) => feedback(
+            host,
+            &format!(
+                "Wireless access at {},{},{}: refused ({refusal})",
+                pos[0], pos[1], pos[2]
+            ),
+        ),
+    }
 }
 
 fn filter_at(host: &mut dyn ServerHost, pos: [i32; 3], filter: &str) {

@@ -1,0 +1,56 @@
+{
+  "variants": {
+    "active=false,facing=down": {
+      "model": "refinedstorage:block/wireless_transmitter/inactive"
+    },
+    "active=false,facing=east": {
+      "model": "refinedstorage:block/wireless_transmitter/inactive",
+      "x": 90,
+      "y": 270
+    },
+    "active=false,facing=north": {
+      "model": "refinedstorage:block/wireless_transmitter/inactive",
+      "x": 90,
+      "y": 180
+    },
+    "active=false,facing=south": {
+      "model": "refinedstorage:block/wireless_transmitter/inactive",
+      "x": 90
+    },
+    "active=false,facing=up": {
+      "model": "refinedstorage:block/wireless_transmitter/inactive",
+      "x": 180
+    },
+    "active=false,facing=west": {
+      "model": "refinedstorage:block/wireless_transmitter/inactive",
+      "x": 90,
+      "y": 90
+    },
+    "active=true,facing=down": {
+      "model": "refinedstorage:block/wireless_transmitter/light_blue"
+    },
+    "active=true,facing=east": {
+      "model": "refinedstorage:block/wireless_transmitter/light_blue",
+      "x": 90,
+      "y": 270
+    },
+    "active=true,facing=north": {
+      "model": "refinedstorage:block/wireless_transmitter/light_blue",
+      "x": 90,
+      "y": 180
+    },
+    "active=true,facing=south": {
+      "model": "refinedstorage:block/wireless_transmitter/light_blue",
+      "x": 90
+    },
+    "active=true,facing=up": {
+      "model": "refinedstorage:block/wireless_transmitter/light_blue",
+      "x": 180
+    },
+    "active=true,facing=west": {
+      "model": "refinedstorage:block/wireless_transmitter/light_blue",
+      "x": 90,
+      "y": 90
+    }
+  }
+}

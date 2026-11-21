@@ -1,0 +1,17 @@
+{
+  "type": "minecraft:crafting_shaped",
+  "pattern": [
+    "EPE",
+    "EME",
+    "EAE"
+  ],
+  "key": {
+    "E": "refinedstorage:quartz_enriched_iron",
+    "P": "#c:ender_pearls",
+    "M": "refinedstorage:machine_casing",
+    "A": "refinedstorage:advanced_processor"
+  },
+  "result": {
+    "id": "refinedstorage:wireless_transmitter"
+  }
+}

@@ -1,0 +1,26 @@
+{
+  "display": {
+    "icon": {
+      "id": "refinedstorage:controller"
+    },
+    "title": {
+      "translate": "mod.refinedstorage"
+    },
+    "description": {
+      "translate": "advancements.refinedstorage.root.description"
+    },
+    "background": "minecraft:textures/gui/advancements/backgrounds/stone.png"
+  },
+  "criteria": {
+    "controller_in_inventory": {
+      "trigger": "minecraft:inventory_changed",
+      "conditions": {
+        "items": [
+          {
+            "items": "#refinedstorage:controllers"
+          }
+        ]
+      }
+    }
+  }
+}

@@ -22,14 +22,21 @@ pub const GRID_SLOTS: usize = 54;
 pub const DRIVE_SLOTS: usize = 9;
 /// The most blocks one flood fill visits; a network larger than this is cut.
 pub const NETWORK_CAP: usize = 512;
+/// How far a wireless transmitter reaches, in blocks (upstream
+/// `DefaultEnergyUsage.WIRELESS_TRANSMITTER_BASE_RANGE`, the config key
+/// `wirelessTransmitter.baseRange`; this port carries no config file yet, so the
+/// upstream default is the rule).
+pub const WIRELESS_RANGE: u32 = 16;
 
-/// The four network blocks of the slice.
+/// The network blocks of the port: the slice's four, plus the wireless
+/// transmitter (slice 3).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Kind {
     Controller,
     Cable,
     DiskDrive,
     Grid,
+    WirelessTransmitter,
 }
 
 impl Kind {
@@ -40,15 +47,142 @@ impl Kind {
             Kind::Cable => "refinedstorage:cable",
             Kind::DiskDrive => "refinedstorage:disk_drive",
             Kind::Grid => "refinedstorage:grid",
+            Kind::WirelessTransmitter => "refinedstorage:wireless_transmitter",
         }
     }
 
     /// The kind a block id stands for, or none for any other block.
     pub fn from_block(block: &str) -> Option<Kind> {
-        [Kind::Controller, Kind::Cable, Kind::DiskDrive, Kind::Grid]
-            .into_iter()
-            .find(|kind| kind.block_id() == block)
+        [
+            Kind::Controller,
+            Kind::Cable,
+            Kind::DiskDrive,
+            Kind::Grid,
+            Kind::WirelessTransmitter,
+        ]
+        .into_iter()
+        .find(|kind| kind.block_id() == block)
     }
+}
+
+/// A face of a block, in the order [`neighbours`] lists them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Face {
+    North,
+    East,
+    South,
+    West,
+    Up,
+    Down,
+}
+
+impl Face {
+    /// The block offset one step out of this face.
+    pub fn offset(self) -> [i32; 3] {
+        match self {
+            Face::North => [0, 0, -1],
+            Face::East => [1, 0, 0],
+            Face::South => [0, 0, 1],
+            Face::West => [-1, 0, 0],
+            Face::Up => [0, 1, 0],
+            Face::Down => [0, -1, 0],
+        }
+    }
+
+    /// The face across the block.
+    pub fn opposite(self) -> Face {
+        match self {
+            Face::North => Face::South,
+            Face::East => Face::West,
+            Face::South => Face::North,
+            Face::West => Face::East,
+            Face::Up => Face::Down,
+            Face::Down => Face::Up,
+        }
+    }
+
+    /// The face a `facing`/`direction` state property value names, none for any
+    /// other value.
+    pub fn from_property(value: &str) -> Option<Face> {
+        [
+            Face::North,
+            Face::East,
+            Face::South,
+            Face::West,
+            Face::Up,
+            Face::Down,
+        ]
+        .into_iter()
+        .find(|face| face.property() == value)
+    }
+
+    /// The face a unit block offset names, none for anything else.
+    pub fn from_offset(offset: [i32; 3]) -> Option<Face> {
+        [
+            Face::North,
+            Face::East,
+            Face::South,
+            Face::West,
+            Face::Up,
+            Face::Down,
+        ]
+        .into_iter()
+        .find(|face| face.offset() == offset)
+    }
+
+    /// The state property value this face is written as.
+    pub fn property(self) -> &'static str {
+        match self {
+            Face::North => "north",
+            Face::East => "east",
+            Face::South => "south",
+            Face::West => "west",
+            Face::Up => "up",
+            Face::Down => "down",
+        }
+    }
+}
+
+/// A block the flood fill reads: its kind, and, for a wireless transmitter, the
+/// one face it joins the network through.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct Node {
+    pub kind: Kind,
+    /// `Some` for a block that joins through one face only (upstream's
+    /// `WirelessTransmitterConnectionStrategy`), `None` for every other block.
+    pub face: Option<Face>,
+}
+
+impl Node {
+    /// A node that joins on all six sides.
+    pub fn plain(kind: Kind) -> Self {
+        Node { kind, face: None }
+    }
+
+    /// A node that joins through `face` only.
+    pub fn facing(kind: Kind, face: Face) -> Self {
+        Node {
+            kind,
+            face: Some(face),
+        }
+    }
+}
+
+/// The offset from one position to a face neighbour of it.
+fn offset(from: [i32; 3], to: [i32; 3]) -> [i32; 3] {
+    [to[0] - from[0], to[1] - from[1], to[2] - from[2]]
+}
+
+/// Whether two face-adjacent nodes link: every network block takes every side,
+/// except a wireless transmitter, which joins through its facing side only and
+/// then only when the neighbour on that side is the one asking (upstream's
+/// `canAcceptIncomingConnection`: `incomingDirection == myDirection`).
+fn links(from: Node, to: Node, step: [i32; 3]) -> bool {
+    let leaves = from.face.is_none_or(|face| face.offset() == step);
+    let arrives = to
+        .face
+        .is_none_or(|face| face.offset() == [-step[0], -step[1], -step[2]]);
+    leaves && arrives
 }
 
 /// The six face neighbours of a position, in the order
@@ -99,10 +233,10 @@ impl Network {
     }
 }
 
-/// Flood fill the network `start` belongs to. `at` answers the kind of the
-/// block at a position from the world (none for a non-network or unloaded
-/// block); `start` itself must be a network block.
-pub fn network(start: [i32; 3], mut at: impl FnMut([i32; 3]) -> Option<Kind>) -> Network {
+/// Flood fill the network `start` belongs to. `at` answers the node at a position
+/// from the world (none for a non-network or unloaded block); `start` itself must
+/// be a network block.
+pub fn network(start: [i32; 3], mut at: impl FnMut([i32; 3]) -> Option<Node>) -> Network {
     let mut out = Network::default();
     if at(start).is_none() {
         return out;
@@ -112,21 +246,85 @@ pub fn network(start: [i32; 3], mut at: impl FnMut([i32; 3]) -> Option<Kind>) ->
     seen.insert(start);
     queue.push_back(start);
     while let Some(pos) = queue.pop_front() {
-        let Some(kind) = at(pos) else {
+        let Some(node) = at(pos) else {
             continue;
         };
         if out.nodes.len() >= NETWORK_CAP {
             out.truncated = true;
             break;
         }
-        out.nodes.push((kind, pos));
+        out.nodes.push((node.kind, pos));
         for next in neighbours(pos) {
-            if seen.insert(next) && at(next).is_some() {
+            if seen.contains(&next) {
+                continue;
+            }
+            let Some(next_node) = at(next) else {
+                continue;
+            };
+            if links(node, next_node, offset(pos, next)) {
+                seen.insert(next);
                 queue.push_back(next);
             }
         }
     }
     out
+}
+
+/// Why a network-bound use through a wireless transmitter was refused.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Refusal {
+    /// The user and the transmitter are in different dimensions.
+    DifferentDimension,
+    /// The transmitter's network has no controller, so every node of it is
+    /// inactive.
+    Offline,
+    /// The user is further from the transmitter's block than its range.
+    OutOfRange { distance: f64, range: u32 },
+}
+
+impl std::fmt::Display for Refusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Refusal::DifferentDimension => write!(f, "different dimension"),
+            Refusal::Offline => write!(f, "the network is offline"),
+            Refusal::OutOfRange { distance, range } => {
+                write!(f, "out of range: {distance:.1} > {range} blocks")
+            }
+        }
+    }
+}
+
+/// The distance from a player's position to a transmitter's block, as upstream
+/// measures it: the square root of three squared coordinate differences, the
+/// transmitter at its integer block position and the player at their own.
+pub fn distance(from: [f64; 3], block: [i32; 3]) -> f64 {
+    let dx = f64::from(block[0]) - from[0];
+    let dy = f64::from(block[1]) - from[1];
+    let dz = f64::from(block[2]) - from[2];
+    (dx * dx + dy * dy + dz * dz).sqrt()
+}
+
+/// Whether a network-bound use may use the network a wireless transmitter
+/// exposes. `online` is whether the transmitter's component has a controller
+/// (otherwise every node of it is inactive); `same_dimension` whether the user
+/// and the transmitter are in one dimension; `distance` the value
+/// [`distance`] answered; `range` the transmitter's range in blocks.
+///
+/// The checks run in upstream's order (`NetworkItemPlayerValidator.isValid`):
+/// dimension first, then the node's activeness, then the range, so a use in
+/// another dimension is refused as such even when the transmitter is offline
+/// too. The boundary is inclusive, as upstream's `<=` is.
+pub fn admit(online: bool, same_dimension: bool, distance: f64, range: u32) -> Result<(), Refusal> {
+    if !same_dimension {
+        return Err(Refusal::DifferentDimension);
+    }
+    if !online {
+        return Err(Refusal::Offline);
+    }
+    if distance > f64::from(range) {
+        return Err(Refusal::OutOfRange { distance, range });
+    }
+    Ok(())
 }
 
 /// What a stored entry must answer for the network to treat it as one resource.
@@ -554,9 +752,17 @@ mod tests {
             Some(Kind::DiskDrive)
         );
         assert_eq!(Kind::from_block("refinedstorage:grid"), Some(Kind::Grid));
+        assert_eq!(
+            Kind::from_block("refinedstorage:wireless_transmitter"),
+            Some(Kind::WirelessTransmitter)
+        );
         assert_eq!(Kind::from_block("minecraft:stone"), None);
         assert_eq!(Kind::from_block("refinedstorage:importer"), None);
         assert_eq!(Kind::Controller.block_id(), "refinedstorage:controller");
+        assert_eq!(
+            Kind::WirelessTransmitter.block_id(),
+            "refinedstorage:wireless_transmitter"
+        );
     }
 
     #[test]
@@ -571,7 +777,7 @@ mod tests {
             nodes
                 .iter()
                 .find(|(_, at)| *at == pos)
-                .map(|(kind, _)| *kind)
+                .map(|(kind, _)| Node::plain(*kind))
         });
         assert_eq!(net.nodes.len(), 4);
         assert!(net.online());
@@ -593,7 +799,7 @@ mod tests {
             nodes
                 .iter()
                 .find(|(_, at)| *at == pos)
-                .map(|(kind, _)| *kind)
+                .map(|(kind, _)| Node::plain(*kind))
         });
         assert_eq!(net.nodes.len(), 3);
         assert!(!net.online(), "no controller means no network");
@@ -610,7 +816,7 @@ mod tests {
             nodes
                 .iter()
                 .find(|(_, at)| *at == pos)
-                .map(|(kind, _)| *kind)
+                .map(|(kind, _)| Node::plain(*kind))
         };
         let net = network([0, 64, 0], at);
         assert_eq!(net.nodes, vec![(Kind::Controller, [0, 64, 0])]);
@@ -644,11 +850,176 @@ mod tests {
         // A wall of `NETWORK_CAP + 8` cables: the fill reports the cut.
         let at = |pos: [i32; 3]| {
             (pos[1] == 0 && pos[2] == 0 && (0..NETWORK_CAP as i32 + 8).contains(&pos[0]))
-                .then_some(Kind::Cable)
+                .then_some(Node::plain(Kind::Cable))
         };
         let net = network([0, 0, 0], at);
         assert_eq!(net.nodes.len(), NETWORK_CAP);
         assert!(net.truncated);
+    }
+
+    // --- the wireless transmitter ------------------------------------------
+
+    /// A tiny world: the nodes it holds, by position.
+    fn world(nodes: &[(Node, [i32; 3])]) -> impl FnMut([i32; 3]) -> Option<Node> + '_ {
+        move |pos| {
+            nodes
+                .iter()
+                .find(|(_, at)| *at == pos)
+                .map(|(node, _)| *node)
+        }
+    }
+
+    #[test]
+    fn every_face_has_an_offset_an_opposite_and_a_property_name() {
+        assert_eq!(Face::North.offset(), [0, 0, -1]);
+        assert_eq!(Face::Up.offset(), [0, 1, 0]);
+        assert_eq!(Face::Down.opposite(), Face::Up);
+        assert_eq!(Face::East.opposite(), Face::West);
+        for face in [
+            Face::North,
+            Face::East,
+            Face::South,
+            Face::West,
+            Face::Up,
+            Face::Down,
+        ] {
+            assert_eq!(face.opposite().opposite(), face);
+            assert_eq!(
+                Face::from_property(face.property()),
+                Some(face),
+                "a written property reads back as the same face"
+            );
+            assert!(neighbours([0, 0, 0]).contains(&face.offset()));
+        }
+        assert_eq!(Face::from_property("middle"), None);
+    }
+
+    #[test]
+    fn a_transmitter_joins_the_network_through_its_facing_side_only() {
+        // controller 0 - cable 1 - transmitter 2, the cable west of it.
+        let nodes = [
+            (Node::plain(Kind::Controller), [0, 64, 0]),
+            (Node::plain(Kind::Cable), [1, 64, 0]),
+        ];
+        // Facing the cable: one online network of three.
+        let mut facing_cable = nodes.to_vec();
+        facing_cable.push((
+            Node::facing(Kind::WirelessTransmitter, Face::West),
+            [2, 64, 0],
+        ));
+        let net = network([2, 64, 0], world(&facing_cable));
+        assert_eq!(net.nodes.len(), 3);
+        assert!(
+            net.online(),
+            "facing the cable joins the controller's network"
+        );
+
+        // Facing up: nothing on its face, so it is its own offline component and
+        // the cable's component does not reach it either.
+        let mut facing_away = nodes.to_vec();
+        facing_away.push((
+            Node::facing(Kind::WirelessTransmitter, Face::Up),
+            [2, 64, 0],
+        ));
+        let tx = network([2, 64, 0], world(&facing_away));
+        assert_eq!(
+            tx.nodes,
+            vec![(Kind::WirelessTransmitter, [2, 64, 0])],
+            "a transmitter that faces nothing is alone"
+        );
+        assert!(!tx.online());
+        let cable = network([1, 64, 0], world(&facing_away));
+        assert_eq!(
+            cable.nodes.len(),
+            2,
+            "the cable does not reach it from behind"
+        );
+        assert!(cable.online());
+    }
+
+    #[test]
+    fn a_transmitter_takes_the_side_it_faces_when_the_neighbour_is_the_one_asking() {
+        // Two transmitters facing each other: each is the other's facing
+        // neighbour, so they are one component of their own — and the cable
+        // behind the first (which it faces away from) does not reach either.
+        let nodes = [
+            (Node::plain(Kind::Controller), [0, 64, 0]),
+            (Node::plain(Kind::Cable), [1, 64, 0]),
+            (
+                Node::facing(Kind::WirelessTransmitter, Face::East),
+                [2, 64, 0],
+            ),
+            (
+                Node::facing(Kind::WirelessTransmitter, Face::West),
+                [3, 64, 0],
+            ),
+        ];
+        let pair = network([2, 64, 0], world(&nodes));
+        assert_eq!(pair.nodes.len(), 2);
+        assert_eq!(pair.count(Kind::WirelessTransmitter), 2);
+        assert!(!pair.online(), "no controller among them");
+        let cable = network([1, 64, 0], world(&nodes));
+        assert_eq!(
+            cable.nodes.len(),
+            2,
+            "the cable's network is the controller and itself"
+        );
+        assert!(cable.online());
+    }
+
+    #[test]
+    fn a_use_in_another_dimension_is_refused_as_such_even_when_offline() {
+        assert_eq!(
+            admit(false, false, 0.0, WIRELESS_RANGE),
+            Err(Refusal::DifferentDimension),
+            "upstream checks the dimension before the node's activeness"
+        );
+        assert_eq!(
+            admit(true, false, 1.0, WIRELESS_RANGE),
+            Err(Refusal::DifferentDimension)
+        );
+    }
+
+    #[test]
+    fn an_offline_transmitter_refuses_a_use_within_its_range() {
+        assert_eq!(
+            admit(false, true, 1.0, WIRELESS_RANGE),
+            Err(Refusal::Offline)
+        );
+    }
+
+    #[test]
+    fn a_use_beyond_the_range_is_refused_naming_the_distance() {
+        assert_eq!(
+            admit(true, true, 16.5, WIRELESS_RANGE),
+            Err(Refusal::OutOfRange {
+                distance: 16.5,
+                range: WIRELESS_RANGE
+            })
+        );
+        assert_eq!(
+            Refusal::OutOfRange {
+                distance: 16.5,
+                range: WIRELESS_RANGE
+            }
+            .to_string(),
+            "out of range: 16.5 > 16 blocks"
+        );
+    }
+
+    #[test]
+    fn the_range_boundary_itself_is_accepted() {
+        assert_eq!(admit(true, true, 16.0, WIRELESS_RANGE), Ok(()));
+        assert!(admit(true, true, 16.000_1, WIRELESS_RANGE).is_err());
+        assert_eq!(admit(true, true, 0.0, WIRELESS_RANGE), Ok(()));
+    }
+
+    #[test]
+    fn the_distance_is_measured_from_the_transmitter_block_to_the_user() {
+        // 1.5 blocks east, 1.5 blocks south of the block's corner: sqrt(2.25 + 2.25).
+        let d = distance([42.5, 64.0, 2.5], [41, 64, 1]);
+        assert!((d - 2.121_320_3).abs() < 1e-6, "distance was {d}");
+        assert_eq!(distance([41.0, 64.0, 1.0], [41, 64, 1]), 0.0);
     }
 
     // --- one disk ----------------------------------------------------------

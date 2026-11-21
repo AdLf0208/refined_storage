@@ -3,6 +3,7 @@
     "refinedstorage:controller",
     "refinedstorage:disk_drive",
     "refinedstorage:grid",
-    "refinedstorage:machine_casing"
+    "refinedstorage:machine_casing",
+    "refinedstorage:wireless_transmitter"
   ]
 }
