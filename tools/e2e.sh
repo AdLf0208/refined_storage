@@ -44,9 +44,16 @@
 #    `refinedstorage:wireless` advancement is granted when the item is obtained
 #    (and was absent before).
 #
+# Slice 5 (the promise table's key):
+#  - two networks in one dimension each show their own stock: network A and
+#    network B both hold 3 gold, and each grid lists its own 3 (keyed by
+#    dimension alone, one of them listed 0 and hid 3 items it did have).
+#
 # SELFTEST=1 flips the wireless range assertion (a use 17 blocks out must be
 # accepted, so the run FAILS); SELFTEST=offline flips the older "offline lists
-# nothing" assertion the same way.
+# nothing" assertion the same way; SELFTEST=grid flips the wireless grid's empty
+# view; SELFTEST=networks flips the two-network assertion (one grid must hide the
+# other network's stock, so the run FAILS now that the key is the network).
 set -euo pipefail
 export LC_ALL=C
 
@@ -96,6 +103,14 @@ count_of() { # count_of ITEM
     ctl inventory | jq -r --arg item "$1" \
         '[((.hotbar // [])[] | select(.item == $item) | .count), ((.main // [])[] | select(.item == $item) | .count)] | add // 0'
 }
+# Use the held item in the air: `ctl interact` leaves the crosshair on a block,
+# and a use on the transmitter would bind again instead of opening the grid.
+use_held() { ctl look 0 -90 >/dev/null; ctl wait 2; ctl use-item; }
+# Aim level at a block before right-clicking it (`ctl interact` needs a face of
+# the block visible from where the player stands; `use_held` looks at the sky).
+# Right-click a block with the held item, aiming the crosshair at one of its
+# faces: a player binds the grid by right-clicking the transmitter.
+use_on_block() { ctl look-at block "$1" "$2" "$3" "$4" >/dev/null; ctl wait 2; ctl use-item; }
 # The first player-inventory slot (0-35 in a container menu) holding ITEM.
 inv_slot() { # inv_slot ITEM
     ctl screen | jq -r --arg item "$1" \
@@ -217,7 +232,7 @@ fi
 echo "== the overworld transmitter, for the cross-dimension use =="
 # The player starts in the overworld; the network there is built and ticked now,
 # then the chunks are force-loaded so a use from the End can still find it.
-ctl command "execute in minecraft:overworld run tp @s 41.5 70 2.5"
+ctl command "execute in minecraft:overworld run tp @s 41.5 64 2.5"
 ctl wait 40
 ctl command "execute in minecraft:overworld run fill 32 63 -8 56 63 24 minecraft:stone"
 ctl command "execute in minecraft:overworld run fill 32 64 -8 56 74 24 minecraft:air"
@@ -311,7 +326,7 @@ ctl wait 6
 expect_reply "refinedstorage wireless 41 64 1 minecraft:overworld" "refused (different dimension)"
 expect_reply "execute in minecraft:overworld run refinedstorage wireless 41 64 1 minecraft:overworld" "accepted (1.6 of 16 blocks"
 
-echo "== the item places with the clicked face, drops itself, and grants the advancement =="
+echo "== the item places with the clicked face and drops itself; the transmitter alone is not the advancement =="
 # The advancement before the item is obtained: the player's saved progress has no
 # entry (the pre-check ran right after the arena).
 ctl command "execute in minecraft:the_end run setblock 55 64 6 minecraft:stone"
@@ -330,12 +345,14 @@ ctl save
 ctl wait 10
 after=$(adv_file)
 [ -n "$after" ] || fail "no player advancements file under $SCRATCH/saves"
-echo "  advancement after the give: $(jq -c '.["refinedstorage:wireless"] // "absent"' "$after")"
-jq -e '.["refinedstorage:wireless"].done == true' "$after" >/dev/null \
-    || fail "obtaining the transmitter did not grant refinedstorage:wireless: $(jq -c '.["refinedstorage:wireless"] // "absent"' "$after")"
-# The same event, from the announcement the game printed when the criterion fired.
-ctl messages 20 | jq -r '.chat[]' | grep -q 'made the advancement \[Wireless\]' \
-    || fail "no '[Wireless]' advancement announcement in chat"
+echo "  advancement after the transmitter alone: $(jq -c '.["refinedstorage:wireless"] // "absent"' "$after")"
+# Upstream's criteria need the wireless grid *and* a transmitter in the
+# inventory (data/refinedstorage/advancement/wireless.json), so a transmitter
+# alone must not grant it; the grid half is asserted in the wireless grid
+# section below, where the item is obtained.
+if jq -e '.["refinedstorage:wireless"].done == true' "$after" >/dev/null; then
+    fail "a wireless transmitter alone granted refinedstorage:wireless: $(jq -c '.["refinedstorage:wireless"]' "$after")"
+fi
 
 echo "== the transmitter block drops itself =="
 # The stone the item was placed against is removed, and the player stands two
@@ -522,6 +539,66 @@ expect_slots '[{"slot":300,"item":"minecraft:gold_ingot","count":3}]'
 ctl close
 ctl wait 4
 
+echo "== two networks in one dimension each show their own stock =="
+# Network A (40..43,64,0) holds 3 gold. Network B (48..50,64,0) gets a drive of
+# its own and the same 3 gold: each grid must list its own 3. Keyed by dimension
+# alone, A's promise hid B's stock (and then B's promise hid A's), so one grid
+# reported 0 while the disk under it held 3.
+ctl command "execute in minecraft:the_end run setblock 51 64 0 refinedstorage:disk_drive"
+ctl wait 10
+expect_info 51 64 0 "online (4 nodes, 1 controller, 1 drive, 1 grid); 0 disks, 0 items in 0 resources"
+ctl give refinedstorage:1k_storage_disk 1 >/dev/null
+ctl wait 4
+ctl select refinedstorage:1k_storage_disk >/dev/null
+ctl wait 4
+ctl command "execute in minecraft:the_end run tp @s 51.5 64 2.5"
+ctl wait 4
+ctl interact 51 64 0
+ctl wait 8
+[ "$(count_of refinedstorage:1k_storage_disk)" = 0 ] \
+    || fail "network B's disk stayed in the hand"
+expect_info 51 64 0 "1 disks, 0 items in 0 resources"
+ctl close
+ctl wait 4
+# 3 gold deposited through network B's own grid.
+ctl give minecraft:gold_ingot 3 >/dev/null
+ctl wait 4
+ctl command "execute in minecraft:the_end run tp @s 49.5 64 2.5"
+ctl wait 4
+ctl interact 50 64 0
+ctl wait 8
+gold_slot=$(inv_slot minecraft:gold_ingot)
+[ -n "$gold_slot" ] || fail "no gold stack in network B's menu inventory"
+ctl click-slot "$gold_slot" shift
+ctl wait 8
+expect_info 51 64 0 "1 disks, 3 items in 1 resources"
+if [ "$SELFTEST" = networks ]; then
+    echo "(selftest: asserting network B's grid hides network A's stock)"
+    expect_slots '[]'
+fi
+expect_slots '[{"slot":300,"item":"minecraft:gold_ingot","count":3}]'
+ctl close
+ctl wait 4
+# The differential, with B's promise now live: A's grid still lists its own 3.
+ctl command "execute in minecraft:the_end run tp @s 42.5 64 2.5"
+ctl wait 4
+ctl interact 43 64 0
+ctl wait 8
+expect_slots '[{"slot":300,"item":"minecraft:gold_ingot","count":3}]'
+ctl close
+ctl wait 4
+# And B's grid again, with both promises live: still its own 3.
+ctl command "execute in minecraft:the_end run tp @s 49.5 64 2.5"
+ctl wait 4
+ctl interact 50 64 0
+ctl wait 8
+expect_slots '[{"slot":300,"item":"minecraft:gold_ingot","count":3}]'
+ctl close
+ctl wait 4
+# The stock was promised, not consumed: each disk still holds its own 3.
+expect_info 43 64 0 "1 disks, 3 items in 1 resources"
+expect_info 51 64 0 "1 disks, 3 items in 1 resources"
+
 echo "== a stick is not a storage disk: the drive takes nothing =="
 ctl give minecraft:stick 1
 ctl wait 4
@@ -572,6 +649,157 @@ ctl command "gamemode creative" >/dev/null
 ctl command "clear @s" >/dev/null
 ctl wait 4
 
+echo "== the wireless grid: bind it, open the network's view, move items through it =="
+# A network of its own (48..50,64,8 with the drive at 49,64,9) inside the arena
+# floor, so the player never falls out of the world while a leg waits; no block
+# grid promises its stock, so the item's view must come from the disks itself.
+ctl command "execute in minecraft:the_end run setblock 48 64 8 refinedstorage:controller"
+ctl command "execute in minecraft:the_end run setblock 49 64 8 refinedstorage:cable"
+ctl command "execute in minecraft:the_end run setblock 50 64 8 refinedstorage:wireless_transmitter[facing=west]"
+ctl command "execute in minecraft:the_end run setblock 49 64 9 refinedstorage:disk_drive"
+ctl command "execute in minecraft:the_end run tp @s 50.5 64 10.5"
+ctl wait 14
+expect_state 50 64 8 'facing=west'
+expect_state 50 64 8 'active=true'
+expect_info 49 64 9 "online (4 nodes, 1 controller, 1 drive, 0 grid, 1 transmitter); 0 disks, 0 items in 0 resources"
+
+# The disk goes into the drive; the five diamonds are deposited through the
+# item's own menu below.
+ctl give refinedstorage:1k_storage_disk 1 >/dev/null
+ctl wait 4
+ctl select refinedstorage:1k_storage_disk >/dev/null
+ctl wait 4
+ctl command "execute in minecraft:the_end run tp @s 49.5 64 10.5"
+ctl wait 4
+ctl interact 49 64 9
+ctl wait 8
+[ "$(count_of refinedstorage:1k_storage_disk)" = 0 ] \
+    || fail "the wireless network's disk stayed in the hand"
+expect_info 49 64 9 "1 disks, 0 items in 0 resources"
+
+# The item is unbound until it is used on a transmitter: the use says so.
+ctl give refinedstorage:wireless_grid 1 >/dev/null
+ctl wait 4
+ctl select refinedstorage:wireless_grid >/dev/null
+ctl wait 4
+expect_reply "refinedstorage bound" "The wireless grid is not bound."
+ctl command "execute in minecraft:the_end run tp @s 50.5 64 10.5"
+ctl wait 4
+use_on_block 50 64 8 south
+ctl wait 6
+# The binding is the item's own component: the dimension and the block it was
+# made on, read back from the stack (upstream's `GlobalPos`).
+expect_reply "refinedstorage bound" "Wireless grid bound to 50,64,8 in minecraft:the_end."
+# The transmitter has no menu of its own: binding opens none.
+ctl screen | jq -e '.screen != "container"' >/dev/null \
+    || fail "binding the grid opened a menu: $(ctl screen | jq -c '{screen}')"
+
+# A use inside the range opens the 9x6 view of that network.
+ctl give minecraft:diamond 5 >/dev/null
+ctl wait 4
+use_held
+ctl wait 10
+ctl screen | jq -e '.screen == "container"' >/dev/null \
+    || fail "the wireless grid did not open a container menu: $(ctl screen | jq -c '{screen,slots:(.slots|length)}')"
+ctl screen | jq -e '[.slots[] | select(.slot >= 300)] | length == 54' >/dev/null \
+    || fail "the wireless grid's menu does not have 54 container slots: $(ctl screen | jq -c '[.slots[] | select(.slot >= 300)] | length')"
+if [ "$SELFTEST" = grid ]; then
+    echo "(selftest: asserting the wireless grid's empty view lists a diamond)"
+    expect_slots '[{"slot":300,"item":"minecraft:diamond","count":5}]'
+fi
+expect_slots '[]'
+# The menu's title names the item (upstream's `ContentNames.WIRELESS_GRID`).
+ctl screen | jq -r '.title // .name // empty' | grep -qi 'wireless grid' \
+    || echo "  (note: the screen reply names no title: $(ctl screen | jq -c '{title,name}'))"
+
+# A shift-click on a player's inventory slot deposits that stack on the network.
+diamond_slot=$(inv_slot minecraft:diamond)
+[ -n "$diamond_slot" ] || fail "no diamond stack in the wireless grid's player inventory"
+ctl click-slot "$diamond_slot" shift
+ctl wait 10
+expect_slots '[{"slot":300,"item":"minecraft:diamond","count":5}]'
+[ "$(count_of minecraft:diamond)" = 0 ] || fail "the deposited diamonds are still in the inventory"
+expect_info 49 64 9 "1 disks, 5 items in 1 resources"
+
+# A shift-click on the view withdraws the stack into the inventory.
+ctl click-slot 300 shift
+ctl wait 10
+expect_slots '[]'
+[ "$(count_of minecraft:diamond)" = 5 ] \
+    || fail "the withdrawn diamonds are not in the inventory: $(ctl inventory | jq -c '[.hotbar // [], .main // []]')"
+expect_info 49 64 9 "1 disks, 0 items in 0 resources"
+ctl close
+ctl wait 4
+
+# The range is the transmitter's: 17 blocks out is refused, naming the distance.
+# The floor runs x 32..56, so both spots stay on it.
+ctl tp 33 64 8
+ctl wait 6
+echo "  bound in range 17: $(reply "refinedstorage bound")"
+use_held
+ctl wait 6
+refusal=$(ctl messages 6 | jq -r '.chat[]' | grep -m1 'Wireless grid' || true)
+echo "  use 17 blocks out: $refusal"
+case "$refusal" in
+    *"refused (out of range: 17.0 > 16 blocks)"*) ;;
+    *) fail "a use 17 blocks out was not refused with its distance: '$refusal'" ;;
+esac
+ctl screen | jq -e '.screen != "container"' >/dev/null \
+    || fail "a refused use opened the grid's menu"
+# The differential: 16 blocks out is inside the range and opens the view.
+ctl tp 34 64 8
+ctl wait 6
+use_held
+ctl wait 10
+ctl screen | jq -e '.screen == "container"' >/dev/null \
+    || fail "a use exactly 16 blocks out did not open the view: $(ctl screen | jq -c '{screen}')"
+expect_slots '[]'
+ctl close
+ctl wait 4
+
+# The dimension is part of the binding: the same item, the same binding and the
+# same player, refused from the overworld and accepted in the End. Only the
+# dimension the use happens in differs, which is the differential.
+ctl command "execute in minecraft:overworld run tp @s 41.5 64 2.5"
+ctl wait 10
+use_held
+ctl wait 6
+refusal=$(ctl messages 6 | jq -r '.chat[]' | grep -m1 'Wireless grid' || true)
+echo "  use of the End transmitter from the overworld: $refusal"
+case "$refusal" in
+    *"refused (different dimension)"*) ;;
+    *) fail "a use in another dimension was not refused as such: '$refusal'" ;;
+esac
+ctl screen | jq -e '.screen != "container"' >/dev/null \
+    || fail "a cross-dimension use opened the grid's menu"
+# Back in the binding's dimension: the same item opens the view.
+ctl command "execute in minecraft:the_end run tp @s 50.5 64 10.5"
+ctl wait 10
+use_held
+ctl wait 10
+ctl screen | jq -e '.screen == "container"' >/dev/null \
+    || fail "the same use in the bound dimension did not open the view: $(ctl screen | jq -c '{screen}')"
+expect_slots '[]'
+ctl close
+ctl wait 4
+
+# The advancement needs the grid and a transmitter: the grid was obtained
+# above, so giving a transmitter completes it.
+ctl command "execute in minecraft:the_end run tp @s 50.5 64 10.5"
+ctl give refinedstorage:wireless_transmitter 1 >/dev/null
+ctl wait 20
+ctl save
+ctl wait 10
+grid_adv=$(adv_file)
+[ -n "$grid_adv" ] || fail "no player advancements file under $SCRATCH/saves"
+echo "  advancement after the grid and a transmitter: $(jq -c '.["refinedstorage:wireless"] // "absent"' "$grid_adv")"
+jq -e '.["refinedstorage:wireless"].done == true' "$grid_adv" >/dev/null \
+    || fail "the wireless grid and a transmitter did not grant refinedstorage:wireless: $(jq -c '.["refinedstorage:wireless"] // "absent"' "$grid_adv")"
+ctl messages 30 | jq -r '.chat[]' | grep -q 'made the advancement \[Wireless\]' \
+    || fail "no '[Wireless]' advancement announcement in chat"
+ctl command "clear @s" >/dev/null
+ctl wait 4
+
 echo "== an unknown id in this namespace is refused =="
 if ctl give refinedstorage:no_such_item 1 >/dev/null 2>&1; then
     fail "give refinedstorage:no_such_item succeeded"
@@ -599,5 +827,5 @@ expect_slots '[{"slot":300,"item":"minecraft:gold_ingot","count":3}]'
 ctl close
 ctl wait 4
 
-echo "PASS: the wireless transmitter joined its network through the facing side only (offline facing away, active facing the cable), /refinedstorage info named it and its range 16 blocks, a use 2.5 blocks away and one exactly 16 blocks away were accepted, 17 blocks away was refused naming the distance, an offline transmitter refused and a position without one answered so, a use from the End against the overworld transmitter was refused as a different dimension while the same command under execute in was accepted, the item placed against the clicked face, the block dropped itself and the refinedstorage:wireless advancement was granted (and was absent before), every carried recipe crafts in game with its declared output and count (and its wrong-ingredient control leaves the result empty), the machine casing places, reads back and drops itself, two grids on one network never offered the same items twice, the cable follows its neighbours and the grid is active with a controller, the disk went into the drive and the grid listed what was deposited through its menu, the search filtered it, a shift-click withdrew the diamonds, breaking the controller took the network offline and putting it back restored the disk's gold, a network without a drive listed nothing, a stick did not enter the drive, a vanilla barrel is not a network block, and the disk kept its 3 gold across a relaunch"
+echo "PASS: the wireless transmitter joined its network through the facing side only (offline facing away, active facing the cable), /refinedstorage info named it and its range 16 blocks, a use 2.5 blocks away and one exactly 16 blocks away were accepted, 17 blocks away was refused naming the distance, an offline transmitter refused and a position without one answered so, a use from the End against the overworld transmitter was refused as a different dimension while the same command under execute in was accepted, the item placed against the clicked face and the block dropped itself, every carried recipe crafts in game with its declared output and count (22 now, each with its wrong-ingredient control), the machine casing places, reads back and drops itself, the wireless grid is unbound until it is used on a transmitter and then names it (dimension and position in its own component), a use inside the range opens the network's 9x6 view with 54 slots, a shift-click in the player inventory deposits 5 diamonds on the network and a shift-click on the view withdraws them back, 17 blocks out is refused naming the distance while 16 blocks out opens the view, the same item and binding is refused as a different dimension from the overworld and accepted in the End, the refinedstorage:wireless advancement is not granted by a transmitter alone and is granted by the grid and a transmitter together, two networks in one dimension each listed their own 3 gold while the other network held 3 too, two grids on one network never offered the same items twice, the cable follows its neighbours and the grid is active with a controller, the disk went into the drive and the grid listed what was deposited through its menu, the search filtered it, a shift-click withdrew the diamonds, breaking the controller took the network offline and putting it back restored the disk's gold, a network without a drive listed nothing, a stick did not enter the drive, a vanilla barrel is not a network block, and the disk kept its 3 gold across a relaunch"
 # The cleanup trap prints EXIT:<status> as the last line.

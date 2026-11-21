@@ -25,9 +25,9 @@ mod runtime;
 mod support;
 
 use mod_api::{
-    self, ComponentTypesEvent, Flow, Hooks, HostSide, RegisterCommandsEvent, Registrar,
-    RegistrationContext, RightClickBlockEvent, RunModCommandEvent, ServerHost, ServerStartedEvent,
-    WorldLifecycleEvent,
+    self, ComponentTypesEvent, Flow, Hooks, HostSide, MenuClickedEvent, MenuClosedEvent,
+    RegisterCommandsEvent, Registrar, RegistrationContext, RightClickBlockEvent,
+    RunModCommandEvent, ServerHost, ServerStartedEvent, ServerTickEvent, WorldLifecycleEvent,
 };
 
 /// The mod holds no state of its own: everything the network needs is derived
@@ -67,17 +67,33 @@ impl Hooks for Mod {
         support::on_right_click_block(host, event)
     }
 
-    /// `/refinedstorage info|filter`.
+    /// `/refinedstorage info|filter|wireless|bound`.
     fn register_commands(&self, _host: &mut dyn ServerHost, event: &mut RegisterCommandsEvent<'_>) {
         support::on_register_commands(event);
     }
 
-    /// The bodies of `/refinedstorage info|filter`.
+    /// The bodies of `/refinedstorage info|filter|wireless|bound`.
     fn run_mod_command(
         &self,
         host: &mut dyn ServerHost,
         event: &mut RunModCommandEvent<'_>,
     ) -> Flow {
         support::on_run_mod_command(host, event)
+    }
+
+    /// A click in a menu a mod opened: a wireless grid's view moves its items
+    /// here, because the game moves nothing in such a menu.
+    fn menu_clicked(&self, host: &mut dyn ServerHost, event: &mut MenuClickedEvent) {
+        support::on_menu_clicked(host, event);
+    }
+
+    /// A wireless grid's menu closed: forget it and release its promise.
+    fn menu_closed(&self, _host: &mut dyn ServerHost, event: &mut MenuClosedEvent) {
+        support::on_menu_closed(event);
+    }
+
+    /// Each server tick: keep every open wireless grid's view current.
+    fn server_tick(&self, host: &mut dyn ServerHost, event: &mut ServerTickEvent<'_>) {
+        support::on_server_tick(host, event);
     }
 }

@@ -19,12 +19,11 @@ the network; no entities, renderers, dimensions or new vanilla hooks.
 Ported now because it is the **#1 core base** of the core-first queue: 13
 pending ATM10 mods depend on it (`ports/tools/port_queue.py`).
 
-Status: **slice 3 — the wireless transmitter (0.2.3)** — the network core of slice 1, the
-crafting chain of slice 2, and the finite-range, same-dimension transmitter an add-on's whole
-content relaxes: its block and item, the rule that it joins a network through its facing side
-only, the admission it answers (same dimension, online, within 16 blocks), the `/refinedstorage
-wireless` readout of that admission, its recipe, and the `refinedstorage:wireless` advancement.
-Everything else is the gap list below, not a claim.
+Status: **slice 4 — the wireless grid (0.2.4)** — the network core of slice 1, the crafting
+chain of slice 2, the finite-range, same-dimension transmitter of slice 3, and the item that asks
+its admission: the wireless grid binds a transmitter's dimension and position into its own
+component, opens that network's 9×6 view from anywhere inside the range, and withdraws and
+deposits through it. Everything else is the gap list below, not a claim.
 
 > The sections from `## Behaviour` to `### Verification after the repairs`
 > describe the **retired `.hnmod`** layout. They are kept as history: the
@@ -1014,3 +1013,387 @@ Evidence: `ports/_shared/evidence/refinedstorage/` — `plan-slice3-transmitter.
 `ports/_shared/evidence/refinedstorage-e2e/` — `e2e-launcher-slice3.log` (green),
 `e2e-launcher-slice3-control.log`, `e2e-launcher-slice3-selftest.log`,
 `e2e-launcher-slice3-selftest-offline.log`.
+
+## Slice 4 — the wireless grid, the item that uses the rule (2026-11-21) — version 0.2.4
+
+Gap line this slice answers — §"Gaps / deviations (slice 1)" item 2, as slice 3 left it: *"The rest of
+the mod does not exist: … ~~wireless transmitter~~ (**done in slice 3**) — … the wireless grid, portable
+grid, …"*, and slice 3's own coverage row *"the wireless grid, the portable grid, the dyed transmitters →
+**not ported** — the next slices"*. It is the consumer of the admission slice 3 built: the transmitter
+answers *whether* a network-bound item may be used; this item is what asks.
+
+Pin **`0a875da91dbb0fdcb7ba8c42c11341aa229af51a`**, mixins
+`e59da9094f0c2fdda6c627fe9eff22dec6a906f0`, SDK `0a875da`, launcher 0.2.92, game 26.3. Class `content`
+/ tier **deep**, shape **machines**, unchanged: one item, one item component, one menu surface and one
+click rule are below the tier. No new pin API and no third-party mod.
+
+### What the jar says (read from `refinedmods/refinedstorage2` tag v2.0.9, MIT)
+
+The clone (commit `0dec63affe8147702b020843c22748483ef18c01`) was read for behaviour only; it is deleted
+after this record. Files read: `common/grid/WirelessGridItem.java`, `WirelessGrid.java`,
+`WirelessGridData.java`, `WirelessGridContainerMenu.java`, `screen/AbstractGridScreen.java`,
+`support/network/item/{NetworkItemContextImpl,NetworkItemHelperImpl}.java`,
+`api/support/network/item/{NetworkItemContext,NetworkItemPlayerValidator}.java`,
+`api/network/impl/node/grid/GridOperationsImpl.java`, `api/network/node/grid/{GridExtractMode,GridInsertMode}.java`,
+`neoforge/grid/strategy/{ItemGridExtractionStrategy,ItemGridInsertionStrategy}.java`, and the jar's
+`data/refinedstorage/recipe/wireless_grid.json`, `tags/item/grids.json`, `advancement/wireless.json`,
+`lang/en_us.json`, `textures/item/wireless_grid/{inactive,active}.png`, `models/item/wireless_grid*.json`.
+
+| upstream | what this slice carries |
+|---|---|
+| `NetworkItemHelperImpl.bind` — a `GlobalPos` (dimension + block) in the `refinedstorage:network_location` component, written by `useOn` on a `NetworkItemTargetBlockEntity`, `SUCCESS` | the same component, read and written through a `Component` impl; the item binds on a wireless transmitter and answers *"Wireless grid bound to x,y,z in dimension."* |
+| `NetworkItemContextImpl.resolveNetwork` — the bound dimension's level, the chunk loaded, the block entity a network target, then `NetworkItemPlayerValidator.isValid` over the network's validators | `host.level(<bound id>)` + `host.block_entity(level, pos)` + `node_at`/`network_in`, then slice 3's `runtime::admit(online, same_dimension, distance, range)` |
+| `use` always consumes; an invalid network opens an inert, empty grid | a refusal names the reason and opens nothing (recorded deviation 2) |
+| `GridOperationsImpl.extract` — amount = `min(total, max_stack)`, `ENTIRE` that, `HALF` half (1 stays 1), `SINGLE` 1 | `runtime::extract_amount` and `runtime::insert_amount`, unit-tested |
+| `AbstractGridScreen` — a left click withdraws to the cursor, a right click half, a shift-click to the inventory; a carried stack over the area deposits (`ENTIRE` left, `SINGLE` right); a shift-click in the inventory deposits that stack | `runtime::plan_click` + `runtime::inventory_click`, unit-tested; the menu is a native chest menu, so the mod moves everything |
+| `recipe/wireless_grid.json` — `EPE/EGE/EAE`, `E` = `quartz_enriched_iron`, `P` = `#c:ender_pearls`, `G` = `#refinedstorage:grids`, `A` = `advanced_processor` | the same recipe in the pin's recipe shape, with `#refinedstorage:grids` declared (its only member here is `refinedstorage:grid`) |
+| `advancement/wireless.json` — one `inventory_changed` criterion needing **both** the wireless grid **and** a member of `#refinedstorage:wireless_transmitters` | restored exactly; this closes slice 3's deviation 3 (which could only test the transmitter) |
+
+### The menu half: probed first, and it reconciles
+
+The pin's `ModContainer` is block-shaped, so a menu opened *from an item* cannot use it. What the pin
+does have is `ServerHost::open_menu(uuid, rows, title, items, replace)` — a chest menu opened in place of
+the player's, whose slots are `MenuSlotBacking::Native(index)` and whose clicks reach `Hooks::menu_clicked`
+with **nothing moved** (`crates/horizon-mod-vocab/src/hooks/notes.rs`, "Server menus"). So the mod owns
+every movement: `ItemPlace::MenuSlot` / `MenuCursor` writes in one transaction, `Hooks::menu_closed` to
+forget the menu, and a `server_tick` refresh that rewrites the view with `menu_set_items` when it changed.
+
+The probe was the first in-game leg of this slice, and it found two defects of the glue (both fixed, both
+invisible to `check`/`fits`/unit tests):
+
+1. a shift-click on a **player inventory** slot deposited the *cursor* instead of that slot's stack (the
+   plan's `Deposit` covers both, and the source place is the clicked slot for one and the cursor for the
+   other);
+2. a shift-click on a **view** slot withdrew nothing: `menu_clicked` swaps no acting player in, so
+   `host.players().acting_player()` is `None` there and the inventory insert found no player. The click
+   carries its player (`event.uuid`).
+
+### Upstream defects fixed
+
+**The `wireless` advancement's criteria (slice 3's deviation 3, now closed).** Slice 3 carried the
+advancement while the wireless grid did not exist, so it tested only `#refinedstorage:wireless_transmitters`
+and drew the transmitter. Upstream's `advancement/wireless.json` needs **both** the grid and a transmitter
+in one `inventory_changed` criterion; the port now carries that, and the in-game leg proves both halves:
+a transmitter alone leaves it unobtained, the grid and a transmitter together grant it (`done=true` and the
+`[Wireless]` announcement). A user now gets the advancement where upstream gives it, not on picking up a
+transmitter.
+
+**The recipe driver silently skipped every shaped tag counterfactual** (`tools/recipe_check.py`, a harness
+defect, not the mod's): it looked for the jar's `{"tag": …}` ingredient object, while this package's
+recipes spell a tag as a `"#tag"` string, so no shaped recipe with a tag ingredient had a wrong-ingredient
+control at all (slice 2's ten controls were the shapeless ones and `#c:stones`). The driver now reads the
+tag from the resolved ingredient, and every shaped tag recipe has its control — 22 recipes, 14 of them with
+a tag control. Its tag loader also reads every namespace under `data/*/tags/item`, so a recipe testing
+this package's own tag resolves.
+
+### Deviations (recorded, not defects)
+
+1. **The item is one model, the inactive texture.** Upstream's item model switches on the
+   `refinedstorage:network_bound_active` item-model property; the pin's `register_item_model_property` is
+   not a stamped hook, so the port carries `textures/item/wireless_grid/inactive.png` as the item's model and
+   leaves `active.png` out rather than shipping an unreachable texture.
+2. **A refused use opens nothing; upstream opens an inert, empty grid.** `WirelessGrid.isGridActive()` is
+   false out of range, offline or unbound, and upstream still opens the screen. The port tells the player
+   the parsed reason instead (`Wireless grid 50,64,8 in minecraft:the_end: refused (out of range: 17.0 > 16 blocks).`)
+   and opens no menu — the same sentence shape as `/refinedstorage wireless`, so the rule has one voice.
+   A use on an unbound grid says so; a use whose transmitter is gone says so.
+3. **The binding is read back with a command, not a tooltip.** Upstream shows `Bound to x, y, z.` in the
+   item's tooltip (`item.refinedstorage.network_item.bound_to`); a mod item's tooltip is the client
+   `tooltip` ItemPart hook, which this port does not subscribe, so `/refinedstorage bound` prints the
+   component's dimension and position (a harness/behaviour addition, like `/refinedstorage info`).
+4. **Click modes.** Pickup (0) and quick-move (1) are carried with upstream's meanings; quick-craft,
+   clone, throw, quick-craft-all and pickup-all (2–6) move nothing (they are not modelled). Drags and
+   scrolling are not modelled either.
+5. **No energy on the item.** Upstream's wireless grid drains FE per open; the parent has no FE at all
+   (gap 1), and the admission rule is energy-independent, as slice 3 proved.
+6. **The menu is a chest menu.** 54 slots, no scrolling, no sorting buttons, no search box, no side
+   buttons, and the plain panel rather than upstream's grid texture — the same limits the block grid
+   records (gap 5). The shift-click path is the deposit/withdraw route the leg proves.
+7. **The view reads the disks live**, not through the tick cache: the transmitter can be in a level that is
+   not in place (whose drives do not tick), and the item's view must not be a tick behind the disk it
+   withdraws from. Writes go straight into the drive's disk item in one transaction, and the drive's own
+   tick re-reads the item.
+
+### Gap this slice leaves (recorded, not fixed)
+
+**The promise table is keyed by dimension, not by network.** `view_with` is fed every other view's promise
+in the same dimension, so two *different* networks in one dimension holding the same resource hide it from
+each other (never a duplication, always an over-exclusion). The key should be the view's network — its
+controller position (upstream's root) — not the dimension; that is a follow-up slice, and the block grid
+has had the same coarseness since slice 1's review repair #4. The in-game leg is unaffected (its networks
+hold different resources).
+
+### Red proof — the rules as tests, before the glue
+
+Written first against stubs (`describes` true, `extract_amount` total, `insert_amount` 1, `plan_click`
+and `inventory_click` `Nothing`), then run: **14 failed of 54**
+(`ports/_shared/evidence/refinedstorage/runtime-red-slice4-wireless-grid.log`):
+
+```
+---- runtime::tests::a_right_click_on_a_view_slot_withdraws_half stdout ----
+assertion `left == right` failed
+  left: Nothing
+ right: Withdraw { mode: Half, to: Cursor }
+---- runtime::tests::a_single_extraction_takes_one stdout ----
+assertion `left == right` failed
+  left: 5
+ right: 1
+---- runtime::tests::an_entire_extraction_is_capped_by_the_stack_size stdout ----
+assertion `left == right` failed
+  left: 200
+ right: 64
+---- runtime::tests::a_shift_click_in_the_inventory_deposits_that_stack stdout ----
+assertion `left == right` failed
+  left: Nothing
+ right: Deposit { mode: Entire }
+---- runtime::tests::an_plain_inventory_click_is_the_cursor_rules stdout ----
+assertion `left == right` failed
+  left: Nothing
+ right: Inventory(Take { half: false })
+test result: FAILED. 40 passed; 14 failed; 0 ignored; 0 measured; 0 filtered out
+```
+
+Green after the rules: **54 passed, 0 failed** (`sdk-test.log`).
+
+### Green — the ladder and the in-game leg (one launcher build at `0a875da`)
+
+| Step | Command | Result |
+|---|---|---|
+| runtime + glue tests | `cargo test --offline` | **54 passed**, 0 failed (`sdk-test.log`, package sha printed) |
+| lints | `cargo clippy --all-targets --offline -- -D warnings` | exit 0, **0 warnings** (`sdk-clippy.log`) |
+| formatting | `rustfmt --edition 2024 --check src/{lib,support,runtime}.rs` | clean |
+| SDK check | `cargo horizon-mod check` | *"…535 items of the API (… 19 hooks …). Made for 0a875da."* (`sdk-check.log`) |
+| package | `rm -f Cargo.lock && cargo horizon-mod build` ×2 | **byte-identical**, **146,938 B**, SHA-256 `31aa1a0d2c28623a66e6dbb30612798cf8629d7069b78f55cf8d3341543067ae`, **189 entries**, no `Cargo.lock` |
+| package check | `cargo horizon-mod check refinedstorage.hmod` | `0.2.4 (native-mod, format native-1/0a875da…/e59da909…, for 26.3) 146938 bytes` |
+| fits (pin) | `… fits refinedstorage.hmod --build 0a875da` | *"0a875da made for"* |
+| fits (other build) | `… fits refinedstorage.hmod --build 0b14f8a` | *"0b14f8a fits"* (`sdk-check-fits-0.2.4.log`) |
+| launcher build | `launcher-game.sh build refinedstorage --rebuild` | exit 0, **`Compiling refinedstorage (1 of 1)`**, `native-0a875da-dd7dca8f05e8` (`launcher-build-0.2.4.log`) |
+| in-game leg | `build-slot.sh run --step e2e -- bash tools/e2e.sh` | **PASS** + **`EXIT:0`** (`e2e-launcher-slice4.log`) |
+| control (same Nightly, no package) | `GAME=$CONTROL_GAME …` | **FAIL** + `EXIT:1` — *"the block at 41,64,1 is minecraft:air, expected facing=north"* |
+| selftest (flipped grid view) | `SELFTEST=grid …` | **FAIL** + `EXIT:1` — *"the grid's view is [], expected [{"count":5,"item":"minecraft:diamond","slot":300}]"* |
+| selftest (flipped command range) | `SELFTEST=1 …` | **FAIL** + `EXIT:1` — *"expected … 'accepted (17.0 of 16 blocks', got … 'refused (out of range: 17.0 > 16 blocks)'"* |
+| log gate | `check-e2e-logs.py refinedstorage-e2e --strict` | `logs=14 ok=14 missing-exit=0 bad-exit=0` |
+| package gate | `verify-sdk-package.py refinedstorage` | **1/1** |
+
+The scenario (quoted from `e2e-launcher-slice4.log`; the network is 48..50,64,8 with the drive at
+49,64,9, inside the arena floor):
+
+```
+  block(50,64,8): refinedstorage:wireless_transmitter[active=true,facing=west]
+  info(49,64,9): Refined Storage network at 49,64,9: online (4 nodes, 1 controller, 1 drive, 0 grid, 1 transmitter); 1 disks, 0 items in 0 resources
+  /refinedstorage bound -> The wireless grid is not bound.
+  /refinedstorage bound -> Wireless grid bound to 50,64,8 in minecraft:the_end.
+  grid view: []                                                    (the view opens, empty)
+  grid view: [{"count":5,"item":"minecraft:diamond","slot":300}]   (after a shift-click on the inventory slot)
+  info(49,64,9): … 1 disks, 5 items in 1 resources
+  grid view: []                                                    (after a shift-click on the view)
+  info(49,64,9): … 1 disks, 0 items in 0 resources
+  use 17 blocks out: Wireless grid 50,64,8 in minecraft:the_end: refused (out of range: 17.0 > 16 blocks).
+  use of the End transmitter from the overworld: Wireless grid 50,64,8 in minecraft:the_end: refused (different dimension).
+  advancement after the grid and a transmitter: {"criteria":{"wireless_grid_in_inventory":"…"},"done":true}
+```
+
+Every assertion has its differential or counterfactual: the unbound readout before the bind; an empty
+view before the deposit and after the withdrawal (the same slots, both directions); 17.0 refused vs 16.0
+accepted (the boundary); the same item, the same binding and the same player refused from the overworld
+and accepted in the End (the dimension); the advancement absent after a transmitter alone and present
+after the grid with one; the `SELFTEST=grid` run inverts the view assertion and exits 1.
+
+### Harness facts learned here
+
+- **A use-item click hits whatever the crosshair is on.** After `ctl interact`/`look-at`, the crosshair is
+  on a block, so `ctl use-item` runs the *block* path and the grid binds again instead of opening. Look at
+  the sky (`ctl look 0 -90`) before an air use.
+- **The transmitter's nub is one face's shape, not six.** With `facing=north` the declared shape is the
+  north nub (`[0.375, 0.375, 0.0, 0.625, 0.625, 0.625]`), so a ray from the south never reaches it and
+  `ctl interact 41 64 1 south` answers *"no face … is visible: minecraft:stone at [41,63,1] is in the way"*.
+  Bind by aiming the crosshair with `ctl look-at block X Y Z <face>` from the side the nub is on.
+- **Keep every teleport inside the arena floor.** The End arena is stone at y=63 over x 32..56, z −8..24;
+  a `ctl tp` outside it drops the player into the void, and a distance assertion then measures from y≈59
+  (17.0 became 17.7 before the coordinates were moved onto the floor).
+- `ctl click-slot N shift` on a *native* menu sends click mode 1 (quick move) for the player's slots and
+  the view's alike; the mod's `menu_clicked` sees the true menu index, so `slot_backing` — not a slot-number
+  threshold — is what tells the view from the inventory.
+
+### Coverage (parity rule) — every family this slice ships
+
+| family | state |
+|---|---|
+| the `wireless_grid` item | **tested** — given, selected, read back (`/refinedstorage bound`), used; `refinedstorage:no_such_item` still refused by the legacy phase |
+| its `refinedstorage:network_location` component | **tested** — unbound before the bind, `50,64,8 in minecraft:the_end` after it; an unknown id refused; the unit test pins the round trip and the dimension's part in it |
+| binding on a transmitter | **tested** — a use on the transmitter writes it, and the transmitter opens no menu of its own |
+| the admission gate (dimension, online, range) | **tested** — 2.5 opens, 17.0 refused naming the distance, 16.0 opens, another dimension refused while the binding's dimension opens |
+| the 9×6 view from the item | **tested** — `ctl screen` says `container` with 54 slots, empty on an empty network, and it lists what the network holds |
+| deposit through the menu | **tested** — a shift-click on an inventory slot puts 5 diamonds on the network (the view and `/refinedstorage info` agree, the inventory empties) |
+| withdrawal through the menu | **tested** — a shift-click on the view returns them (the view empties, the inventory gains 5, the disk holds 0) |
+| its recipe | **tested** — `recipe_check.py` crafts it (output id + count, ingredients consumed) with a wrong-ingredient control on `#refinedstorage:grids` |
+| the `#refinedstorage:grids` tag | **tested** — the recipe's control replaces its member with dirt and crafts nothing |
+| the `refinedstorage:wireless` advancement | **tested** — absent after a transmitter alone, `done=true` after the grid with a transmitter, with the `[Wireless]` announcement |
+| its textures/model | **carried** — one model (the inactive texture); the active variant needs an item-model property hook the pin does not stamp (deviation 1) |
+| cursor pick-up / place / merge / swap in the menu | **unit-tested, not in game** — `inventory_click`'s table; the leg's two paths are shift-clicks |
+| drag, throw, quick-craft, scrolling, search, sorting | **not ported** — deviation 4 and gap 6 |
+| network energy (upstream's wireless grid drains FE) | **not ported** — parent gap 1 |
+| the portable grid, the crafting/pattern grids, the dyed grids | **not ported** — the next slices |
+
+Skills: superpowers/using-superpowers,brainstorming,writing-plans,test-driven-development,systematic-debugging,verification-before-completion; BeautifulRust/rust-best-practices
+
+Evidence: `ports/_shared/evidence/refinedstorage/` — `plan-slice4-wireless-grid.md`,
+`runtime-red-slice4-wireless-grid.log`, `sdk-test.log`, `sdk-clippy.log`, `sdk-check.log`,
+`sdk-check-fits-0.2.4.log`, `refinedstorage.hmod` (the delivered bytes) — and
+`ports/_shared/evidence/refinedstorage-e2e/` — `e2e-launcher-slice4.log` (green),
+`e2e-launcher-slice4-control.log`, `e2e-launcher-slice4-selftest.log`,
+`e2e-launcher-slice4-selftest-grid.log`, and `launcher-build-0.2.4.log` (`Compiling refinedstorage
+(1 of 1)`, `native-0a875da-dd7dca8f05e8` — the build all four legs ran on).
+
+## Slice 5 — the promise table keyed by network: two networks in one dimension (2026-11-21) — version 0.2.5
+
+Defect this slice fixes, quoted from slice 4's own record: *"**The promise table is keyed by
+dimension, not by network.** … two *different* networks in one dimension holding the same resource
+hide it from each other (never a duplication, always an over-exclusion) … the key should be the
+view's network — its controller position (upstream's root) … the block grid has had the same
+coarseness since slice 1's review repair #4."*
+
+Pin **`0a875da91dbb0fdcb7ba8c42c11341aa229af51a`**, mixins
+`e59da9094f0c2fdda6c627fe9eff22dec6a906f0`, SDK `0a875da`, launcher 0.2.92, game 26.3. Class
+`content` / tier **deep**, shape **machines**, unchanged. No new pin API, no third-party mod, no
+content change: this slice is the keying rule, its tests and its in-game differential.
+
+### The rule, and where it lives now
+
+The rule was inline in two places in `support.rs` (the block grid's `grid_tick` filter and
+`promises_elsewhere` for the wireless grid), both keyed `(dimension, Place)`. It is now one pure,
+unit-tested type in `runtime.rs`:
+
+- `runtime::Place` — where a view sits (`Grid(pos)` or `Wireless { player, window }`), moved out of
+  `support.rs` so the table's identity is part of the pure model.
+- `runtime::ViewKey { dimension, network, place }` — `network` is
+  `runtime::Network::anchor()`, the network's **root**: the controller's position (upstream's
+  `AbstractNetworkNode.getRoot`), the smallest one when a flood fill found more than one so the
+  answer does not depend on where the fill started; `None` for a controller-less network, whose view
+  is empty and therefore promises nothing.
+- `runtime::Promises` — `record`, `promised_elsewhere`, `retain`, `release`. `promised_elsewhere`
+  sets aside only the promises of views with **the same dimension, the same network and another
+  place**, so two networks in one dimension can no longer hide each other's stock.
+- `Core::reserved` became `Core::promises: Promises`; both grids build one `ViewKey` and call the
+  same function (`grid_tick`, `refresh_menu`), so the block grid and the wireless grid share one
+  code path.
+
+### Port defect fixed (not upstream's — this one put the port *out* of step with upstream)
+
+Upstream binds a network-bound item to its root and every grid reads its own network's storage, so
+two networks in one dimension never saw each other. The port's promise table (added in the 2026-11-08
+review to stop two grids of *one* network offering the same items twice) keyed only by dimension, so
+a second network's grid listed `[]` while its own disk held the 3 items. A player with two networks in
+one base lost sight of one network's stock on both grids (an over-exclusion, never a duplication: the
+`view_with` cap could only ever subtract). The port now keys by the root, which is upstream's
+behaviour; nothing else about the promise changes (same-network views still never overlap, and a
+broken grid still releases its promise).
+
+### Red proof — the rule as a unit test, before the keying change
+
+The rule was first moved into `runtime.rs` **preserving today's keying** (a pure refactor), and the
+two-network test was written against it. `cargo test --offline`:
+**55 passed, 1 failed** (`ports/_shared/evidence/refinedstorage/runtime-red-slice5-promises.log`):
+
+```
+---- runtime::tests::two_networks_in_one_dimension_do_not_hide_each_others_stock stdout ----
+
+thread '…' panicked at src/runtime.rs:1746:9:
+assertion `left == right` failed: a grid of another network in the same dimension shows its own 3 gold
+  left: [("minecraft:gold_ingot", 3)]
+ right: []
+test result: FAILED. 55 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out
+```
+
+Green after the key gained the network: **57 passed, 0 failed** (`sdk-test.log`), the two new tests
+being the rule above plus `a_networks_root_is_its_controller_wherever_the_fill_started` (the same
+three-block network filled from either end has one root; a lone cable has none).
+
+### Red proof — in game, against the previous package (0.2.4 at `31aa1a0d…`)
+
+The new phase was run first against **0.2.4** (the export the slice-4 build left,
+`native-0a875da-dd7dca8f05e8`): network A (40..43,64,0) holds 3 gold; network B (48..50,64,0) is
+given a drive at 51,64,0, a disk and the same 3 gold, deposited through B's own grid. The disk says
+it has them; the grid does not show them (`ports/_shared/evidence/refinedstorage-e2e/e2e-slice5-red-0.2.4.log`):
+
+```
+  info(51,64,0): Refined Storage network at 51,64,0: online (4 nodes, 1 controller, 1 drive, 1 grid); 1 disks, 3 items in 1 resources
+FAIL: the grid's view is [], expected [{"count":3,"item":"minecraft:gold_ingot","slot":300}]
+EXIT:1
+```
+
+That is the reported symptom exactly: B's own stock hidden by A's promise of 3 gold.
+
+### Green — the ladder and the in-game leg (one launcher build at `0a875da`)
+
+| Step | Command | Result |
+|---|---|---|
+| runtime + glue tests | `cargo test --offline` | **57 passed**, 0 failed (`sdk-test.log`) |
+| lints | `cargo clippy --all-targets --offline -- -D warnings` | exit 0, **0 warnings** (`sdk-clippy.log`) |
+| formatting | `rustfmt --edition 2024 --check src/{lib,support,runtime}.rs` | clean (`FMT_EXIT:0`) |
+| SDK check | `cargo horizon-mod check` | *"…532 items of the API (… 19 hooks …). Made for 0a875da."* (`sdk-check.log`) |
+| package | `rm -f Cargo.lock && cargo horizon-mod build` ×2 | **byte-identical** to the previous build (`cmp`), **148,725 B**, SHA-256 `0a5d894c67cec3483b3ec6955f4ed2d42eba150c5bbdf365a20360d67e8547fd`, **189 entries**, no `Cargo.lock` (`sdk-build-0.2.5.log`) |
+| package check | `cargo horizon-mod check refinedstorage.hmod` | `0.2.5 (native-mod, format native-1/0a875da…/e59da909…, for 26.3) 148725 bytes` |
+| fits (pin) | `… fits refinedstorage.hmod --build 0a875da` | *"0a875da made for"* (`FITS_PIN_EXIT:0`) |
+| fits (other build) | `… fits refinedstorage.hmod --build 0b14f8a` | *"0b14f8a fits"* (`FITS_OTHER_EXIT:0`) |
+| launcher build | `launcher-game.sh build refinedstorage --rebuild` | exit 0, **`Compiling refinedstorage (1 of 1)`**, `native-0a875da-174d06351fe0` (`launcher-build-0.2.5.log`) |
+| in-game leg | `launcher-game.sh run refinedstorage` | **PASS** + **`EXIT:0`** (`e2e-slice5-green.log`) |
+| control (same Nightly, no package) | `GAME=$CONTROL_GAME …` | **FAIL** + `EXIT:1` — *"the block at 41,64,1 is minecraft:air, expected facing=north"* |
+| selftest (flipped two-network rule) | `SELFTEST=networks …` | **FAIL** + `EXIT:1` — *"the grid's view is [{count 3 gold}], expected []"* |
+| selftest (flipped grid view) | `SELFTEST=grid …` | **FAIL** + `EXIT:1` — *"the grid's view is [], expected [{"count":5,"item":"minecraft:diamond","slot":300}]"* |
+| selftest (flipped command range) | `SELFTEST=1 …` | **FAIL** + `EXIT:1` — *"expected … 'accepted (17.0 of 16 blocks', got … 'refused (out of range: 17.0 > 16 blocks)'"* |
+| selftest (flipped offline view) | `SELFTEST=offline …` | **FAIL** + `EXIT:1` — *"the grid's view is [], expected [{count 3 gold}]"* |
+| log gate | `check-e2e-logs.py refinedstorage-e2e --strict` | `logs=21 ok=21 missing-exit=0 bad-exit=0` |
+| package gate | `verify-sdk-package.py refinedstorage` | **1/1** |
+
+Both `fits` runs used the delivered bytes (`sdk-fits-0.2.5.log`, first lines: port root and evidence
+copy both `0a5d894c…`).
+
+The two-network phase, quoted from `e2e-slice5-green.log` (A's grid at 43,64,0 and B's at 50,64,0,
+both promises live):
+
+```
+  info(51,64,0): … online (4 nodes, 1 controller, 1 drive, 1 grid); 1 disks, 3 items in 1 resources
+  grid view: [{"count":3,"item":"minecraft:gold_ingot","slot":300}]   (B's grid, A holding 3 too)
+  grid view: [{"count":3,"item":"minecraft:gold_ingot","slot":300}]   (A's grid, B's promise live)
+  grid view: [{"count":3,"item":"minecraft:gold_ingot","slot":300}]   (B's grid again)
+  info(43,64,0): … 1 disks, 3 items in 1 resources
+  info(51,64,0): … 1 disks, 3 items in 1 resources
+```
+
+The differential is the phase itself: the same two networks, the same 3 gold each, on the **previous
+package** one grid answered `[]` (red log above) and on this one both answer 3. The counterfactual is
+`SELFTEST=networks`, which asserts the old behaviour and fails on the fix — so the assertion is not
+vacuous. The same-network rule it must not break is the pre-existing phase *"two grids on one
+network never offer the same items twice"*, green in the same log.
+
+### Coverage — what this slice changes
+
+| family | state |
+|---|---|
+| the promise table's key | **tested** — unit: `two_networks_in_one_dimension_do_not_hide_each_others_stock`, `two_grids_of_one_network_never_show_the_same_items`; in game: the two-network phase (two grids, both 3) |
+| the network's root | **tested** — unit: `a_networks_root_is_its_controller_wherever_the_fill_started`; in game: every `info` line names the network the grid at that position resolved to |
+| two grids of one network never overlap | **tested** — the slice-1 phase, still green |
+| a wireless grid of another network | **not in this leg** — the wireless grid's key is the same `Promises` call (`refresh_menu`), unit-covered by the same rule; its in-game leg still binds one network only (slice 4) |
+| everything slice 1–4 shipped | **unchanged** — same asserts, same logs, all green |
+
+### Harness facts learned here
+
+- **A promise outlives the menu.** A block grid records what it shows on every tick, whether or not a
+  player has its menu open, so the differential needs the *other* grid to have promised first — this
+  phase opens A's grid (asserting 3), then B's, and reads each again after both promises are live.
+- **A drive joins through any side** (only the transmitter faces one side), so a second network's
+  drive can hang off its grid at 51,64,0 with no extra cable.
+- `inv_slot` + `ctl click-slot N shift` deposits a whole stack through *any* grid's menu; the same
+  two lines prove network B's own stock arrived before the view is read.
+
+Skills: superpowers/using-superpowers,systematic-debugging,test-driven-development,verification-before-completion; BeautifulRust/rust-best-practices
+
+Evidence: `ports/_shared/evidence/refinedstorage/` — `runtime-red-slice5-promises.log`,
+`sdk-test.log`, `sdk-clippy.log`, `sdk-check.log`, `sdk-build-0.2.5.log`,
+`sdk-check-fits-0.2.5.log`, `sdk-fits-0.2.5.log`, `refinedstorage.hmod` (the delivered bytes) — and
+`ports/_shared/evidence/refinedstorage-e2e/` — `e2e-slice5-green.log` (green),
+`e2e-slice5-red-0.2.4.log` (the previous package, red), `e2e-slice5-control.log`,
+`e2e-slice5-selftest.log`, `e2e-slice5-selftest-grid.log`, `e2e-slice5-selftest-offline.log`,
+`e2e-slice5-selftest-networks.log`, and `launcher-build-0.2.5.log` (`Compiling refinedstorage
+(1 of 1)`, `native-0a875da-174d06351fe0` — the build every leg ran on).

@@ -28,6 +28,9 @@
   "item.refinedstorage.raw_improved_processor": "Raw Improved Processor",
   "item.refinedstorage.silicon": "Silicon",
   "item.refinedstorage.storage_housing": "Storage Housing",
+  "item.refinedstorage.wireless_grid": "Wireless Grid",
+  "item.refinedstorage.wireless_grid.help": "Use a Wireless Transmitter to bind it, then use it to open your storage network from anywhere inside the transmitter's range.",
   "item.refinedstorage.wireless_transmitter.help": "Provides wireless network access for items like the Wireless Grid. Multiple are allowed in an area for wider coverage.",
+  "tag.item.refinedstorage.grids": "Grids",
   "tag.item.refinedstorage.wireless_transmitters": "Wireless Transmitters"
 }

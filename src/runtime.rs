@@ -231,6 +231,15 @@ impl Network {
     pub fn count(&self, kind: Kind) -> usize {
         self.nodes.iter().filter(|(k, _)| *k == kind).count()
     }
+
+    /// The network's root: the controller's position (upstream's
+    /// `AbstractNetworkNode.getRoot`), the smallest one when the flood fill
+    /// found more than one, so the answer does not depend on where the fill
+    /// started. `None` for a network with no controller — such a network is
+    /// offline and its views are empty, so nothing is ever promised on it.
+    pub fn anchor(&self) -> Option<[i32; 3]> {
+        self.of_kind(Kind::Controller).min()
+    }
 }
 
 /// Flood fill the network `start` belongs to. `at` answers the node at a position
@@ -636,6 +645,87 @@ pub fn view_with<T: Stored>(
         .collect()
 }
 
+// --- the promise table -----------------------------------------------------
+
+/// Where a view sits: a block grid's position, or a wireless grid's open menu.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Place {
+    /// The grid block at a position.
+    Grid([i32; 3]),
+    /// A wireless grid's open menu: its player and window id.
+    Wireless { player: u128, window: i32 },
+}
+
+/// A view's identity in the promise table: the dimension it is in, the network
+/// it shows and which view it is.
+///
+/// The network is part of the key because two *different* networks in one
+/// dimension keep separate stock: keying by dimension alone made each hide the
+/// other's items (an over-exclusion, never a duplication).
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct ViewKey {
+    /// The dimension's id, e.g. `minecraft:the_end`.
+    pub dimension: String,
+    /// The network's root ([`Network::anchor`]); `None` for a network with no
+    /// controller, whose view is empty and therefore promises nothing.
+    pub network: Option<[i32; 3]>,
+    /// Which view it is.
+    pub place: Place,
+}
+
+impl ViewKey {
+    /// The key of the view `place`, showing `network` in `dimension`.
+    pub fn new(dimension: &str, network: Option<[i32; 3]>, place: Place) -> Self {
+        ViewKey {
+            dimension: dimension.to_owned(),
+            network,
+            place,
+        }
+    }
+}
+
+/// What every open view currently shows. Every grid exposes the *same* network
+/// through real menu slots, so two views of one network must never show the
+/// same items; [`Promises::promised_elsewhere`] is what a view sets aside before
+/// it shows its network's stock (`view_with`).
+#[derive(Debug, Default)]
+pub struct Promises {
+    views: std::collections::HashMap<ViewKey, Vec<(String, u32)>>,
+}
+
+impl Promises {
+    /// Remember what the view `key` shows.
+    pub fn record(&mut self, key: ViewKey, promised: Vec<(String, u32)>) {
+        self.views.insert(key, promised);
+    }
+
+    /// The stacks every *other* view of the same network promises, which this
+    /// view must set aside. A view of another network in the same dimension is
+    /// not one of them: it holds its own stock.
+    pub fn promised_elsewhere(&self, key: &ViewKey) -> Vec<(String, u32)> {
+        self.views
+            .iter()
+            .filter(|(other, _)| {
+                other.dimension == key.dimension
+                    && other.network == key.network
+                    && other.place != key.place
+            })
+            .flat_map(|(_, stacks)| stacks.iter().cloned())
+            .collect()
+    }
+
+    /// Forget the views `keep` rejects: a broken grid must not keep hiding the
+    /// network's stock from the others.
+    pub fn retain(&mut self, mut keep: impl FnMut(&ViewKey) -> bool) {
+        self.views.retain(|key, _| keep(key));
+    }
+
+    /// Forget the view at `place` wherever it is (a closed menu).
+    pub fn release(&mut self, place: Place) {
+        self.views.retain(|key, _| key.place != place);
+    }
+}
+
 /// What a player's click did to one grid slot, as the next tick sees it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Delta<T> {
@@ -696,6 +786,226 @@ pub fn deltas<T: Stored>(
         }
     }
     out
+}
+
+// --- the network-bound item (slice 4) --------------------------------------
+
+/// The transmitter a wireless grid is bound to: its dimension and its block,
+/// upstream's `GlobalPos` in the `refinedstorage:network_location` component.
+///
+/// The dimension is part of the binding, not just the position: the same
+/// coordinates in another dimension are another transmitter, which is why the
+/// use has to resolve the level by name before it can read the network.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Binding {
+    dimension: String,
+    pos: [i32; 3],
+}
+
+impl Binding {
+    /// A binding to the transmitter block at `pos` in `dimension`.
+    pub fn new(dimension: impl Into<String>, pos: [i32; 3]) -> Self {
+        Binding {
+            dimension: dimension.into(),
+            pos,
+        }
+    }
+
+    /// The bound dimension's id (`minecraft:the_end`).
+    pub fn dimension(&self) -> &str {
+        &self.dimension
+    }
+
+    /// The bound transmitter's block position.
+    pub fn pos(&self) -> [i32; 3] {
+        self.pos
+    }
+
+    /// Whether this binding names the block at `pos` in `dimension`.
+    pub fn describes(&self, dimension: &str, pos: [i32; 3]) -> bool {
+        self.dimension == dimension && self.pos == pos
+    }
+}
+
+/// How much of a grid resource a click moves (upstream's `GridExtractMode` and
+/// the two of `GridInsertMode` this port needs).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ExtractMode {
+    /// The whole resource, capped by its maximum stack size.
+    Entire,
+    /// Half of that, rounded down.
+    Half,
+    /// One item.
+    Single,
+}
+
+/// How many of a stored resource `mode` moves when it is withdrawn from a
+/// network with `total` of it; `max_stack` is the resource's maximum stack size.
+///
+/// Transcribed from upstream's `GridOperationsImpl`: the base amount is
+/// `min(total, max_stack)`, `Half` is that halved unless it is one item, and
+/// `Single` is one.
+pub fn extract_amount(total: u32, max_stack: u32, mode: ExtractMode) -> u32 {
+    let available = total.min(max_stack);
+    match mode {
+        ExtractMode::Entire => available,
+        ExtractMode::Half if available <= 1 => available,
+        ExtractMode::Half => available / 2,
+        ExtractMode::Single => available.min(1),
+    }
+}
+
+/// How many of a resource a deposit moves: a whole stack in `Entire` mode, one
+/// item in `Single` mode (upstream's `GridOperationsImpl.insert`).
+pub fn insert_amount(max_stack: u32, mode: ExtractMode) -> u32 {
+    match mode {
+        ExtractMode::Entire | ExtractMode::Half => max_stack,
+        ExtractMode::Single => 1,
+    }
+}
+
+/// Which part of a grid menu a click landed on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Region {
+    /// One of the menu's own slots, which show the network's resources.
+    View,
+    /// One of the player's own inventory slots below the view.
+    Inventory,
+}
+
+/// What the cursor (the stack the player carries, upstream's `getCarried`)
+/// holds, as far as a click cares.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Cursor {
+    /// Nothing.
+    Empty,
+    /// The resource the click concerns, with `room` items to spare.
+    Same { room: u32 },
+    /// Another resource, so it can only be put down.
+    Other,
+}
+
+/// Where a withdrawal goes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Destination {
+    /// Onto the cursor, as a normal click does.
+    Cursor,
+    /// Straight into the player's inventory, as a shift-click does.
+    Inventory,
+}
+
+/// What a click on a player's own inventory slot does.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CursorMove {
+    /// Take the slot's stack (`half` for a right click: half of it, rounded up).
+    Take { half: bool },
+    /// Put the cursor's stack into an empty slot (`one` for a right click).
+    Place { one: bool },
+    /// Top the slot up from the cursor (`one` for a right click).
+    Merge { one: bool },
+    /// Exchange the cursor's resource with the slot's.
+    Swap,
+    /// Nothing moves.
+    Nothing,
+}
+
+/// What a click in a grid menu does.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Plan {
+    /// Take resources off the network.
+    Withdraw {
+        /// How much of the resource.
+        mode: ExtractMode,
+        /// Where it goes.
+        to: Destination,
+    },
+    /// Put the cursor's resource onto the network.
+    Deposit {
+        /// How much of it.
+        mode: ExtractMode,
+    },
+    /// The player's own inventory's cursor rules.
+    Inventory(CursorMove),
+    /// Nothing moves.
+    Nothing,
+}
+
+/// What a click does in a grid menu whose own slots show the network's
+/// resources: `region` where it landed, `slot_has` whether that slot holds
+/// anything, `cursor` what the player carries, `button` the mouse button (0
+/// left, 1 right) and `shift` whether it is a shift-click (the menu's quick-move
+/// click mode).
+///
+/// Transcribed from upstream's `AbstractGridScreen`: a click on a resource slot
+/// withdraws when the cursor can take the resource and deposits when it cannot
+/// (or when it is a different resource, or the slot is empty); a shift-click
+/// always withdraws to the player's inventory, or deposits the clicked stack
+/// from it. A plain click on the player's own inventory is the cursor's.
+pub fn plan_click(region: Region, slot_has: bool, cursor: Cursor, button: u8, shift: bool) -> Plan {
+    let withdraw_mode = if button == 1 {
+        ExtractMode::Half
+    } else {
+        ExtractMode::Entire
+    };
+    let deposit_mode = if button == 1 {
+        ExtractMode::Single
+    } else {
+        ExtractMode::Entire
+    };
+    match region {
+        Region::Inventory if shift => {
+            if slot_has {
+                Plan::Deposit {
+                    mode: ExtractMode::Entire,
+                }
+            } else {
+                Plan::Nothing
+            }
+        }
+        Region::Inventory => Plan::Inventory(inventory_click(slot_has, cursor, button)),
+        Region::View if shift => {
+            if slot_has {
+                Plan::Withdraw {
+                    mode: ExtractMode::Entire,
+                    to: Destination::Inventory,
+                }
+            } else {
+                Plan::Nothing
+            }
+        }
+        Region::View => {
+            let takes = match cursor {
+                Cursor::Empty => slot_has,
+                Cursor::Same { room } => slot_has && room > 0,
+                Cursor::Other => false,
+            };
+            if takes {
+                Plan::Withdraw {
+                    mode: withdraw_mode,
+                    to: Destination::Cursor,
+                }
+            } else if cursor != Cursor::Empty {
+                Plan::Deposit { mode: deposit_mode }
+            } else {
+                Plan::Nothing
+            }
+        }
+    }
+}
+
+/// The cursor's own rules in the player's inventory, as vanilla's left and
+/// right clicks: an empty cursor takes, a cursor puts down or merges, another
+/// resource swaps.
+pub fn inventory_click(slot_has: bool, cursor: Cursor, button: u8) -> CursorMove {
+    let right = button == 1;
+    match (cursor, slot_has) {
+        (Cursor::Empty, true) => CursorMove::Take { half: right },
+        (Cursor::Empty, false) => CursorMove::Nothing,
+        (Cursor::Same { .. }, true) => CursorMove::Merge { one: right },
+        (Cursor::Same { .. }, false) => CursorMove::Place { one: right },
+        (Cursor::Other, true) => CursorMove::Swap,
+        (Cursor::Other, false) => CursorMove::Place { one: right },
+    }
 }
 
 #[cfg(test)]
@@ -1022,6 +1332,207 @@ mod tests {
         assert_eq!(distance([41.0, 64.0, 1.0], [41, 64, 1]), 0.0);
     }
 
+    // --- the wireless grid's binding and its menu (slice 4) ----------------
+
+    #[test]
+    fn a_binding_names_a_dimension_and_a_position() {
+        let binding = Binding::new("minecraft:the_end", [54, 64, 4]);
+        assert_eq!(binding.dimension(), "minecraft:the_end");
+        assert_eq!(binding.pos(), [54, 64, 4]);
+        assert!(
+            binding.describes("minecraft:the_end", [54, 64, 4]),
+            "the binding describes the transmitter it was made on"
+        );
+        assert!(
+            !binding.describes("minecraft:overworld", [54, 64, 4]),
+            "the same coordinates in another dimension are another transmitter"
+        );
+        assert!(
+            !binding.describes("minecraft:the_end", [54, 64, 5]),
+            "the position is part of the binding"
+        );
+    }
+
+    #[test]
+    fn an_entire_extraction_is_capped_by_the_stack_size() {
+        assert_eq!(extract_amount(5, 64, ExtractMode::Entire), 5);
+        assert_eq!(extract_amount(200, 64, ExtractMode::Entire), 64);
+        assert_eq!(extract_amount(0, 64, ExtractMode::Entire), 0);
+    }
+
+    #[test]
+    fn a_half_extraction_is_floor_halved_and_one_item_stays_one() {
+        // Upstream: `extractableAmount == 1 ? 1 : extractableAmount / 2`.
+        assert_eq!(extract_amount(5, 64, ExtractMode::Half), 2);
+        assert_eq!(extract_amount(4, 64, ExtractMode::Half), 2);
+        assert_eq!(extract_amount(1, 64, ExtractMode::Half), 1);
+        assert_eq!(extract_amount(200, 64, ExtractMode::Half), 32);
+        assert_eq!(extract_amount(0, 64, ExtractMode::Half), 0);
+    }
+
+    #[test]
+    fn a_single_extraction_takes_one() {
+        assert_eq!(extract_amount(5, 64, ExtractMode::Single), 1);
+        assert_eq!(extract_amount(0, 64, ExtractMode::Single), 0);
+    }
+
+    #[test]
+    fn a_deposit_moves_a_whole_stack_or_one_item() {
+        assert_eq!(insert_amount(64, ExtractMode::Entire), 64);
+        assert_eq!(insert_amount(64, ExtractMode::Single), 1);
+        assert_eq!(insert_amount(16, ExtractMode::Entire), 16);
+    }
+
+    #[test]
+    fn a_left_click_on_a_view_slot_withdraws_the_whole_stack_to_the_cursor() {
+        assert_eq!(
+            plan_click(Region::View, true, Cursor::Empty, 0, false),
+            Plan::Withdraw {
+                mode: ExtractMode::Entire,
+                to: Destination::Cursor
+            }
+        );
+    }
+
+    #[test]
+    fn a_right_click_on_a_view_slot_withdraws_half() {
+        assert_eq!(
+            plan_click(Region::View, true, Cursor::Empty, 1, false),
+            Plan::Withdraw {
+                mode: ExtractMode::Half,
+                to: Destination::Cursor
+            }
+        );
+    }
+
+    #[test]
+    fn a_shift_click_on_a_view_slot_withdraws_to_the_inventory() {
+        assert_eq!(
+            plan_click(Region::View, true, Cursor::Empty, 0, true),
+            Plan::Withdraw {
+                mode: ExtractMode::Entire,
+                to: Destination::Inventory
+            }
+        );
+        // The cursor is ignored: a quick move always goes to the inventory.
+        assert_eq!(
+            plan_click(Region::View, true, Cursor::Same { room: 10 }, 1, true),
+            Plan::Withdraw {
+                mode: ExtractMode::Entire,
+                to: Destination::Inventory
+            }
+        );
+    }
+
+    #[test]
+    fn a_cursor_that_can_take_the_resource_withdraws_into_it() {
+        assert_eq!(
+            plan_click(Region::View, true, Cursor::Same { room: 10 }, 0, false),
+            Plan::Withdraw {
+                mode: ExtractMode::Entire,
+                to: Destination::Cursor
+            }
+        );
+    }
+
+    #[test]
+    fn a_cursor_with_another_resource_deposits_instead() {
+        assert_eq!(
+            plan_click(Region::View, true, Cursor::Other, 0, false),
+            Plan::Deposit {
+                mode: ExtractMode::Entire
+            }
+        );
+        assert_eq!(
+            plan_click(Region::View, true, Cursor::Other, 1, false),
+            Plan::Deposit {
+                mode: ExtractMode::Single
+            }
+        );
+    }
+
+    #[test]
+    fn a_cursor_that_is_full_of_the_resource_deposits_instead() {
+        assert_eq!(
+            plan_click(Region::View, true, Cursor::Same { room: 0 }, 0, false),
+            Plan::Deposit {
+                mode: ExtractMode::Entire
+            }
+        );
+    }
+
+    #[test]
+    fn an_empty_cursor_over_an_empty_slot_moves_nothing() {
+        assert_eq!(
+            plan_click(Region::View, false, Cursor::Empty, 0, false),
+            Plan::Nothing
+        );
+        assert_eq!(
+            plan_click(Region::View, false, Cursor::Empty, 1, false),
+            Plan::Nothing
+        );
+    }
+
+    #[test]
+    fn an_empty_view_slot_takes_a_cursor_as_a_deposit() {
+        assert_eq!(
+            plan_click(Region::View, false, Cursor::Other, 0, false),
+            Plan::Deposit {
+                mode: ExtractMode::Entire
+            }
+        );
+    }
+
+    #[test]
+    fn a_shift_click_in_the_inventory_deposits_that_stack() {
+        assert_eq!(
+            plan_click(Region::Inventory, true, Cursor::Empty, 0, true),
+            Plan::Deposit {
+                mode: ExtractMode::Entire
+            }
+        );
+        assert_eq!(
+            plan_click(Region::Inventory, false, Cursor::Empty, 0, true),
+            Plan::Nothing
+        );
+    }
+
+    #[test]
+    fn an_plain_inventory_click_is_the_cursor_rules() {
+        assert_eq!(
+            plan_click(Region::Inventory, true, Cursor::Empty, 0, false),
+            Plan::Inventory(CursorMove::Take { half: false })
+        );
+        assert_eq!(
+            plan_click(Region::Inventory, true, Cursor::Empty, 1, false),
+            Plan::Inventory(CursorMove::Take { half: true })
+        );
+        assert_eq!(
+            plan_click(Region::Inventory, false, Cursor::Same { room: 5 }, 0, false),
+            Plan::Inventory(CursorMove::Place { one: false })
+        );
+        assert_eq!(
+            plan_click(Region::Inventory, false, Cursor::Other, 1, false),
+            Plan::Inventory(CursorMove::Place { one: true })
+        );
+        assert_eq!(
+            plan_click(Region::Inventory, true, Cursor::Same { room: 5 }, 0, false),
+            Plan::Inventory(CursorMove::Merge { one: false })
+        );
+        assert_eq!(
+            plan_click(Region::Inventory, true, Cursor::Same { room: 5 }, 1, false),
+            Plan::Inventory(CursorMove::Merge { one: true })
+        );
+        assert_eq!(
+            plan_click(Region::Inventory, true, Cursor::Other, 0, false),
+            Plan::Inventory(CursorMove::Swap)
+        );
+        assert_eq!(
+            plan_click(Region::Inventory, false, Cursor::Empty, 0, false),
+            Plan::Inventory(CursorMove::Nothing)
+        );
+    }
+
     // --- one disk ----------------------------------------------------------
 
     #[test]
@@ -1229,6 +1740,87 @@ mod tests {
             view_with(&disks, &held, "", GRID_SLOTS, stack_of),
             vec![TestItem::new("minecraft:diamond", 10)]
         );
+    }
+
+    // --- the promise table -------------------------------------------------
+
+    /// A view key in the End, showing the network whose controller is at
+    /// `network`.
+    fn place_at(network: [i32; 3], pos: [i32; 3]) -> ViewKey {
+        ViewKey::new("minecraft:the_end", Some(network), Place::Grid(pos))
+    }
+
+    #[test]
+    fn two_grids_of_one_network_never_show_the_same_items() {
+        let gold = vec![("minecraft:gold_ingot".to_string(), 3)];
+        let mut promises = Promises::default();
+        promises.record(place_at([40, 64, 0], [43, 64, 0]), gold.clone());
+        assert_eq!(
+            promises.promised_elsewhere(&place_at([40, 64, 0], [42, 65, 0])),
+            gold,
+            "the second grid of the same network sets the first one's 3 gold aside"
+        );
+        assert_eq!(
+            promises.promised_elsewhere(&ViewKey::new(
+                "minecraft:overworld",
+                Some([40, 64, 0]),
+                Place::Grid([43, 64, 0])
+            )),
+            Vec::new(),
+            "another dimension's grid is untouched"
+        );
+    }
+
+    #[test]
+    fn two_networks_in_one_dimension_do_not_hide_each_others_stock() {
+        // Network A's grid at 43,64,0 (controller 40,64,0) and network B's grid
+        // at 50,64,0 (controller 48,64,0), both in the End and both holding 3
+        // gold: each must show its own 3.
+        let gold = vec![("minecraft:gold_ingot".to_string(), 3)];
+        let mut promises = Promises::default();
+        promises.record(place_at([40, 64, 0], [43, 64, 0]), gold.clone());
+        assert_eq!(
+            promises.promised_elsewhere(&place_at([48, 64, 0], [50, 64, 0])),
+            Vec::new(),
+            "a grid of another network in the same dimension shows its own 3 gold"
+        );
+        // The same grid asked again still sees what the other views of *its*
+        // network promise, so the scoping did not drop the rule.
+        promises.record(place_at([48, 64, 0], [51, 65, 0]), gold.clone());
+        assert_eq!(
+            promises.promised_elsewhere(&place_at([48, 64, 0], [50, 64, 0])),
+            gold,
+            "network B's first grid sets the second one's 3 gold aside"
+        );
+        assert_eq!(
+            promises.promised_elsewhere(&place_at([40, 64, 0], [43, 64, 0])),
+            Vec::new(),
+            "and network A's grid is still unaffected by B's two views"
+        );
+    }
+
+    #[test]
+    fn a_networks_root_is_its_controller_wherever_the_fill_started() {
+        // controller - cable - grid, entered from either end.
+        let at = |pos: [i32; 3]| match pos {
+            [0, 0, 0] => Some(Node::plain(Kind::Controller)),
+            [1, 0, 0] | [2, 0, 0] => Some(Node::plain(Kind::Cable)),
+            _ => None,
+        };
+        let left = network([0, 0, 0], at);
+        let right = network([2, 0, 0], at);
+        assert_eq!(left.anchor(), Some([0, 0, 0]));
+        assert_eq!(
+            right.anchor(),
+            left.anchor(),
+            "the fill's start is not identity"
+        );
+        // A cable alone has no controller, so it has no root.
+        let loose = network([10, 0, 0], |pos| {
+            (pos == [10, 0, 0]).then(|| Node::plain(Kind::Cable))
+        });
+        assert_eq!(loose.anchor(), None);
+        assert!(!loose.online());
     }
 
     #[test]

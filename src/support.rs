@@ -19,15 +19,18 @@ use mod_api::item::containers::ModBlockEntityFields;
 use mod_api::{
     self, BlockEntityEvent, BlockEntityPart, BlockEntityTickEvent, BlockEntityTicksEvent, BlockKey,
     BlockPart, BlockState, Command, CommandArgumentValue, CommandInvocation, CommandSource,
-    Component, Compound, Flow, Host, HostSide, HostTransaction, ItemKey, ItemStack, LevelHost,
-    LevelRef, LevelSide, ModBlockEntityView, ModContainer, RegisterCommandsEvent, Registrar,
-    RegistrationContext, RightClickBlockEvent, RunModCommandEvent, Screen, ScreenEvent, ServerHost,
-    StateForPlacementEvent, Tag, Text, WorldPhase,
+    Component, Compound, Flow, Hand, Host, HostSide, HostTransaction, InteractionResult, ItemKey,
+    ItemPart, ItemPlace, ItemResource, ItemStack, LevelHost, LevelRef, LevelSide, MenuClickedEvent,
+    MenuClosedEvent, MenuRef, MenuReplace, MenuSlotBacking, ModBlockEntityView, ModContainer,
+    RegisterCommandsEvent, Registrar, RegistrationContext, RightClickBlockEvent,
+    RunModCommandEvent, Screen, ScreenEvent, ServerHost, ServerTickEvent, ServerTickPhase,
+    StateForPlacementEvent, Tag, Text, UseItemEvent, UseOnEvent, WorldPhase,
 };
 
 use crate::runtime::{
-    self, CAPACITY_1K, DRIVE_SLOTS, Delta, Disk, Face, GRID_SLOTS, Kind, Node, Stored,
-    WIRELESS_RANGE, extract, insert, network, view_with,
+    self, Binding, CAPACITY_1K, Cursor, DRIVE_SLOTS, Delta, Destination, Disk, Face, GRID_SLOTS,
+    Kind, Node, Place, Plan, Promises, Region, Stored, ViewKey, WIRELESS_RANGE, extract, insert,
+    network, plan_click, view_with,
 };
 
 /// The five content ids of the slice, exactly as the content declares them.
@@ -39,10 +42,21 @@ const DISK: &str = "refinedstorage:1k_storage_disk";
 /// The wireless transmitter (slice 3): a network node that joins through its
 /// facing side and answers whether a player may use its network.
 const TRANSMITTER: &str = "refinedstorage:wireless_transmitter";
+/// The wireless grid (slice 4): a network-bound item that opens its network's
+/// 9×6 grid view from anywhere inside a transmitter's range.
+const WIRELESS_GRID: &str = "refinedstorage:wireless_grid";
 /// The block-entity type this mod declares for the four network blocks.
 const BE_TYPE: &str = "refinedstorage:network";
 /// The item component that carries a disk's contents.
 const COMPONENT: &str = "refinedstorage:storage";
+/// The item component that names the transmitter a wireless grid is bound to
+/// (upstream's `refinedstorage:network_location`, a `GlobalPos`).
+const NETWORK_LOCATION: &str = "refinedstorage:network_location";
+
+/// The title the wireless grid's menu shows (upstream's `ContentNames.WIRELESS_GRID`).
+const WIRELESS_GRID_TITLE: &str = "Wireless Grid";
+/// The wireless grid's menu has six rows, the block grid's 9×6 view.
+const WIRELESS_GRID_ROWS: u8 = 6;
 
 /// The drive's menu shows one row of nine (upstream has eight; the game's
 /// menu types only show 9/18/27/45/54 slots, and a menu is how a player moves
@@ -67,6 +81,7 @@ struct Keys {
     grid: BlockKey,
     transmitter: BlockKey,
     disk: ItemKey,
+    wireless_grid: ItemKey,
 }
 
 impl Keys {
@@ -103,8 +118,10 @@ pub(crate) fn register(registrar: &mut dyn Registrar, _cx: &RegistrationContext)
         grid: registrar.block_key(GRID),
         transmitter: registrar.block_key(TRANSMITTER),
         disk: registrar.item_key(DISK),
+        wireless_grid: registrar.item_key(WIRELESS_GRID),
     };
     let _ = KEYS.set(keys);
+    registrar.item_part(keys.wireless_grid, WirelessGrid);
     let kind = registrar
         .block_entity_type(BE_TYPE)
         .blocks(&[CONTROLLER, CABLE, DISK_DRIVE, GRID, TRANSMITTER])
@@ -146,9 +163,11 @@ pub(crate) fn register(registrar: &mut dyn Registrar, _cx: &RegistrationContext)
     }
 }
 
-/// The disk's item component (`component_types`, before content loads).
+/// The disk's item component and the wireless grid's binding (`component_types`,
+/// before content loads).
 pub(crate) fn register_component_types(event: &mut mod_api::ComponentTypesEvent<'_>) {
     event.types.push(COMPONENT.to_owned());
+    event.types.push(NETWORK_LOCATION.to_owned());
 }
 
 // --- one item as the network sees it --------------------------------------
@@ -156,7 +175,7 @@ pub(crate) fn register_component_types(event: &mut mod_api::ComponentTypesEvent<
 /// One item on the network: the stack plus its canonical resource key,
 /// resolved once where a host is at hand. Two stacks are one resource when
 /// their item id, damage and components all agree.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 struct Net {
     stack: ItemStack,
     key: String,
@@ -278,6 +297,793 @@ fn write_disk(host: &dyn Host, stack: &mut ItemStack, disk: &Disk<Net>) {
         .filter_map(|entry| entry.stack().to_nbt(host))
         .collect();
     let _ = stack.set(&StorageComponent, entries);
+}
+
+// --- a wireless grid's binding --------------------------------------------
+
+/// The component that names the transmitter a wireless grid is bound to:
+/// upstream's `GlobalPos` — a dimension id and a block position — in the
+/// `refinedstorage:network_location` component.
+struct NetworkLocation;
+
+impl Component for NetworkLocation {
+    type Value = Binding;
+
+    fn id(&self) -> &str {
+        NETWORK_LOCATION
+    }
+
+    fn decode(&self, value: &Tag) -> Option<Binding> {
+        let Tag::Compound(compound) = value else {
+            return None;
+        };
+        let Some(Tag::String(dimension)) = field(compound, "dimension") else {
+            return None;
+        };
+        let Some(Tag::IntArray(pos)) = field(compound, "pos") else {
+            return None;
+        };
+        let [x, y, z] = pos.as_slice() else {
+            return None;
+        };
+        Some(Binding::new(dimension.to_string_lossy(), [*x, *y, *z]))
+    }
+
+    fn encode(&self, value: Binding) -> Tag {
+        Tag::Compound(Compound::from([
+            ("dimension".into(), Tag::String(value.dimension().into())),
+            ("pos".into(), Tag::IntArray(value.pos().to_vec())),
+        ]))
+    }
+}
+
+/// The transmitter a wireless grid item is bound to, from its component.
+fn binding_of(stack: &ItemStack) -> Option<Binding> {
+    stack.get(&NetworkLocation)
+}
+
+/// `stack` with its binding component set to `binding`.
+fn with_binding(mut stack: ItemStack, binding: &Binding) -> ItemStack {
+    let _ = stack.set(&NetworkLocation, binding.clone());
+    stack
+}
+
+// --- the wireless grid item ------------------------------------------------
+
+/// The wireless grid: bind it on a transmitter, use it to open that network's
+/// grid view from anywhere inside the transmitter's range.
+struct WirelessGrid;
+
+#[mod_api::horizon_part]
+impl ItemPart for WirelessGrid {
+    /// Using the grid on a wireless transmitter stores the transmitter's
+    /// dimension and position in the item (`NetworkItemHelperImpl.bind`); on
+    /// any other block the click is left alone.
+    fn use_on(&self, host: HostSide<'_>, event: &mut UseOnEvent<'_>) -> Option<InteractionResult> {
+        if event.stack.item() != keys().wireless_grid {
+            return None;
+        }
+        let HostSide::Server(host) = host else {
+            // The client predicts the swing; only the server writes the item.
+            return Some(InteractionResult::Success);
+        };
+        if kind_at(host, event.pos) != Some(Kind::WirelessTransmitter) {
+            return None;
+        }
+        let Some(player) = host.player(event.player) else {
+            return Some(InteractionResult::Fail);
+        };
+        let Some(slot) = held_slot(host, &player, event.hand) else {
+            return Some(InteractionResult::Fail);
+        };
+        let binding = Binding::new(host.dimension().to_owned(), event.pos);
+        let bound = with_binding(event.stack.clone(), &binding);
+        let wrote = host
+            .transaction(|host, _tx| player.set_inventory_slot(host, slot, Some(bound)))
+            .is_ok();
+        if wrote {
+            tell(
+                host,
+                event.player,
+                &format!("Wireless grid bound to {}.", binding_name(&binding)),
+            );
+        }
+        Some(InteractionResult::Success)
+    }
+
+    /// Using the grid opens the network its transmitter exposes, or names the
+    /// reason it cannot (`NetworkItemContextImpl.resolveNetwork` +
+    /// `NetworkItemPlayerValidator.isValid`).
+    fn use_item(
+        &self,
+        host: HostSide<'_>,
+        event: &mut UseItemEvent<'_>,
+    ) -> Option<InteractionResult> {
+        if event.stack.item() != keys().wireless_grid {
+            return None;
+        }
+        let HostSide::Server(host) = host else {
+            return Some(InteractionResult::Success);
+        };
+        open_wireless_grid(host, event.player, event.stack);
+        Some(InteractionResult::Success)
+    }
+}
+
+/// The player's inventory slot the item of `hand` lives in: the hotbar slot
+/// they hold for the main hand, the off-hand slot (40) for the other.
+fn held_slot(host: &dyn Host, player: &mod_api::PlayerRef, hand: Hand) -> Option<u32> {
+    match hand {
+        Hand::Main => Some(player.selected_slot(host)? as u32),
+        Hand::Off => Some(40),
+    }
+}
+
+/// The resolve a wireless grid's use makes, and what it does with it: the
+/// bound transmitter's network, or the reason the use is refused.
+fn open_wireless_grid(host: &mut dyn ServerHost, uuid: u128, stack: &ItemStack) {
+    let Some(binding) = binding_of(stack) else {
+        tell(
+            host,
+            uuid,
+            "The wireless grid is not bound: use it on a wireless transmitter first.",
+        );
+        return;
+    };
+    let Some(player) = host.player(uuid) else {
+        return;
+    };
+    let Some(from) = player.entity().position(host) else {
+        return;
+    };
+    let here = host.dimension().to_owned();
+    // Upstream's `resolveNetwork`: the bound dimension's server level, the
+    // chunk loaded, and the block entity there a network target.
+    let Some(level) = host.level(binding.dimension()) else {
+        tell(
+            host,
+            uuid,
+            &format!(
+                "Wireless grid {}: no level {} is open.",
+                binding_name(&binding),
+                binding.dimension()
+            ),
+        );
+        return;
+    };
+    if node_at(host, level, binding.pos()).map(|node| node.kind) != Some(Kind::WirelessTransmitter)
+    {
+        tell(
+            host,
+            uuid,
+            &format!(
+                "Wireless grid {}: no wireless transmitter there any more.",
+                binding_name(&binding)
+            ),
+        );
+        return;
+    }
+    let net = network_in(host, level, binding.pos());
+    let online = net.online();
+    let distance = runtime::distance(from, binding.pos());
+    match runtime::admit(
+        online,
+        here == binding.dimension(),
+        distance,
+        WIRELESS_RANGE,
+    ) {
+        Ok(()) => show_wireless_grid(host, uuid, &binding, level, distance),
+        Err(refusal) => tell(
+            host,
+            uuid,
+            &format!(
+                "Wireless grid {}: refused ({refusal}).",
+                binding_name(&binding)
+            ),
+        ),
+    }
+}
+
+/// `x,y,z in dimension`, as the wireless grid's lines spell a binding.
+fn binding_name(binding: &Binding) -> String {
+    format!(
+        "{},{},{} in {}",
+        binding.pos()[0],
+        binding.pos()[1],
+        binding.pos()[2],
+        binding.dimension()
+    )
+}
+
+/// Open the 9×6 grid view of `net` as a chest menu in place of whatever the
+/// player had open, and remember it so its clicks can move items.
+fn show_wireless_grid(
+    host: &mut dyn ServerHost,
+    uuid: u128,
+    binding: &Binding,
+    level: LevelRef,
+    distance: f64,
+) {
+    // Open empty and let the refresh fill it: one place computes the view.
+    let items: Vec<Option<ItemStack>> = vec![None; GRID_SLOTS];
+    let opened = host.open_menu(
+        uuid,
+        WIRELESS_GRID_ROWS,
+        Text::literal(WIRELESS_GRID_TITLE),
+        items.clone(),
+        MenuReplace::InPlace,
+    );
+    let Ok(Some(window)) = opened else {
+        tell(host, uuid, "The wireless grid could not open a menu.");
+        return;
+    };
+    with_core(|core| {
+        core.menus.insert(
+            (uuid, window),
+            OpenGrid {
+                binding: binding.clone(),
+                view: items,
+            },
+        );
+    });
+    refresh_menu(host, uuid, window, binding, level);
+    tell(
+        host,
+        uuid,
+        &format!(
+            "Wireless grid {}: opened ({distance:.1} of {WIRELESS_RANGE} blocks).",
+            binding_name(binding)
+        ),
+    );
+}
+
+/// The stacks a menu shows, from a view: one menu slot per entry, in order.
+fn view_items(entries: &[Net]) -> Vec<Option<ItemStack>> {
+    let mut items: Vec<Option<ItemStack>> = vec![None; GRID_SLOTS];
+    for (slot, entry) in items.iter_mut().zip(entries.iter()) {
+        *slot = Some(entry.stack().clone());
+    }
+    items
+}
+
+/// What a view promises the network's other views, by resource key and count.
+fn promises_of(host: &dyn Host, items: &[Option<ItemStack>]) -> Vec<(String, u32)> {
+    items
+        .iter()
+        .flatten()
+        .map(|stack| (resource_key(host, stack), stack.count()))
+        .collect()
+}
+
+// --- a wireless grid's live view ------------------------------------------
+
+/// One disk of a network read where it lies: its drive and slot, the disk item
+/// and the contents read from that item's component.
+///
+/// A wireless grid reads its network's disks **live** rather than through the
+/// tick-maintained cache: its transmitter can be in a level that is not in
+/// place, whose drives do not tick, and the item's own view must never be a
+/// tick behind the disk it withdraws from.
+struct LiveDisk {
+    drive: [i32; 3],
+    slot: usize,
+    item: ItemStack,
+    disk: Disk<Net>,
+}
+
+/// Every storage disk of `net`, read from the drives' own slots in `level`.
+fn live_disks(host: &dyn Host, level: LevelRef, net: &runtime::Network) -> Vec<LiveDisk> {
+    let mut out = Vec::new();
+    for drive in net.of_kind(Kind::DiskDrive) {
+        let Some(entity) = host.block_entity(level, drive) else {
+            continue;
+        };
+        for slot in 0..DRIVE_SLOTS {
+            let Ok(Some(item)) = entity.item_slot(host, slot as u32) else {
+                continue;
+            };
+            if !is_disk(&item) {
+                continue;
+            }
+            let disk = read_disk(host, &item);
+            out.push(LiveDisk {
+                drive,
+                slot,
+                item,
+                disk,
+            });
+        }
+    }
+    out
+}
+
+/// What a set of live disks holds, as the runtime's network functions take it.
+fn disks_of(live: &[LiveDisk]) -> Vec<Disk<Net>> {
+    live.iter().map(|disk| disk.disk.clone()).collect()
+}
+
+/// Write every disk whose contents changed back into its item, and that item
+/// into the drive's slot, in one transaction. The drive's own tick then re-reads
+/// the item (its cache is not dirty), so the block grid and this item agree.
+fn write_back(host: &mut dyn ServerHost, level: LevelRef, live: &[LiveDisk], disks: &[Disk<Net>]) {
+    let mut writes = Vec::new();
+    for (disk, entries) in live.iter().zip(disks.iter()) {
+        if &disk.disk == entries {
+            continue;
+        }
+        let mut item = disk.item.clone();
+        write_disk(host, &mut item, entries);
+        writes.push((disk.drive, disk.slot, item));
+    }
+    if writes.is_empty() {
+        return;
+    }
+    let _ = host.transaction(|host, tx| {
+        for (drive, slot, item) in &writes {
+            let Some(entity) = host.block_entity(level, *drive) else {
+                continue;
+            };
+            entity.set_item_slot(host, tx, *slot as u32, Some(item.clone()))?;
+        }
+        Ok::<(), mod_api::BlockEntityItemError>(())
+    });
+}
+
+/// The promises every other view of `net` makes, so this view never shows what
+/// one of them already shows. A view of another network in the same dimension
+/// is not one of them: it holds its own stock.
+fn promises_elsewhere(net: &runtime::Network, dimension: &str, place: Place) -> Vec<(String, u32)> {
+    let key = ViewKey::new(dimension, net.anchor(), place);
+    with_core(|core| core.promises.promised_elsewhere(&key))
+}
+
+/// A wireless grid's open menu: its binding and what it currently shows.
+#[derive(Clone, Debug)]
+struct OpenGrid {
+    binding: Binding,
+    view: Vec<Option<ItemStack>>,
+}
+
+/// A click in a wireless grid's menu: what the click asks for, applied to the
+/// live disks and the player's own slots.
+pub(crate) fn on_menu_clicked(host: &mut dyn ServerHost, event: &MenuClickedEvent) {
+    let uuid = event.uuid;
+    let window = event.window;
+    let Some(open) = with_core(|core| core.menus.get(&(uuid, window)).cloned()) else {
+        return;
+    };
+    let Some(menu) = host.menu(uuid, window) else {
+        return;
+    };
+    let Ok(slot) = usize::try_from(event.slot) else {
+        return;
+    };
+    let (region, view_slot) = match menu.slot_backing(host, slot) {
+        Some(MenuSlotBacking::Native(index)) => (Region::View, Some(index)),
+        Some(MenuSlotBacking::Player(_)) => (Region::Inventory, None),
+        _ => return,
+    };
+    let binding = open.binding.clone();
+    let Some(level) = host.level(binding.dimension()) else {
+        return;
+    };
+    let net = network_in(host, level, binding.pos());
+    let live = live_disks(host, level, &net);
+    let mut disks = disks_of(&live);
+    let carried = menu.carried(host).flatten();
+    let slot_has = match view_slot {
+        Some(index) => open.view.get(index).is_some_and(Option::is_some),
+        None => menu.slot(host, slot).flatten().is_some(),
+    };
+    let cursor = cursor_shape(host, &carried, view_slot, &open.view);
+    let plan = plan_click(
+        region,
+        slot_has,
+        cursor,
+        u8::from(event.button == 1),
+        event.mode == 1,
+    );
+    let click = Click {
+        player: uuid,
+        menu,
+        region,
+        slot,
+        view_slot,
+        carried: carried.as_ref(),
+    };
+    let moved = apply_plan(host, &click, &plan, &mut disks);
+    if moved {
+        write_back(host, level, &live, &disks);
+    }
+    refresh_menu(host, uuid, window, &binding, level);
+}
+
+/// What the cursor holds, seen against the resource the click concerns: the
+/// stack the clicked view slot shows, or nothing for a slot that shows none.
+fn cursor_shape(
+    host: &dyn Host,
+    carried: &Option<ItemStack>,
+    view_slot: Option<usize>,
+    view: &[Option<ItemStack>],
+) -> Cursor {
+    let Some(carried) = carried else {
+        return Cursor::Empty;
+    };
+    let Some(slot_stack) = view_slot
+        .and_then(|index| view.get(index))
+        .and_then(|slot| slot.as_ref())
+    else {
+        // An empty view slot takes any cursor as a deposit.
+        return Cursor::Other;
+    };
+    if resource_key(host, carried) != resource_key(host, slot_stack) {
+        return Cursor::Other;
+    }
+    let max = host.max_stack_size(slot_stack.item()).unwrap_or(64);
+    Cursor::Same {
+        room: max.saturating_sub(slot_stack.count()),
+    }
+}
+
+/// One click in a wireless grid's menu, as the plan needs it.
+struct Click<'a> {
+    /// The player who clicked: `menu_clicked` swaps no acting player in.
+    player: u128,
+    menu: MenuRef,
+    /// Which part of the menu it landed on.
+    region: Region,
+    /// The menu's slot index.
+    slot: usize,
+    /// The view index, when it landed on one of the view's own slots.
+    view_slot: Option<usize>,
+    /// What the player carries.
+    carried: Option<&'a ItemStack>,
+}
+
+/// Do what `plan` says inside one transaction; true when items moved.
+fn apply_plan(
+    host: &mut dyn ServerHost,
+    click: &Click<'_>,
+    plan: &Plan,
+    disks: &mut [Disk<Net>],
+) -> bool {
+    let Click {
+        player,
+        menu,
+        region,
+        slot,
+        view_slot,
+        carried,
+    } = *click;
+    match *plan {
+        Plan::Nothing => false,
+        Plan::Withdraw { mode, to } => {
+            let Some(index) = view_slot else {
+                return false;
+            };
+            let Some(stack) = menu.slot(host, index).flatten() else {
+                return false;
+            };
+            let max = host.max_stack_size(stack.item()).unwrap_or(64);
+            let want = runtime::extract_amount(stack.count(), max, mode);
+            let key = resource_key(host, &stack);
+            match to {
+                Destination::Cursor => {
+                    let room = match carried {
+                        None => max,
+                        Some(cursor) if resource_key(host, cursor) == key => {
+                            max.saturating_sub(cursor.count())
+                        }
+                        Some(_) => 0,
+                    };
+                    let amount = want.min(room);
+                    if amount == 0 {
+                        return false;
+                    }
+                    let source = ItemPlace::MenuSlot { menu, slot: index };
+                    moved(host, |host, tx| {
+                        move_between(host, tx, &source, &menu.cursor(), amount)
+                    })
+                }
+                Destination::Inventory => moved(host, |host, tx| {
+                    withdraw_to_inventory(host, tx, disks, &key, want, player)
+                }),
+            }
+        }
+        Plan::Deposit { mode } => {
+            // A quick-moved inventory slot deposits *that* stack, where a view
+            // slot deposits the cursor's.
+            let source = if region == Region::Inventory {
+                ItemPlace::MenuSlot { menu, slot }
+            } else {
+                menu.cursor()
+            };
+            let Some(held) = source.stack(host) else {
+                return false;
+            };
+            let max = host.max_stack_size(held.item()).unwrap_or(64);
+            let amount = runtime::insert_amount(max, mode).min(held.count());
+            if amount == 0 {
+                return false;
+            }
+            moved(host, |host, tx| {
+                deposit_from(host, tx, &source, amount, disks)
+            })
+        }
+        Plan::Inventory(how) => match how {
+            runtime::CursorMove::Nothing => false,
+            runtime::CursorMove::Take { half } => {
+                let amount = match (half, carried) {
+                    (false, _) => u32::MAX,
+                    (true, Some(cursor)) => cursor.count().div_ceil(2),
+                    (true, None) => 1,
+                };
+                let target = ItemPlace::MenuSlot { menu, slot };
+                moved(host, |host, tx| {
+                    move_between(host, tx, &target, &menu.cursor(), amount)
+                })
+            }
+            runtime::CursorMove::Place { one } => {
+                let Some(cursor) = carried else {
+                    return false;
+                };
+                let amount = if one { 1 } else { cursor.count() };
+                let target = ItemPlace::MenuSlot { menu, slot };
+                moved(host, |host, tx| {
+                    move_between(host, tx, &menu.cursor(), &target, amount)
+                })
+            }
+            runtime::CursorMove::Merge { one } => {
+                let Some(cursor) = carried else {
+                    return false;
+                };
+                let room = if one {
+                    1
+                } else {
+                    let max = host.max_stack_size(cursor.item()).unwrap_or(64);
+                    max.saturating_sub(
+                        menu.slot(host, slot)
+                            .flatten()
+                            .map_or(0, |held| held.count()),
+                    )
+                };
+                if room == 0 {
+                    return false;
+                }
+                let target = ItemPlace::MenuSlot { menu, slot };
+                moved(host, |host, tx| {
+                    move_between(host, tx, &menu.cursor(), &target, room)
+                })
+            }
+            runtime::CursorMove::Swap => {
+                let target = ItemPlace::MenuSlot { menu, slot };
+                moved(host, |host, tx| {
+                    swap_between(host, tx, &menu.cursor(), &target)
+                })
+            }
+        },
+    }
+}
+
+/// Run `f` in one transaction and answer whether any item moved.
+fn moved(
+    host: &mut dyn ServerHost,
+    f: impl FnOnce(&mut dyn ServerHost, &mod_api::Transaction) -> u32,
+) -> bool {
+    host.transaction(|host, tx| Ok::<u32, mod_api::PlayerDataRefusal>(f(host, tx)))
+        .is_ok_and(|amount| amount > 0)
+}
+
+/// Move up to `amount` of the source's resource from `from` to `to`, inside
+/// `tx`; how much moved.
+fn move_between(
+    host: &mut dyn ServerHost,
+    tx: &mod_api::Transaction,
+    from: &ItemPlace,
+    to: &ItemPlace,
+    amount: u32,
+) -> u32 {
+    if amount == 0 {
+        return 0;
+    }
+    let Some(resource) = from.resource(host) else {
+        return 0;
+    };
+    let got = from.extract(host, tx, &resource, amount);
+    if got == 0 {
+        return 0;
+    }
+    let went = to.insert(host, tx, &resource, got);
+    if went < got {
+        let _ = from.insert(host, tx, &resource, got - went);
+    }
+    went
+}
+
+/// Exchange what the cursor holds with what a slot holds, inside `tx`.
+fn swap_between(
+    host: &mut dyn ServerHost,
+    tx: &mod_api::Transaction,
+    cursor: &ItemPlace,
+    slot: &ItemPlace,
+) -> u32 {
+    let Some(slot_resource) = slot.resource(host) else {
+        return 0;
+    };
+    let from_slot = slot.extract(host, tx, &slot_resource, u32::MAX);
+    if from_slot == 0 {
+        return 0;
+    }
+    let cursor_resource = cursor.resource(host);
+    let from_cursor = match &cursor_resource {
+        Some(resource) => cursor.extract(host, tx, resource, u32::MAX),
+        None => 0,
+    };
+    let mut back = 0;
+    if let Some(resource) = &cursor_resource {
+        back = slot.insert(host, tx, resource, from_cursor);
+    }
+    let into_cursor = cursor.insert(host, tx, &slot_resource, from_slot);
+    if back < from_cursor
+        && let Some(resource) = &cursor_resource
+    {
+        let _ = cursor.insert(host, tx, resource, from_cursor - back);
+    }
+    into_cursor
+}
+
+/// Take `want` of `key` off the network and put it in the player's inventory,
+/// inside `tx`; how much went. What the inventory cannot take goes back onto
+/// the network, as upstream's `TransferHelper.transfer` does.
+fn withdraw_to_inventory(
+    host: &mut dyn ServerHost,
+    tx: &mod_api::Transaction,
+    disks: &mut [Disk<Net>],
+    key: &str,
+    want: u32,
+    player: u128,
+) -> u32 {
+    let Some(taken) = extract(disks, key, want) else {
+        return 0;
+    };
+    let resource = ItemResource::of(taken.stack());
+    let Some(player) = host.player(player) else {
+        return 0;
+    };
+    let went = player
+        .entity()
+        .capability(host, &mod_api::ENTITY_ITEMS, ())
+        .map_or(0, |handler| {
+            handler.insert_any(host, tx, &resource, taken.count())
+        });
+    if went < taken.count() {
+        let _ = insert(disks, taken.with_count(taken.count() - went));
+    }
+    went
+}
+
+/// Take `amount` of what `from` holds and put it on the network, inside `tx`;
+/// how much went. What the network cannot take stays where it was.
+fn deposit_from(
+    host: &mut dyn ServerHost,
+    tx: &mod_api::Transaction,
+    from: &ItemPlace,
+    amount: u32,
+    disks: &mut [Disk<Net>],
+) -> u32 {
+    let Some(resource) = from.resource(host) else {
+        return 0;
+    };
+    let got = from.extract(host, tx, &resource, amount);
+    if got == 0 {
+        return 0;
+    }
+    let Some(stack) = resource.to_stack(got) else {
+        let _ = from.insert(host, tx, &resource, got);
+        return 0;
+    };
+    let Some(left) = insert(disks, Net::of(host, &stack)) else {
+        return got;
+    };
+    let left_count = left.count();
+    if left_count > 0 {
+        let _ = from.insert(host, tx, &resource, left_count);
+    }
+    got - left_count
+}
+
+/// Rewrite a wireless grid's menu contents from the network, and remember the
+/// promise it makes. Nothing is sent when the view did not change.
+fn refresh_menu(
+    host: &mut dyn ServerHost,
+    uuid: u128,
+    window: i32,
+    binding: &Binding,
+    level: LevelRef,
+) {
+    let net = network_in(host, level, binding.pos());
+    let live = live_disks(host, level, &net);
+    let disks = disks_of(&live);
+    let held = promises_elsewhere(
+        &net,
+        binding.dimension(),
+        Place::Wireless {
+            player: uuid,
+            window,
+        },
+    );
+    let entries = if net.online() {
+        view_with(&disks, &held, "", GRID_SLOTS, |stack| {
+            host.max_stack_size(stack.stack().item()).unwrap_or(64)
+        })
+    } else {
+        Vec::new()
+    };
+    let items = view_items(&entries);
+    let unchanged = with_core(|core| {
+        core.menus
+            .get(&(uuid, window))
+            .is_some_and(|open| open.view == items)
+    });
+    if unchanged {
+        return;
+    }
+    let _ = host.menu_set_items(uuid, window, items.clone());
+    let promised = promises_of(host, &items);
+    let key = ViewKey::new(
+        binding.dimension(),
+        net.anchor(),
+        Place::Wireless {
+            player: uuid,
+            window,
+        },
+    );
+    with_core(|core| {
+        if let Some(open) = core.menus.get_mut(&(uuid, window)) {
+            open.view = items;
+        }
+        core.promises.record(key, promised);
+    });
+}
+
+/// A wireless grid's menu closed: forget it and release its promise.
+pub(crate) fn on_menu_closed(event: &MenuClosedEvent) {
+    forget_menu(event.uuid, event.window);
+}
+
+/// Forget one wireless grid menu and the promise it made.
+fn forget_menu(uuid: u128, window: i32) {
+    with_core(|core| {
+        core.menus.remove(&(uuid, window));
+        core.promises.release(Place::Wireless {
+            player: uuid,
+            window,
+        });
+    });
+}
+
+/// The server tick: keep every open wireless grid's view current, and forget
+/// the menus whose player or window is gone.
+pub(crate) fn on_server_tick(host: &mut dyn ServerHost, event: &ServerTickEvent<'_>) {
+    if !matches!(event.phase, ServerTickPhase::ServerTickStart { .. }) {
+        return;
+    }
+    let open: Vec<(u128, i32, Binding)> = with_core(|core| {
+        core.menus
+            .iter()
+            .map(|((uuid, window), grid)| (*uuid, *window, grid.binding.clone()))
+            .collect()
+    });
+    for (uuid, window, binding) in open {
+        if host.menu(uuid, window).is_none() {
+            forget_menu(uuid, window);
+            continue;
+        }
+        let Some(level) = host.level(binding.dimension()) else {
+            continue;
+        };
+        refresh_menu(host, uuid, window, &binding, level);
+    }
 }
 
 // --- blocks ----------------------------------------------------------------
@@ -655,23 +1461,20 @@ fn grid_tick(host: &mut dyn ServerHost, pos: [i32; 3], entity: &mut ModBlockEnti
             .unwrap_or_default()
     });
     let held = with_core(|core| {
+        let key = ViewKey::new(&dimension, net.anchor(), Place::Grid(pos));
         // Forget the promises of grids that are no longer there: a broken grid
         // must not keep hiding the network's stock from the others. The block
         // is the truth, not the cache (a replaced block can leave its entity
-        // behind for a tick).
-        core.reserved.retain(|(dim, grid), _| {
-            dim != &dimension
-                || if *grid == pos {
-                    true
-                } else {
-                    kind_at(host, *grid) == Some(Kind::Grid)
+        // behind for a tick). A wireless grid's menu is forgotten by its own
+        // close, and by the tick when its window is gone.
+        core.promises.retain(|key| {
+            key.dimension != dimension
+                || match key.place {
+                    Place::Grid(grid) => grid == pos || kind_at(host, grid) == Some(Kind::Grid),
+                    Place::Wireless { .. } => true,
                 }
         });
-        core.reserved
-            .iter()
-            .filter(|((dim, grid), _)| !(dim == &dimension && *grid == pos))
-            .flat_map(|(_, stacks)| stacks.iter().cloned())
-            .collect::<Vec<_>>()
+        core.promises.promised_elsewhere(&key)
     });
     let entries = if online {
         view_with(&disks, &held, &filter, GRID_SLOTS, |stack| {
@@ -700,7 +1503,10 @@ fn grid_tick(host: &mut dyn ServerHost, pos: [i32; 3], entity: &mut ModBlockEnti
         .map(|stack| (resource_key(host, stack), stack.count()))
         .collect::<Vec<_>>();
     with_core(|core| {
-        core.reserved.insert((dimension.clone(), pos), promised);
+        core.promises.record(
+            ViewKey::new(&dimension, net.anchor(), Place::Grid(pos)),
+            promised,
+        );
     });
     entity.items = slots;
     let rebuilt: Vec<Option<Net>> = entity
@@ -758,14 +1564,14 @@ struct Core {
     connections: HashMap<(String, [i32; 3]), u8>,
     /// The `active` state each grid was last written with.
     active: HashMap<(String, [i32; 3]), bool>,
-    /// What each open grid currently shows: the network stock it has already
-    /// promised its players (`view_with`). Two grids never show the same
-    /// items, so neither can hand them out twice.
-    #[expect(
-        clippy::type_complexity,
-        reason = "one grid's place to the stacks it shows; a newtype would not read better"
-    )]
-    reserved: HashMap<(String, [i32; 3]), Vec<(String, u32)>>,
+    /// What each open view currently shows: the network stock it has already
+    /// promised its players (`view_with`). Two views of one network never show
+    /// the same items, so neither can hand them out twice, whether they are a
+    /// grid block or a wireless grid's menu; two networks keep separate stock.
+    promises: Promises,
+    /// The wireless grids whose menu is open: the player and window id, the
+    /// transmitter it is bound to and what it last showed.
+    menus: HashMap<(u128, i32), OpenGrid>,
 }
 
 static CORE: Mutex<Option<Core>> = Mutex::new(None);
@@ -886,6 +1692,11 @@ pub(crate) fn on_register_commands(event: &mut RegisterCommandsEvent<'_>) {
     event.commands.push(Command::new(
         "refinedstorage wireless <pos:block_pos> <dimension:dimension>",
     ));
+    // The binding a wireless grid carries, read back from the item component
+    // (upstream shows it in the item's tooltip; a mod item's tooltip is a
+    // client hook this port does not subscribe, so the readout is a command,
+    // like `/refinedstorage info`).
+    event.commands.push(Command::new("refinedstorage bound"));
 }
 
 /// The `/refinedstorage` commands' bodies (`run_mod_command`).
@@ -898,6 +1709,10 @@ pub(crate) fn on_run_mod_command(
     };
     if root != "refinedstorage" {
         return Flow::Continue;
+    }
+    if sub == "bound" {
+        bound(host, event.source);
+        return Flow::Cancel;
     }
     let Some(CommandArgumentValue::BlockPos(pos)) = event.command.argument("pos") else {
         feedback(
@@ -939,6 +1754,37 @@ pub(crate) fn on_run_mod_command(
 
 fn feedback(host: &mut dyn ServerHost, line: &str) {
     let _ = host.commands().feedback(Text::literal(line));
+}
+
+/// The body of `/refinedstorage bound`: the transmitter the acting player's
+/// wireless grid is bound to, read back from the item's own component.
+fn bound(host: &mut dyn ServerHost, source: &CommandSource) {
+    let player = match source {
+        CommandSource::Player { player, .. } => player,
+        _ => {
+            feedback(host, "Only a player holds a wireless grid.");
+            return;
+        }
+    };
+    let held = ItemPlace::PlayerHand {
+        player: player.uuid(),
+        hand: Hand::Main,
+    };
+    let Some(stack) = held.stack(host) else {
+        feedback(host, "No item in the main hand.");
+        return;
+    };
+    if stack.item() != keys().wireless_grid {
+        feedback(host, "The item in the main hand is not a wireless grid.");
+        return;
+    }
+    match binding_of(&stack) {
+        Some(binding) => feedback(
+            host,
+            &format!("Wireless grid bound to {}.", binding_name(&binding)),
+        ),
+        None => feedback(host, "The wireless grid is not bound."),
+    }
 }
 
 fn info(host: &mut dyn ServerHost, pos: [i32; 3]) {

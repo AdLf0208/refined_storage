@@ -49,6 +49,8 @@ TAG_FALLBACK = {
     "c:ingots/gold": "minecraft:gold_ingot",
     "c:ingots/copper": "minecraft:copper_ingot",
     "c:silicon": "refinedstorage:silicon",
+    # This package's own tags (slice 4's wireless grid tests #refinedstorage:grids).
+    "refinedstorage:grids": "refinedstorage:grid",
 }
 
 # A vanilla item that is NOT in the tag above, for the tag counterfactual: with
@@ -67,6 +69,7 @@ TAG_IMPOSTOR = {
     "c:ingots/gold": "minecraft:dirt",
     "c:ingots/copper": "minecraft:dirt",
     "c:silicon": "minecraft:dirt",
+    "refinedstorage:grids": "minecraft:dirt",
 }
 
 
@@ -97,20 +100,20 @@ class Ctl:
 
 
 def load_tags(data):
-    """Every `#tag` in the package's data, mapped to one concrete item id."""
+    """Every `#tag` in the package's data, mapped to one concrete item id.
+
+    Any namespace: `c:`, `minecraft:` and this package's own (`refinedstorage:`)
+    tags alike, so a recipe testing one of the mod's own tags resolves here.
+    """
     tags = {}
-    for path in sorted((data / "c" / "tags" / "item").rglob("*.json")):
-        tag = "c:" + path.relative_to(data / "c" / "tags" / "item").with_suffix("").as_posix()
-        values = json.loads(path.read_text())["values"]
-        plain = [v for v in values if not v.startswith("#")]
-        if plain:
-            tags[tag] = plain[0]
-    for path in sorted((data / "minecraft" / "tags" / "item").rglob("*.json")):
-        tag = "minecraft:" + path.relative_to(data / "minecraft" / "tags" / "item").with_suffix("").as_posix()
-        values = json.loads(path.read_text())["values"]
-        plain = [v for v in values if not v.startswith("#")]
-        if plain:
-            tags[tag] = plain[0]
+    for namespace in sorted(p.name for p in data.iterdir() if (p / "tags" / "item").is_dir()):
+        root = data / namespace / "tags" / "item"
+        for path in sorted(root.rglob("*.json")):
+            tag = f"{namespace}:" + path.relative_to(root).with_suffix("").as_posix()
+            values = json.loads(path.read_text())["values"]
+            plain = [v for v in values if not v.startswith("#")]
+            if plain:
+                tags[tag] = plain[0]
     return tags
 
 
@@ -257,9 +260,10 @@ def main():
             )
             crafted += 1
             # Counterfactual: replace the first tag ingredient with a non-member.
-            tag_key = next((k for k, v in recipe["key"].items() if isinstance(v, dict) and "tag" in v), None)
-            if tag_key:
-                tag = recipe["key"][tag_key]["tag"]
+            # The tag is read from the resolved ingredient (the pin's recipe shape
+            # spells it as a "#tag" string), not from the jar's `{"tag": …}` dict.
+            tag = next((t for (_, t) in cells_per_item if t), None)
+            if tag:
                 impostor = TAG_IMPOSTOR.get(tag)
                 cells = [c for (_, t), cs in cells_per_item.items() if t == tag for c in cs]
                 if impostor and cells:
