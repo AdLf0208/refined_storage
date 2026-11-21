@@ -21,16 +21,17 @@ use mod_api::{
     BlockPart, BlockState, Command, CommandArgumentValue, CommandInvocation, CommandSource,
     Component, Compound, Flow, Hand, Host, HostSide, HostTransaction, InteractionResult, ItemKey,
     ItemPart, ItemPlace, ItemResource, ItemStack, LevelHost, LevelRef, LevelSide, MenuClickedEvent,
-    MenuClosedEvent, MenuRef, MenuReplace, MenuSlotBacking, ModBlockEntityView, ModContainer,
-    RegisterCommandsEvent, Registrar, RegistrationContext, RightClickBlockEvent,
-    RunModCommandEvent, Screen, ScreenEvent, ServerHost, ServerTickEvent, ServerTickPhase,
-    StateForPlacementEvent, Tag, Text, UseItemEvent, UseOnEvent, WorldPhase,
+    MenuClosedEvent, MenuContainer, MenuPart, MenuRef, MenuReplace, MenuSlotBacking,
+    MenuSlotRulesEvent, ModBlockEntityView, ModContainer, RegisterCommandsEvent, Registrar,
+    RegistrationContext, RightClickBlockEvent, RunModCommandEvent, Screen, ScreenEvent, ServerHost,
+    ServerTickEvent, ServerTickPhase, StateForPlacementEvent, Tag, Text, UseItemEvent, UseOnEvent,
+    WorldPhase,
 };
 
 use crate::runtime::{
     self, Binding, CAPACITY_1K, Cursor, DRIVE_SLOTS, Delta, Destination, Disk, Face, GRID_SLOTS,
-    Kind, Node, Place, Plan, Promises, Region, Stored, ViewKey, WIRELESS_RANGE, extract, insert,
-    network, plan_click, view_with,
+    Kind, Node, Place, Plan, Promises, Region, Stored, ViewKey, extract, insert, network,
+    plan_click, view_with,
 };
 
 /// The five content ids of the slice, exactly as the content declares them.
@@ -45,6 +46,12 @@ const TRANSMITTER: &str = "refinedstorage:wireless_transmitter";
 /// The wireless grid (slice 4): a network-bound item that opens its network's
 /// 9×6 grid view from anywhere inside a transmitter's range.
 const WIRELESS_GRID: &str = "refinedstorage:wireless_grid";
+/// The range upgrade (slice 6): +8 blocks each, at most four per transmitter
+/// (upstream `RangeUpgradeItem`, registered for `WIRELESS_TRANSMITTER`).
+const RANGE_UPGRADE: &str = "refinedstorage:range_upgrade";
+/// The creative range upgrade (slice 6): unlimited range, creative-only, at
+/// most one per transmitter (upstream `RangeUpgradeItem`, creative).
+const CREATIVE_RANGE_UPGRADE: &str = "refinedstorage:creative_range_upgrade";
 /// The block-entity type this mod declares for the four network blocks.
 const BE_TYPE: &str = "refinedstorage:network";
 /// The item component that carries a disk's contents.
@@ -63,6 +70,13 @@ const WIRELESS_GRID_ROWS: u8 = 6;
 /// disks in and out).
 const DRIVE_MENU: &str = "minecraft:generic_9x1";
 const GRID_MENU: &str = "minecraft:generic_9x6";
+/// The transmitter's upgrade slots: upstream's `UpgradeContainer` default size
+/// is 4, the container its `WirelessTransmitterBlockEntity` builds.
+const TRANSMITTER_SLOTS: usize = 4;
+/// The transmitter's menu: upstream's `WirelessTransmitterContainerMenu` shows
+/// the four upgrade slots beside the player's inventory. The pin's vanilla
+/// menus have no four-slot type, so the package declares its own (API 85).
+const TRANSMITTER_MENU: &str = "refinedstorage:wireless_transmitter";
 
 /// The saved compound key the grid's view marks live under.
 const VIEW_KEY: &str = "RefinedStorageView";
@@ -82,6 +96,8 @@ struct Keys {
     transmitter: BlockKey,
     disk: ItemKey,
     wireless_grid: ItemKey,
+    range_upgrade: ItemKey,
+    creative_range_upgrade: ItemKey,
 }
 
 impl Keys {
@@ -119,9 +135,12 @@ pub(crate) fn register(registrar: &mut dyn Registrar, _cx: &RegistrationContext)
         transmitter: registrar.block_key(TRANSMITTER),
         disk: registrar.item_key(DISK),
         wireless_grid: registrar.item_key(WIRELESS_GRID),
+        range_upgrade: registrar.item_key(RANGE_UPGRADE),
+        creative_range_upgrade: registrar.item_key(CREATIVE_RANGE_UPGRADE),
     };
     let _ = KEYS.set(keys);
     registrar.item_part(keys.wireless_grid, WirelessGrid);
+    registrar.menu_part(TRANSMITTER_MENU, Upgrades);
     let kind = registrar
         .block_entity_type(BE_TYPE)
         .blocks(&[CONTROLLER, CABLE, DISK_DRIVE, GRID, TRANSMITTER])
@@ -160,6 +179,76 @@ pub(crate) fn register(registrar: &mut dyn Registrar, _cx: &RegistrationContext)
             ..ModContainer::default()
         };
         registrar.block_container(&block, container);
+    }
+    // The transmitter's four upgrade slots (upstream `UpgradeContainer`,
+    // `WirelessTransmitterBlockEntity`) and the menu that shows them.
+    let upgrades: Vec<usize> = (0..TRANSMITTER_SLOTS).collect();
+    #[expect(
+        clippy::needless_update,
+        reason = "the update is for a field a later game build may add"
+    )]
+    let container = ModContainer {
+        slots: TRANSMITTER_SLOTS,
+        // No hopper reaches a transmitter's upgrade slots upstream: they are
+        // the menu's, not a container's faces.
+        faces: [
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+        ],
+        inputs: upgrades.clone(),
+        outputs: upgrades,
+        menu: Some(TRANSMITTER_MENU.to_owned()),
+        ..ModContainer::default()
+    };
+    registrar.block_container(&keys.transmitter, container);
+}
+
+/// The transmitter's menu Part: its four upgrade slots take an upgrade item
+/// and nothing else, one per slot, at most four range upgrades and one
+/// creative one (upstream `UpgradeContainer.canPlaceItem` and the
+/// `WIRELESS_TRANSMITTER` registrations: range `maxAmount` 4, creative 1).
+///
+/// Scoped to the menu's own container (`MenuContainer::Main`): the player
+/// inventory's slots keep vanilla's rules, so a refusal here cannot cancel a
+/// click on the player's side of the menu.
+struct Upgrades;
+
+#[mod_api::horizon_part]
+impl MenuPart for Upgrades {
+    fn menu_slot_rules(&self, _host: &dyn Host, event: &mut MenuSlotRulesEvent<'_>) {
+        if event.container != MenuContainer::Main {
+            return;
+        }
+        let keys = keys();
+        let item = event.stack.item();
+        let range = item == keys.range_upgrade;
+        let creative = item == keys.creative_range_upgrade;
+        if !range && !creative {
+            event.may_place = false;
+            return;
+        }
+        // One upgrade per slot, as `UpgradeContainer.getMaxStackSize` answers 1.
+        event.max_stack = 1;
+        let held = |what: ItemKey| {
+            (0..TRANSMITTER_SLOTS)
+                .filter(|slot| {
+                    event
+                        .context
+                        .slot(MenuContainer::Main, *slot)
+                        .is_some_and(|stack| stack.item() == what)
+                })
+                .count() as u32
+        };
+        if range && held(keys.range_upgrade) >= runtime::MAX_RANGE_UPGRADES {
+            event.may_place = false;
+        }
+        if creative && held(keys.creative_range_upgrade) >= 1 {
+            event.may_place = false;
+        }
     }
 }
 
@@ -348,6 +437,37 @@ fn with_binding(mut stack: ItemStack, binding: &Binding) -> ItemStack {
     stack
 }
 
+/// Bind the held wireless grid to the transmitter at `pos`: its dimension and
+/// position in the item's own component (`NetworkItemHelperImpl.bind`), in one
+/// transaction, and tell the player. False when the hand or the player is gone.
+fn bind_grid(
+    host: &mut dyn ServerHost,
+    uuid: u128,
+    hand: Hand,
+    pos: [i32; 3],
+    stack: &ItemStack,
+) -> bool {
+    let Some(player) = host.player(uuid) else {
+        return false;
+    };
+    let Some(slot) = held_slot(host, &player, hand) else {
+        return false;
+    };
+    let binding = Binding::new(host.dimension().to_owned(), pos);
+    let bound = with_binding(stack.clone(), &binding);
+    let wrote = host
+        .transaction(|host, _tx| player.set_inventory_slot(host, slot, Some(bound)))
+        .is_ok();
+    if wrote {
+        tell(
+            host,
+            uuid,
+            &format!("Wireless grid bound to {}.", binding_name(&binding)),
+        );
+    }
+    wrote
+}
+
 // --- the wireless grid item ------------------------------------------------
 
 /// The wireless grid: bind it on a transmitter, use it to open that network's
@@ -370,25 +490,10 @@ impl ItemPart for WirelessGrid {
         if kind_at(host, event.pos) != Some(Kind::WirelessTransmitter) {
             return None;
         }
-        let Some(player) = host.player(event.player) else {
-            return Some(InteractionResult::Fail);
-        };
-        let Some(slot) = held_slot(host, &player, event.hand) else {
-            return Some(InteractionResult::Fail);
-        };
-        let binding = Binding::new(host.dimension().to_owned(), event.pos);
-        let bound = with_binding(event.stack.clone(), &binding);
-        let wrote = host
-            .transaction(|host, _tx| player.set_inventory_slot(host, slot, Some(bound)))
-            .is_ok();
-        if wrote {
-            tell(
-                host,
-                event.player,
-                &format!("Wireless grid bound to {}.", binding_name(&binding)),
-            );
+        if bind_grid(host, event.player, event.hand, event.pos, event.stack) {
+            return Some(InteractionResult::Success);
         }
-        Some(InteractionResult::Success)
+        Some(InteractionResult::Fail)
     }
 
     /// Using the grid opens the network its transmitter exposes, or names the
@@ -466,13 +571,9 @@ fn open_wireless_grid(host: &mut dyn ServerHost, uuid: u128, stack: &ItemStack) 
     let net = network_in(host, level, binding.pos());
     let online = net.online();
     let distance = runtime::distance(from, binding.pos());
-    match runtime::admit(
-        online,
-        here == binding.dimension(),
-        distance,
-        WIRELESS_RANGE,
-    ) {
-        Ok(()) => show_wireless_grid(host, uuid, &binding, level, distance),
+    let range = range_at(host, level, binding.pos());
+    match runtime::admit(online, here == binding.dimension(), distance, range) {
+        Ok(()) => show_wireless_grid(host, uuid, &binding, level, distance, range),
         Err(refusal) => tell(
             host,
             uuid,
@@ -503,6 +604,7 @@ fn show_wireless_grid(
     binding: &Binding,
     level: LevelRef,
     distance: f64,
+    range: u32,
 ) {
     // Open empty and let the refresh fill it: one place computes the view.
     let items: Vec<Option<ItemStack>> = vec![None; GRID_SLOTS];
@@ -531,8 +633,9 @@ fn show_wireless_grid(
         host,
         uuid,
         &format!(
-            "Wireless grid {}: opened ({distance:.1} of {WIRELESS_RANGE} blocks).",
-            binding_name(binding)
+            "Wireless grid {}: opened ({distance:.1} of {}).",
+            binding_name(binding),
+            runtime::range_label(range)
         ),
     );
 }
@@ -1125,6 +1228,31 @@ fn network_in(host: &dyn Host, level: mod_api::LevelRef, start: [i32; 3]) -> run
     network(start, |pos| node_at(host, level, pos))
 }
 
+/// A wireless transmitter's range, read from its four upgrade slots: the base
+/// 16 blocks plus 8 per range upgrade, or unlimited with a creative range
+/// upgrade (upstream's composite range modifier, which reads the same
+/// container the menu edits).
+fn range_at(host: &dyn Host, level: LevelRef, pos: [i32; 3]) -> u32 {
+    let Some(entity) = host.block_entity(level, pos) else {
+        return runtime::upgraded_range(0, false);
+    };
+    let keys = keys();
+    let mut range_upgrades = 0;
+    let mut creative = false;
+    for slot in 0..TRANSMITTER_SLOTS as u32 {
+        let Ok(Some(stack)) = entity.item_slot(host, slot) else {
+            continue;
+        };
+        if stack.item() == keys.range_upgrade {
+            range_upgrades += 1;
+        }
+        if stack.item() == keys.creative_range_upgrade {
+            creative = true;
+        }
+    }
+    runtime::upgraded_range(range_upgrades, creative)
+}
+
 /// The network the block at `start` belongs to, in the level in place.
 fn network_at(host: &dyn Host, start: [i32; 3]) -> runtime::Network {
     let Some(level) = host.level(host.dimension()) else {
@@ -1230,7 +1358,24 @@ impl BlockEntityPart for Network {
                     ..Screen::default()
                 })
             }
-            Kind::Controller | Kind::Cable | Kind::WirelessTransmitter => None,
+            Kind::WirelessTransmitter => {
+                // Upstream's `WirelessTransmitterScreen`: four upgrade slots in
+                // the top row, the player's inventory below.
+                let slots = (0..TRANSMITTER_SLOTS)
+                    .map(|index| Some([8.0 + 18.0 * index as f32, 16.0]))
+                    .collect();
+                Some(Screen {
+                    width: 176.0,
+                    height: 133.0,
+                    slots,
+                    inventory_y: 84.0,
+                    inventory_x: 8.0,
+                    own_labels: false,
+                    own_background: false,
+                    ..Screen::default()
+                })
+            }
+            Kind::Controller | Kind::Cable => None,
         }
     }
 }
@@ -1616,6 +1761,17 @@ pub(crate) fn on_right_click_block(
         return Flow::Continue;
     };
     let pos = event.click.pos;
+    // A wireless grid right-clicked onto a transmitter binds it. The block's
+    // own use would open the transmitter's upgrade menu first (the game runs
+    // the block's `use_item_on` before the item's `use_on`), so the binding is
+    // the click's, as the disk onto a drive is.
+    if kind_at(host, pos) == Some(Kind::WirelessTransmitter)
+        && let Some(held) = event.click.stack
+        && held.item() == keys().wireless_grid
+    {
+        bind_grid(host, event.click.player, event.click.hand, pos, held);
+        return Flow::Cancel;
+    }
     if kind_at(host, pos) != Some(Kind::DiskDrive) {
         return Flow::Continue;
     }
@@ -1831,13 +1987,17 @@ fn info(host: &mut dyn ServerHost, pos: [i32; 3]) {
         ),
     );
     if kind_at(host, pos) == Some(Kind::WirelessTransmitter) {
+        let range = host
+            .level(host.dimension())
+            .map_or(runtime::WIRELESS_RANGE, |level| range_at(host, level, pos));
         feedback(
             host,
             &format!(
-                "Wireless transmitter at {},{},{}: range {WIRELESS_RANGE} blocks, {}",
+                "Wireless transmitter at {},{},{}: range {}, {}",
                 pos[0],
                 pos[1],
                 pos[2],
+                runtime::range_label(range),
                 if online { "active" } else { "inactive" },
             ),
         );
@@ -1873,19 +2033,21 @@ fn wireless(
         return;
     };
     let distance = runtime::distance(from, pos);
+    let range = range_at(host, level, pos);
     match runtime::admit(
         online,
         command.dimension == level.dimension(),
         distance,
-        WIRELESS_RANGE,
+        range,
     ) {
         Ok(()) => feedback(
             host,
             &format!(
-                "Wireless access at {},{},{}: accepted ({distance:.1} of {WIRELESS_RANGE} blocks, {} network)",
+                "Wireless access at {},{},{}: accepted ({distance:.1} of {}, {} network)",
                 pos[0],
                 pos[1],
                 pos[2],
+                runtime::range_label(range),
                 if online { "online" } else { "offline" },
             ),
         ),

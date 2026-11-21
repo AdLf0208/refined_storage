@@ -4,7 +4,8 @@ The port's own record is [notes.md](notes.md): the behaviour, the helper→hook
 table of the SDK migration, the deviations, the gap list, and the verification
 tables (the retired `.hnmod` ladder, the SDK-format one, slice 2's red→green
 recipe proof, slice 3's wireless-transmitter red→green and in-game leg, slice
-4's wireless-grid one, and slice 5's network-keyed promise table).
+4's wireless-grid one, slice 5's network-keyed promise table, and slice 6's upgrade
+items and the raised range).
 
 Quick reproduction (a build slot is required; see the campaign's AGENTS.md):
 
@@ -24,15 +25,18 @@ cp target/horizon-mod/refinedstorage.hmod ./refinedstorage.hmod
 cargo horizon-mod check refinedstorage.hmod
 cargo horizon-mod fits refinedstorage.hmod --build 0a875da   # "made for" (the pin: tautology)
 cargo horizon-mod fits refinedstorage.hmod --build 0b14f8a   # "fits" (a different build: the proof)
+# Both fits runs print the file's sha256 first (sdk-fits-0.2.6.log). The GitHub releases
+# list answers 403 (unauthenticated rate limit) while other legs on the box fetch too;
+# retry the second run after the limit resets.
 ```
 
 The two `check`/`build`/`fits` steps need `BUILD_LOCAL=1` on the slot runner:
 the second build machine has no `cargo-horizon-mod`.
 
 Pin **`0a875da91dbb0fdcb7ba8c42c11341aa229af51a`** + mixins
-`e59da9094f0c2fdda6c627fe9eff22dec6a906f0`. Delivered package (0.2.5):
-`refinedstorage.hmod`, **148,725 B**, SHA-256
-`0a5d894c67cec3483b3ec6955f4ed2d42eba150c5bbdf365a20360d67e8547fd`, 189 entries, no packed
+`e59da9094f0c2fdda6c627fe9eff22dec6a906f0`. Delivered package (0.2.6):
+`refinedstorage.hmod`, **158,835 B**, SHA-256
+`5aa7faa89f85979a6347dc23b5982f9b993c895f0e3f8efdda34c8adab729743`, 204 entries, no packed
 `Cargo.lock`; a copy of the delivered bytes is at
 `ports/_shared/evidence/refinedstorage/refinedstorage.hmod`, which is the file both `fits`
 runs used.
@@ -50,12 +54,14 @@ SELFTEST=1 … tools/e2e.sh                                         # flipped co
 SELFTEST=grid … tools/e2e.sh                                      # flipped grid view: EXIT:1
 SELFTEST=offline … tools/e2e.sh                                   # flipped offline-grid assertion: EXIT:1
 SELFTEST=networks … tools/e2e.sh                                  # flipped two-network assertion: EXIT:1
+SELFTEST=range … tools/e2e.sh                                     # flipped raised-range assertion: EXIT:1
+SELFTEST=creative … tools/e2e.sh                                  # flipped creative-range assertion: EXIT:1
 python3 ../tools/check-e2e-logs.py refinedstorage-e2e --strict
 ```
 
 `tools/recipe_check.py` is the recipe family's driver: it reads this package's own
-`data/refinedstorage/recipe/*.json` (22 recipes, including slice 3's `wireless_transmitter`
-and slice 4's `wireless_grid`) and crafts every one of them in a crafting table or a furnace,
+`data/refinedstorage/recipe/*.json` (24 recipes, including slice 3's `wireless_transmitter`,
+slice 4's `wireless_grid`, and slice 6's `upgrade` and `range_upgrade`) and crafts every one of them in a crafting table or a furnace,
 asserting the output id and count, that the ingredients were consumed, and that a
 wrong-ingredient control yields nothing — including one control per shaped tag ingredient
 (slice 4 fixed the driver's tag lookup). Recorded in `notes.md` §"Slice 2", §"Slice 3" and
@@ -78,3 +84,10 @@ Slice 5's assertion is `notes.md` §"Slice 5": two networks in one dimension, ea
 each grid listing its own 3 (`SELFTEST=networks` asserts the old, wrong answer and fails, so the
 assertion is fail-capable). Its first run was against the previous package (0.2.4), where one grid
 answered `[]` while its disk held 3.
+
+Slice 6's assertions are `notes.md` §"Slice 6": a range upgrade inserted into the transmitter's own
+four upgrade slots raises its range to 24 blocks (the same 17.0-block use the slice-4 phase refuses
+is accepted, and the wireless grid opens its view naming 24 blocks), the transmitter's menu shows the
+four slots and refuses a diamond, and a creative range upgrade gives unlimited range (70.5 blocks out
+accepted, another dimension still refused). `SELFTEST=range` and `SELFTEST=creative` invert the two
+new assertions and exit 1.

@@ -23,6 +23,9 @@
     "refinedstorage:destruction_core",
     "refinedstorage:1k_storage_part",
     "refinedstorage:storage_housing",
-    "refinedstorage:machine_casing"
+    "refinedstorage:machine_casing",
+    "refinedstorage:upgrade",
+    "refinedstorage:range_upgrade",
+    "refinedstorage:creative_range_upgrade"
   ]
 }

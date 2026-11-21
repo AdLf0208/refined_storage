@@ -1,0 +1,16 @@
+{
+  "type": "minecraft:crafting_shaped",
+  "pattern": [
+    "EPE",
+    "PUP",
+    "EEE"
+  ],
+  "key": {
+    "E": "refinedstorage:quartz_enriched_iron",
+    "P": "#c:ender_pearls",
+    "U": "refinedstorage:upgrade"
+  },
+  "result": {
+    "id": "refinedstorage:range_upgrade"
+  }
+}

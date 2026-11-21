@@ -1,11 +1,11 @@
-# Package receipt — refinedstorage 0.2.5
+# Package receipt — refinedstorage 0.2.6
 
 | field | value |
 |---|---|
-| version | `0.2.5` |
+| version | `0.2.6` |
 | file | `refinedstorage.hmod` |
-| bytes | 148,725 |
-| sha256 | `0a5d894c67cec3483b3ec6955f4ed2d42eba150c5bbdf365a20360d67e8547fd` |
+| bytes | 158,835 |
+| sha256 | `5aa7faa89f85979a6347dc23b5982f9b993c895f0e3f8efdda34c8adab729743` |
 | source | this tag — the tree here is the source that produced the archive |
 | game | 26.3 |
 | horizon | `0a875da91dbb0fdcb7ba8c42c11341aa229af51a` |

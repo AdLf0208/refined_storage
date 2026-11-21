@@ -1,4 +1,4 @@
-# Refined Storage for Horizon (slice 4)
+# Refined Storage for Horizon (slice 6)
 
 A clean-room Rust port of **Refined Storage 2.0.9**
 (`refinedmods/refinedstorage2`, MIT), scoped to the **item network core**:
@@ -11,7 +11,10 @@ A clean-room Rust port of **Refined Storage 2.0.9**
 - **Wireless Transmitter**: joins a network through its facing side and answers
   whether a player may use that network — same dimension, online, within 16 blocks;
 - **Wireless Grid**: binds a transmitter's dimension and position into the item, then
-  opens that network's 9x6 view from anywhere inside the transmitter's range.
+  opens that network's 9x6 view from anywhere inside the transmitter's range;
+- **Range Upgrades**: the transmitter's own four upgrade slots take a **Range Upgrade**
+  (+8 blocks each, up to four) or a **Creative Range Upgrade** (unlimited range, still
+  one dimension), both crafted from the base **Upgrade** item.
 
 The crafting chain that reaches them (quartz enriched iron and copper, silicon,
 processors, the machine casing, cores, the 1k storage part, the storage housing)
@@ -19,8 +22,8 @@ is carried too, with the recipes for every block and the disk, the item tags, an
 the `refinedstorage:root` / `refinedstorage:wireless` advancements.
 
 The rest of the mod (crafters, exporters/importers, fluids, the portable grid,
-security, autocrafting, the other disk sizes) is the planned gap list in
-[notes.md](notes.md).
+security, autocrafting, the other disk sizes, and the eight upgrades whose blocks are
+not ported) is the planned gap list in [notes.md](notes.md).
 
 One flat package, the SDK layout: `horizon-mod.toml` is the only manifest,
 `src/` is the code (compiled by the launcher against the pinned game build),

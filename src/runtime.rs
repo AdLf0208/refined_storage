@@ -27,6 +27,18 @@ pub const NETWORK_CAP: usize = 512;
 /// `wirelessTransmitter.baseRange`; this port carries no config file yet, so the
 /// upstream default is the rule).
 pub const WIRELESS_RANGE: u32 = 16;
+/// How much range one range upgrade adds, in blocks (upstream
+/// `DefaultEnergyUsage.RANGE_UPGRADE_RANGE`, the config key
+/// `upgrade.rangeUpgradeRange`).
+pub const RANGE_PER_UPGRADE: u32 = 8;
+/// The most range upgrades a wireless transmitter takes: upstream registers the
+/// range upgrade for `WIRELESS_TRANSMITTER` with `maxAmount` 4, and its
+/// `UpgradeContainer` refuses a fifth.
+pub const MAX_RANGE_UPGRADES: u32 = 4;
+/// The range a creative range upgrade gives: upstream's
+/// `CreativeRangeUpgradeWirelessTransmitterRangeModifier` answers
+/// `Integer.MAX_VALUE`, which no finite distance exceeds.
+pub const CREATIVE_RANGE: u32 = i32::MAX as u32;
 
 /// The network blocks of the port: the slice's four, plus the wireless
 /// transmitter (slice 3).
@@ -334,6 +346,33 @@ pub fn admit(online: bool, same_dimension: bool, distance: f64, range: u32) -> R
         return Err(Refusal::OutOfRange { distance, range });
     }
     Ok(())
+}
+
+/// The range a wireless transmitter reaches with `range_upgrades` range
+/// upgrades in its upgrade slots, and `creative` whether a creative range
+/// upgrade is among them.
+///
+/// Upstream composes three modifiers (`CompositeWirelessTransmitterRangeModifier`):
+/// the base range (`WIRELESS_TRANSMITTER_BASE_RANGE`, 16), then
+/// `range + amount * rangeUpgradeRange` per range upgrade, then
+/// `Integer.MAX_VALUE` when the creative upgrade is present (it has the highest
+/// priority, so it wins over any number of range upgrades). A count past
+/// [`MAX_RANGE_UPGRADES`] is capped: upstream's container refuses a fifth range
+/// upgrade, and a stray stack must not raise the range past it either.
+pub fn upgraded_range(range_upgrades: u32, creative: bool) -> u32 {
+    if creative {
+        return CREATIVE_RANGE;
+    }
+    WIRELESS_RANGE + RANGE_PER_UPGRADE * range_upgrades.min(MAX_RANGE_UPGRADES)
+}
+
+/// How a range reads in the port's messages: in blocks, or `unlimited` for the
+/// creative range, which no finite distance exceeds.
+pub fn range_label(range: u32) -> String {
+    if range >= CREATIVE_RANGE {
+        return "unlimited".to_owned();
+    }
+    format!("{range} blocks")
 }
 
 /// What a stored entry must answer for the network to treat it as one resource.
@@ -1330,6 +1369,74 @@ mod tests {
         let d = distance([42.5, 64.0, 2.5], [41, 64, 1]);
         assert!((d - 2.121_320_3).abs() < 1e-6, "distance was {d}");
         assert_eq!(distance([41.0, 64.0, 1.0], [41, 64, 1]), 0.0);
+    }
+
+    // --- the upgrade items and the range they raise (slice 6) --------------
+
+    #[test]
+    fn a_transmitter_without_upgrades_keeps_the_base_range() {
+        assert_eq!(upgraded_range(0, false), WIRELESS_RANGE);
+    }
+
+    #[test]
+    fn each_range_upgrade_adds_eight_blocks() {
+        // upstream `RangeUpgradeWirelessTransmitterRangeModifier.modifyRange`:
+        // `range + amountOfRangeUpgrades * rangeUpgradeRange`, with 8 per upgrade.
+        assert_eq!(upgraded_range(1, false), 24);
+        assert_eq!(upgraded_range(2, false), 32);
+        assert_eq!(upgraded_range(4, false), 48);
+    }
+
+    #[test]
+    fn a_fifth_range_upgrade_is_not_counted() {
+        // upstream registers the range upgrade for a transmitter with maxAmount 4
+        // and its `UpgradeContainer.canPlaceItem` refuses the fifth.
+        assert_eq!(upgraded_range(5, false), 48);
+        assert_eq!(upgraded_range(40, false), 48);
+    }
+
+    #[test]
+    fn a_creative_range_upgrade_reaches_any_finite_distance() {
+        let range = upgraded_range(0, true);
+        assert_eq!(range, CREATIVE_RANGE);
+        assert_eq!(admit(true, true, 1_000_000.0, range), Ok(()));
+        assert_eq!(
+            upgraded_range(4, true),
+            CREATIVE_RANGE,
+            "the creative upgrade has the highest priority and wins over the range ones"
+        );
+    }
+
+    #[test]
+    fn a_creative_range_upgrade_still_refuses_another_dimension() {
+        // `WirelessTransmitterNetworkNodeContainer.isValid` checks the dimension
+        // before the range, so the creative upgrade cannot cross one.
+        assert_eq!(
+            admit(true, false, 1.0, upgraded_range(0, true)),
+            Err(Refusal::DifferentDimension)
+        );
+    }
+
+    #[test]
+    fn a_raised_range_accepts_what_the_base_range_refused() {
+        // the differential the in-game leg uses: the same 17.0-block use.
+        assert_eq!(
+            admit(true, true, 17.0, upgraded_range(0, false)),
+            Err(Refusal::OutOfRange {
+                distance: 17.0,
+                range: 16
+            })
+        );
+        assert_eq!(admit(true, true, 17.0, upgraded_range(1, false)), Ok(()));
+        assert_eq!(admit(true, true, 48.0, upgraded_range(4, false)), Ok(()));
+        assert!(admit(true, true, 48.1, upgraded_range(4, false)).is_err());
+    }
+
+    #[test]
+    fn a_range_is_named_in_blocks_unless_it_is_the_creative_one() {
+        assert_eq!(range_label(upgraded_range(1, false)), "24 blocks");
+        assert_eq!(range_label(WIRELESS_RANGE), "16 blocks");
+        assert_eq!(range_label(upgraded_range(0, true)), "unlimited");
     }
 
     // --- the wireless grid's binding and its menu (slice 4) ----------------

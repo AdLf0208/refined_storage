@@ -49,11 +49,24 @@
 #    network B both hold 3 gold, and each grid lists its own 3 (keyed by
 #    dimension alone, one of them listed 0 and hid 3 items it did have).
 #
+# Slice 6 (the upgrade items):
+#  - a range upgrade in the transmitter's own four upgrade slots raises its
+#    range from 16 to 24 blocks: the same 17.0-block use the wireless-grid
+#    phase refuses is accepted, and the item opens its view naming 24 blocks;
+#  - the transmitter's menu opens with four upgrade slots holding the upgrade,
+#    and a diamond shift-clicked from the inventory does not enter them;
+#  - a creative range upgrade makes the range unlimited (a use 70.5 blocks out
+#    is accepted, beyond the 48-block maximum of four range upgrades) and still
+#    refuses another dimension.
+#
 # SELFTEST=1 flips the wireless range assertion (a use 17 blocks out must be
 # accepted, so the run FAILS); SELFTEST=offline flips the older "offline lists
 # nothing" assertion the same way; SELFTEST=grid flips the wireless grid's empty
 # view; SELFTEST=networks flips the two-network assertion (one grid must hide the
-# other network's stock, so the run FAILS now that the key is the network).
+# other network's stock, so the run FAILS now that the key is the network);
+# SELFTEST=range asserts the 17-block use is still refused with the range
+# upgrade in; SELFTEST=creative asserts the creative upgrade left the finite
+# range.
 set -euo pipefail
 export LC_ALL=C
 
@@ -157,6 +170,17 @@ expect_info() { # expect_info X Y Z TEXT
     case "$line" in
         *"$4"*) ;;
         *) fail "expected /refinedstorage info to say '$4', got '$line'" ;;
+    esac
+}
+# The transmitter's own info line (a second chat line, after the network's):
+# `expect_info` reads the network line only.
+expect_range() { # expect_range X Y Z TEXT
+    local line
+    line=$(reply "refinedstorage info $1 $2 $3" | grep -m1 'Wireless transmitter' || true)
+    echo "  info($1,$2,$3) range: $line"
+    case "$line" in
+        *"$4"*) ;;
+        *) fail "expected the transmitter's range line to say '$4', got '$line'" ;;
     esac
 }
 # The player's saved advancement progress (`players/advancements/<uuid>.json`),
@@ -690,7 +714,8 @@ ctl wait 6
 # The binding is the item's own component: the dimension and the block it was
 # made on, read back from the stack (upstream's `GlobalPos`).
 expect_reply "refinedstorage bound" "Wireless grid bound to 50,64,8 in minecraft:the_end."
-# The transmitter has no menu of its own: binding opens none.
+# Binding is the item's use, which cancels the click: the transmitter's own
+# menu (slice 6) does not open behind it.
 ctl screen | jq -e '.screen != "container"' >/dev/null \
     || fail "binding the grid opened a menu: $(ctl screen | jq -c '{screen}')"
 
@@ -783,9 +808,107 @@ expect_slots '[]'
 ctl close
 ctl wait 4
 
-# The advancement needs the grid and a transmitter: the grid was obtained
-# above, so giving a transmitter completes it.
+echo "== the range upgrade: the transmitter's own slot raises its range =="
+# Upstream's transmitter has a four-slot upgrade container behind its menu
+# (`WirelessTransmitterBlockEntity`), and its range is the base 16 plus 8 per
+# range upgrade (`WirelessTransmitterRangeModifier`, `rangeUpgradeRange` 8,
+# maxAmount 4). The upgrade goes into that slot and is read back before the
+# rule is asked.
 ctl command "execute in minecraft:the_end run tp @s 50.5 64 10.5"
+ctl wait 6
+ctl container 50 64 8 refinedstorage:range_upgrade 1 >/dev/null
+ctl wait 4
+upgrade_slots=$(slots 50 64 8)
+echo "  transmitter slots: $upgrade_slots"
+echo "$upgrade_slots" | jq -e 'length == 1 and .[0].item == "refinedstorage:range_upgrade" and .[0].count == 1' >/dev/null \
+    || fail "the transmitter's upgrade slot does not hold the range upgrade: $upgrade_slots"
+expect_range 50 64 8 "range 24 blocks, active"
+
+# The differential: the same 17.0-block use the phase above refused with 16
+# blocks is accepted with the upgrade, and names the raised range.
+ctl tp 33 64 8
+ctl wait 6
+if [ "$SELFTEST" = range ]; then
+    echo "(selftest: asserting a use 17 blocks out is still refused with the range upgrade in)"
+    expect_reply "refinedstorage wireless 50 64 8 minecraft:the_end" "refused (out of range: 17.0 > 16 blocks"
+else
+    expect_reply "refinedstorage wireless 50 64 8 minecraft:the_end" "accepted (17.0 of 24 blocks"
+fi
+# And the wireless grid item itself opens the view from the same spot.
+ctl select refinedstorage:wireless_grid >/dev/null
+ctl wait 4
+use_held
+ctl wait 10
+opened=$(ctl messages 8 | jq -r '.chat[]' | grep -m1 'Wireless grid' || true)
+echo "  use 17 blocks out with the range upgrade: $opened"
+case "$opened" in
+    *"opened (17.0 of 24 blocks"*) ;;
+    *) fail "the wireless grid did not open 17.0 blocks out with the range upgrade: '$opened'" ;;
+esac
+ctl screen | jq -e '.screen == "container"' >/dev/null \
+    || fail "the raised range did not open the grid's view: $(ctl screen | jq -c '{screen}')"
+expect_slots '[]'
+ctl close
+ctl wait 4
+
+echo "== the transmitter's menu: four upgrade slots, and only upgrades fit =="
+# An empty hand: the right click is the block's, which opens the transmitter's
+# menu (its container's menu type, API 85).
+ctl command "execute in minecraft:the_end run tp @s 50.5 64 10.5"
+ctl command "clear @s" >/dev/null
+ctl wait 4
+ctl interact 50 64 8 south
+ctl wait 10
+ctl screen | jq -e '.screen == "container"' >/dev/null \
+    || fail "the transmitter's menu did not open: $(ctl screen | jq -c '{screen,slots:(.slots|length)}')"
+menu_slots=$(ctl screen | jq '[.slots[] | select(.slot >= 300)] | length')
+echo "  transmitter menu slots: $menu_slots"
+[ "$menu_slots" = 4 ] || fail "the transmitter's menu has $menu_slots container slots, expected 4"
+ctl screen | jq -e '[.slots[] | select(.slot >= 300 and .item != null) | .item] == ["refinedstorage:range_upgrade"]' >/dev/null \
+    || fail "the transmitter's menu does not show the range upgrade: $(ctl screen | jq -c '[.slots[] | select(.slot >= 300 and .item != null)]')"
+# Only an upgrade fits: a diamond shift-clicked from the inventory is refused
+# (upstream `UpgradeContainer.canPlaceItem`) and stays in the inventory.
+ctl give minecraft:diamond 1 >/dev/null
+ctl wait 4
+diamond_slot=$(inv_slot minecraft:diamond)
+[ -n "$diamond_slot" ] || fail "no diamond stack in the transmitter menu's inventory"
+ctl click-slot "$diamond_slot" shift
+ctl wait 8
+ctl screen | jq -e '[.slots[] | select(.slot >= 300 and .item == "minecraft:diamond")] == []' >/dev/null \
+    || fail "a diamond entered the transmitter's upgrade slot"
+[ "$(count_of minecraft:diamond)" = 1 ] || fail "the refused diamond left the inventory"
+expect_range 50 64 8 "range 24 blocks, active"
+ctl close
+ctl wait 4
+
+echo "== the creative range upgrade: unlimited, and still one dimension =="
+ctl command "execute in minecraft:the_end run tp @s 50.5 64 10.5"
+ctl wait 4
+ctl container 50 64 8 refinedstorage:creative_range_upgrade 1 >/dev/null
+ctl wait 4
+echo "  transmitter slots: $(slots 50 64 8)"
+if [ "$SELFTEST" = creative ]; then
+    echo "(selftest: asserting the creative upgrade leaves the finite range)"
+    expect_range 50 64 8 "range 48 blocks, active"
+fi
+expect_range 50 64 8 "range unlimited, active"
+# A platform 70.5 blocks out: beyond the 48-block maximum of four range
+# upgrades, so only the creative upgrade accepts it.
+ctl command "execute in minecraft:the_end run fill 118 63 -2 122 63 2 minecraft:stone"
+ctl tp 120 64 0
+ctl wait 8
+expect_reply "refinedstorage wireless 50 64 8 minecraft:the_end" "accepted (70.5 of unlimited"
+# The creative upgrade gives no cross-dimension access: the dimension is
+# checked first, as it was without it.
+expect_reply "execute in minecraft:overworld run refinedstorage wireless 50 64 8 minecraft:the_end" "refused (different dimension)"
+ctl command "execute in minecraft:the_end run tp @s 50.5 64 10.5"
+ctl wait 6
+
+# The advancement needs the grid and a transmitter in one `inventory_changed`
+# criterion (upstream `advancement/wireless.json`): giving both completes it,
+# while the transmitter-only phase above left it unobtained.
+ctl command "execute in minecraft:the_end run tp @s 50.5 64 10.5"
+ctl give refinedstorage:wireless_grid 1 >/dev/null
 ctl give refinedstorage:wireless_transmitter 1 >/dev/null
 ctl wait 20
 ctl save
@@ -827,5 +950,5 @@ expect_slots '[{"slot":300,"item":"minecraft:gold_ingot","count":3}]'
 ctl close
 ctl wait 4
 
-echo "PASS: the wireless transmitter joined its network through the facing side only (offline facing away, active facing the cable), /refinedstorage info named it and its range 16 blocks, a use 2.5 blocks away and one exactly 16 blocks away were accepted, 17 blocks away was refused naming the distance, an offline transmitter refused and a position without one answered so, a use from the End against the overworld transmitter was refused as a different dimension while the same command under execute in was accepted, the item placed against the clicked face and the block dropped itself, every carried recipe crafts in game with its declared output and count (22 now, each with its wrong-ingredient control), the machine casing places, reads back and drops itself, the wireless grid is unbound until it is used on a transmitter and then names it (dimension and position in its own component), a use inside the range opens the network's 9x6 view with 54 slots, a shift-click in the player inventory deposits 5 diamonds on the network and a shift-click on the view withdraws them back, 17 blocks out is refused naming the distance while 16 blocks out opens the view, the same item and binding is refused as a different dimension from the overworld and accepted in the End, the refinedstorage:wireless advancement is not granted by a transmitter alone and is granted by the grid and a transmitter together, two networks in one dimension each listed their own 3 gold while the other network held 3 too, two grids on one network never offered the same items twice, the cable follows its neighbours and the grid is active with a controller, the disk went into the drive and the grid listed what was deposited through its menu, the search filtered it, a shift-click withdrew the diamonds, breaking the controller took the network offline and putting it back restored the disk's gold, a network without a drive listed nothing, a stick did not enter the drive, a vanilla barrel is not a network block, and the disk kept its 3 gold across a relaunch"
+echo "PASS: the wireless transmitter joined its network through the facing side only (offline facing away, active facing the cable), /refinedstorage info named it and its range 16 blocks, a use 2.5 blocks away and one exactly 16 blocks away were accepted, 17 blocks away was refused naming the distance, an offline transmitter refused and a position without one answered so, a use from the End against the overworld transmitter was refused as a different dimension while the same command under execute in was accepted, the item placed against the clicked face and the block dropped itself, every carried recipe crafts in game with its declared output and count (24 now, each with its wrong-ingredient control), the machine casing places, reads back and drops itself, the wireless grid is unbound until it is used on a transmitter and then names it (dimension and position in its own component), a use inside the range opens the network's 9x6 view with 54 slots, a shift-click in the player inventory deposits 5 diamonds on the network and a shift-click on the view withdraws them back, 17 blocks out is refused naming the distance while 16 blocks out opens the view, the same item and binding is refused as a different dimension from the overworld and accepted in the End, the refinedstorage:wireless advancement is not granted by a transmitter alone and is granted by the grid and a transmitter together, two networks in one dimension each listed their own 3 gold while the other network held 3 too, two grids on one network never offered the same items twice, the cable follows its neighbours and the grid is active with a controller, the disk went into the drive and the grid listed what was deposited through its menu, the search filtered it, a shift-click withdrew the diamonds, breaking the controller took the network offline and putting it back restored the disk's gold, a network without a drive listed nothing, a stick did not enter the drive, a vanilla barrel is not a network block, a range upgrade in the transmitter's own upgrade slot raised its range to 24 blocks so the same 17.0-block use was accepted and the wireless grid opened its view naming 24 blocks, the transmitter's four-slot menu showed the upgrade and refused a diamond, a creative range upgrade gave unlimited range (70.5 blocks out accepted, another dimension still refused), and the disk kept its 3 gold across a relaunch"
 # The cleanup trap prints EXIT:<status> as the last line.

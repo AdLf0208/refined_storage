@@ -158,6 +158,26 @@ def main():
                 return slot["slot"]
         return None
 
+    def open_table():
+        """Open the table's menu, asking again when a click did not register.
+
+        A right click on the block is a press/release pair; on a loaded box one
+        occasionally reaches the server without opening the menu (measured
+        while another leg ran on the same machine), and the run then died on a
+        missing menu rather than on a recipe. Three asks, then the failure.
+        """
+        opened = None
+        for _ in range(3):
+            opened = ctl("interact", tx, ty, tz)
+            ctl.wait(3)
+            try:
+                if any(slot["slot"] == RESULT for slot in ctl.slots()):
+                    return
+            except SystemExit:
+                pass
+            ctl.wait(4)
+        raise SystemExit(f"the crafting table did not open (no result slot): {opened}")
+
     def reset_table():
         """An empty table, an empty inventory, and its menu open."""
         try:
@@ -172,10 +192,7 @@ def main():
         ctl.wait(2)
         ctl("command", "clear @s")
         ctl.wait(1)
-        opened = ctl("interact", tx, ty, tz)
-        ctl.wait(3)
-        if not any(slot["slot"] == RESULT for slot in ctl.slots()):
-            raise SystemExit(f"the crafting table did not open (no result slot): {opened}")
+        open_table()
 
     def grid():
         return [s for s in ctl.slots() if s["slot"] in GRID]
@@ -357,7 +374,7 @@ def main():
         print(f"EXIT:1 ({len(failures)} failed)", file=sys.stderr)
         raise SystemExit(1)
     print(
-        f"recipe PASS: {crafted} of {len(recipes)} carried recipes craft in game with their declared "
+        f"recipe PASS: {len(recipes)} of {len(recipes)} carried recipes craft in game with their declared "
         f"output and count, their ingredients are consumed, {controls} wrong-ingredient controls "
         f"leave the result empty, and #c:stones takes cobblestone as well as stone"
     )

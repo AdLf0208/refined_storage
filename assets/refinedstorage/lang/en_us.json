@@ -32,5 +32,10 @@
   "item.refinedstorage.wireless_grid.help": "Use a Wireless Transmitter to bind it, then use it to open your storage network from anywhere inside the transmitter's range.",
   "item.refinedstorage.wireless_transmitter.help": "Provides wireless network access for items like the Wireless Grid. Multiple are allowed in an area for wider coverage.",
   "tag.item.refinedstorage.grids": "Grids",
-  "tag.item.refinedstorage.wireless_transmitters": "Wireless Transmitters"
+  "tag.item.refinedstorage.wireless_transmitters": "Wireless Transmitters",
+  "item.refinedstorage.upgrade": "Upgrade",
+  "item.refinedstorage.range_upgrade": "Range Upgrade",
+  "item.refinedstorage.range_upgrade.help": "Increases the range of the Wireless Transmitter.",
+  "item.refinedstorage.creative_range_upgrade": "Creative Range Upgrade",
+  "item.refinedstorage.creative_range_upgrade.help": "Provides infinite range for the Wireless Transmitter. Does not work cross-dimensionally."
 }

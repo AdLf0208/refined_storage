@@ -19,11 +19,11 @@ the network; no entities, renderers, dimensions or new vanilla hooks.
 Ported now because it is the **#1 core base** of the core-first queue: 13
 pending ATM10 mods depend on it (`ports/tools/port_queue.py`).
 
-Status: **slice 4 — the wireless grid (0.2.4)** — the network core of slice 1, the crafting
-chain of slice 2, the finite-range, same-dimension transmitter of slice 3, and the item that asks
-its admission: the wireless grid binds a transmitter's dimension and position into its own
-component, opens that network's 9×6 view from anywhere inside the range, and withdraws and
-deposits through it. Everything else is the gap list below, not a claim.
+Status: **slice 6 — the upgrade items (0.2.6)** — the network core of slice 1, the crafting
+chain of slice 2, the finite-range, same-dimension transmitter of slice 3, the item that asks
+its admission (slice 4), the promise table keyed by network (slice 5), and now the transmitter's own
+four upgrade slots with the range and creative range upgrades in them. Everything else is the gap
+list below, not a claim.
 
 > The sections from `## Behaviour` to `### Verification after the repairs`
 > describe the **retired `.hnmod`** layout. They are kept as history: the
@@ -114,12 +114,21 @@ and in the gaps below.
    upstream has four energy levels. No FE hook is needed or used.
 2. **The rest of the mod does not exist**: crafters, exporters/importers,
    external storage, interfaces, relays, network transmitters/receivers,
-   security manager, ~~wireless transmitter~~ (**done in slice 3, 0.2.3** — the
+   security manager, ~~wireless transmitter~~ (**done in slice 3, 0.2.3**; the
    block, its item, the facing-only connection rule, the same-dimension/16-block
-   admission, its recipe and the `refinedstorage:wireless` advancement), the
-   wireless grid, portable grid, crafting/pattern
+   admission, its recipe and the `refinedstorage:wireless` advancement),
+   ~~the wireless grid~~ (**done in slice 4, 0.2.4**), portable grid, crafting/pattern
    grids, autocrafting, fluid storage and disks, the other disk sizes (4k/16k/
-   64k/creative), storage blocks, upgrades, the config file, and the coloured
+   64k/creative), storage blocks, ~~the range and creative range upgrades~~
+   (**done in slice 6, 0.2.6**: the transmitter's four upgrade slots, the base
+   `upgrade` item and its recipe, +8 blocks per range upgrade up to four, the
+   creative one unlimited but never cross-dimension), the **eight inert
+   upgrades** (`speed`, `stack`, `regulator`, `autocrafting`, `silk_touch`,
+   `fortune_1/2/3` — `blocked(no-importer/exporter/destructor/crafting-grid)`:
+   every surface upstream registers them for is an unported block, so shipping
+   them would be inert; `silk_touch`/`fortune_1..3` also need the
+   `refinedstorage:upgrade_with_enchanted_book` recipe type, which the pin has no
+   content-side recipe-type registry for), the config file, and the coloured
    variants of every block (the slice has the default colour only — the
    transmitter is the plain variant, and its tag is ready for the dyed ones).
 3. ~~**No recipes.** Every recipe of the five items needs Refined Storage's own
@@ -756,7 +765,7 @@ shape).
 | 6 shipped-item recipes | **tested** — `controller` 1, `cable` 12, `disk_drive` 1, `grid` 1, `1k_storage_disk` 1 (shaped and from the housing) |
 | the `c:` tags | **tested** — every tag-consuming recipe crafts, and `#c:stones` makes the casing from **cobblestone**, not only from its first entry (stone) |
 | unknown ids | **tested** — `give refinedstorage:no_such_item` refused; `setblock … refinedstorage:no_such_block` leaves air |
-| the rest of the jar (crafters, exporters/importers, external storage, interfaces, relays, security, wireless, fluid storage, the other disk sizes, coloured variants, upgrades) | **not ported** — slice-1 gap 2, unchanged |
+| the rest of the jar (crafters, exporters/importers, external storage, interfaces, relays, security, fluid storage, the other disk sizes, coloured variants, the eight inert upgrades) | **not ported** — slice-1 gap 2, unchanged (the range and creative range upgrades are slice 6) |
 
 ### Deviations and traps
 
@@ -1397,3 +1406,219 @@ Evidence: `ports/_shared/evidence/refinedstorage/` — `runtime-red-slice5-promi
 `e2e-slice5-selftest.log`, `e2e-slice5-selftest-grid.log`, `e2e-slice5-selftest-offline.log`,
 `e2e-slice5-selftest-networks.log`, and `launcher-build-0.2.5.log` (`Compiling refinedstorage
 (1 of 1)`, `native-0a875da-174d06351fe0` — the build every leg ran on).
+
+## Slice 6 — the upgrade items, and the one that is not inert (2026-11-21) — version 0.2.6
+
+Gap line this slice answers — §"Gaps / deviations (slice 1)" item 2, as slices 2–5 left it: *"The rest
+of the mod does not exist: … **upgrades**, … the config file …"*, and slice 2's coverage row *"the
+rest of the jar (…, coloured variants, **upgrades**) → not ported"*. It is also the family the slice-4
+report named as the next slice, with the selection rule the `mifa` dispatch had just cost the campaign:
+of upstream's eleven upgrade items, only the one whose consumer exists in this port is non-inert.
+
+Pin **`0a875da91dbb0fdcb7ba8c42c11341aa229af51a`**, mixins
+`e59da9094f0c2fdda6c627fe9eff22dec6a906f0`, SDK `0a875da`, launcher 0.2.92, game 26.3. Class
+`content` / tier **deep**, shape **machines**, unchanged: three items, a block container, a content
+menu type, a menu Part and one pure range rule are below the tier. No new pin API and no third-party
+mod: every ingredient is vanilla or a chain item slice 2 already carries.
+
+### The jar's eleven upgrade items, and which are non-inert here
+
+Read from `refinedmods/refinedstorage2` v2.0.9 (MIT), commit
+`0dec63affe8147702b020843c22748483ef18c01` — the clone was read for behaviour only and is deleted
+after this record. Files read: `upgrade/{UpgradeContainer,UpgradeDestinations,UpgradeRegistryImpl,
+RangeUpgradeItem,SimpleUpgradeItem}.java`, `networking/{Base,Composite,RangeUpgrade,CreativeRangeUpgrade}
+WirelessTransmitterRangeModifier.java`, `networking/{WirelessTransmitterBlockEntity,
+WirelessTransmitterNetworkNodeContainer,WirelessTransmitterContainerMenu}.java`,
+`common/content/DefaultEnergyUsage.java`, the `AbstractModInitializer` upgrade registrations, and the
+jar's `recipe/*upgrade.json`, `models/item/*upgrade.json`, `textures/item/*upgrade.png`,
+`lang/en_us.json`.
+
+| item | upstream registers it for | this port has the surface? |
+|---|---|---|
+| `upgrade` | a plain `Item`, the base ingredient of the upgrade recipes | **yes** — `range_upgrade`'s recipe consumes it |
+| `range_upgrade` | `WIRELESS_TRANSMITTER` (`maxAmount` 4) | **yes** — the transmitter ships (slice 3) |
+| `creative_range_upgrade` | `WIRELESS_TRANSMITTER` (`maxAmount` 1) | **yes** — creative-only, no recipe |
+| `speed_upgrade` | importer, exporter, destructor, constructor, disk interface, autocrafter | **no** |
+| `stack_upgrade` | importer, exporter, constructor, disk interface | **no** |
+| `regulator_upgrade` | importer, exporter | **no** |
+| `autocrafting_upgrade` | importer, constructor, interface | **no** |
+| `silk_touch_upgrade` | destructor | **no** |
+| `fortune_1/2/3_upgrade` | destructor | **no** |
+
+The eight inert ones are **not shipped** (the `mifa` rule: an item no shipped block reads is not a
+port). Their `blocked(<symbol>)` reasons are in gap 2 above. Their recipes would also be
+unresolvable: `silk_touch` and `fortune_1..3` are `refinedstorage:upgrade_with_enchanted_book`
+recipes, and the pin has **no content-side recipe-type registry** (custom recipe types are planned for
+machines in `horizon/docs/modpacks.md` §"What packs need"), so those four recipes stay
+`blocked(no-recipe-type: refinedstorage:upgrade_with_enchanted_book)` even if the destructor existed.
+
+### The rule (upstream, read rather than guessed)
+
+`WirelessTransmitterBlockEntity.getRange()` calls
+`CompositeWirelessTransmitterRangeModifier.modifyRange(upgradeContainer, 0)`:
+
+1. `BaseWirelessTransmitterRangeModifier` → `baseRange` (`WIRELESS_TRANSMITTER_BASE_RANGE` = 16);
+2. `RangeUpgradeWirelessTransmitterRangeModifier` → `range + amount(range_upgrade) *
+   rangeUpgradeRange`, and `DefaultEnergyUsage.RANGE_UPGRADE_RANGE` = **8**;
+3. `CreativeRangeUpgradeWirelessTransmitterRangeModifier` (priority `Integer.MAX_VALUE`) →
+   `Integer.MAX_VALUE` when the creative upgrade is present.
+
+The container is `UpgradeContainer`'s default size **4**, and its `canPlaceItem` refuses a placement
+past the registration's `maxAmount` (4 range, 1 creative). So the port's rule is
+`upgraded_range(range_upgrades, creative)` = `16 + 8 * min(4, count)`, or `i32::MAX` with a creative
+upgrade; `admit` keeps upstream's check order (dimension, online, range), so the creative upgrade
+never crosses a dimension.
+
+### What was implemented
+
+- **runtime.rs** (tests first): `RANGE_PER_UPGRADE` (8), `MAX_RANGE_UPGRADES` (4), `CREATIVE_RANGE`
+  (`i32::MAX`), `upgraded_range(count, creative)` and `range_label(range)` ("24 blocks"/"unlimited").
+- **support.rs**: the transmitter's four upgrade slots (`Registrar::block_container`); a content menu
+  type `refinedstorage:wireless_transmitter` (`data/refinedstorage/horizon/menu/`, API 85,
+  `{"slots": 4}`) with a `Screen` layout and a `MenuPart`; `range_at(host, level, pos)` reading the
+  four slots; the three range readers (the wireless grid's `use_item`, `/refinedstorage wireless`,
+  `/refinedstorage info`) now call it.
+- **The menu Part's `menu_slot_rules`** (API 130) is upstream's `canPlaceItem`/`getMaxStackSize`:
+  only a range or creative range upgrade, one per slot, at most four range and one creative. It is
+  scoped to `MenuContainer::Main`, so the player inventory keeps vanilla's rules — a refusal on the
+  menu's slot cannot cancel a deposit from the player's side.
+- **The binding moved to `right_click_block`.** The transmitter's menu needs the block's own use to
+  open, which the game only posts for a container *class*, so its template became
+  `minecraft:barrel` (as the drive's already was) and the blockstate gained `open=false|true` (24
+  variants). That changed the order of a click: the block's `use_item_on` now runs **before** the
+  item's `use_on`, so a click with a wireless grid opened the menu instead of binding. The binding is
+  now done in `right_click_block` (`Flow::Cancel`, the same shape as a disk onto a drive) and the
+  item's `use_on` calls the same `bind_grid` helper for the paths that do not run the hook.
+- **Content** (from the jar, MIT): the `upgrade`, `range_upgrade` and `creative_range_upgrade` items
+  (paper template, own textures/models/item definitions/lang, the creative tab), the `upgrade` and
+  `range_upgrade` recipes in the pin's `"id"`/`"#tag"` shape, and the transmitter's
+  `open` blockstate variants.
+
+### Upstream defects fixed
+
+None found in the upgrade items themselves. One **port** defect was found and fixed by the slice:
+the transmitter's block could not open its own menu at all while its template was `minecraft:end_rod`
+(the game posts `PlayerEffect::OpenMenu` only for a container class,
+`horizon-world/src/level/interact.rs:414-437`), so the four upgrade slots would have been reachable
+only through `ctl container`. The template change above fixes it; the nub stays the block's shape and
+collision through `shapes`, and the barrel's `open` state is carried.
+
+### Red proof — the rules as tests, before the glue
+
+`upgraded_range` first answered the base range and `range_label` always "N blocks"; run:
+**5 failed of 64** (`ports/_shared/evidence/refinedstorage/runtime-red-slice6-upgrades.log`):
+
+```
+---- runtime::tests::each_range_upgrade_adds_eight_blocks stdout ----
+assertion `left == right` failed
+  left: 16
+ right: 24
+---- runtime::tests::a_raised_range_accepts_what_the_base_range_refused stdout ----
+assertion `left == right` failed
+  left: Err(OutOfRange { distance: 17.0, range: 16 })
+ right: Ok(())
+---- runtime::tests::a_creative_range_upgrade_reaches_any_finite_distance stdout ----
+assertion `left == right` failed
+  left: 16
+ right: 2147483647
+test result: FAILED. 59 passed; 5 failed; 0 ignored; 0 measured; 0 filtered out
+```
+
+Green after the rule: **64 passed, 0 failed** (`sdk-test-0.2.6.log`). The five new tests are
+`a_transmitter_without_upgrades_keeps_the_base_range`, `each_range_upgrade_adds_eight_blocks`,
+`a_fifth_range_upgrade_is_not_counted`, `a_creative_range_upgrade_reaches_any_finite_distance`,
+`a_creative_range_upgrade_still_refuses_another_dimension`,
+`a_raised_range_accepts_what_the_base_range_refused` and
+`a_range_is_named_in_blocks_unless_it_is_the_creative_one` — seven, of which five were red.
+
+### Green — the ladder and the in-game leg (one launcher build at `0a875da`)
+
+| Step | Command | Result |
+|---|---|---|
+| runtime + glue tests | `cargo test --offline` | **64 passed**, 0 failed (`sdk-test-0.2.6.log`) |
+| lints | `cargo clippy --all-targets --offline -- -D warnings` | exit 0, **0 warnings** (`sdk-clippy-0.2.6.log`) |
+| formatting | `rustfmt --edition 2024 --check src/{lib,support,runtime}.rs` | clean (`sdk-fmt-0.2.6.log`, `FMT_EXIT:0`) |
+| SDK check | `cargo horizon-mod check` | *"…561 items of the API (… 20 hooks …). Made for 0a875da."* (`sdk-check-0.2.6.log`) |
+| package | `rm -f Cargo.lock && cargo horizon-mod build` ×2 | **byte-identical** (`cmp`), **158,835 B**, SHA-256 `5aa7faa89f85979a6347dc23b5982f9b993c895f0e3f8efdda34c8adab729743`, **204 entries**, no `Cargo.lock` (`sdk-build-0.2.6-{1,2}.log`) |
+| package check | `cargo horizon-mod check refinedstorage.hmod` | `0.2.6 (native-mod, format native-1/0a875da…/e59da909…, for 26.3) 158835 bytes` |
+| fits (pin) | `… fits refinedstorage.hmod --build 0a875da` | *"0a875da made for"*, `FITS_PIN_EXIT:0` |
+| fits (other build) | `… fits refinedstorage.hmod --build 0b14f8a` | *"0b14f8a fits"*, `FITS_OTHER_EXIT:0` (`sdk-fits-0.2.6.log`, sha `5aa7faa8…` printed before each run) — the run first answered the GitHub releases list **403** (the unauthenticated rate limit, exhausted by the box's parallel legs) and was repeated after the reset; `8f83e5c` (a later cached nightly) also answers *"8f83e5c fits"* |
+| launcher build | `launcher-game.sh build refinedstorage --rebuild` | exit 0, **`Compiling refinedstorage (1 of 1)`**, `native-0a875da-3f241726424e` (`launcher-build-0.2.6.log`) |
+| in-game leg | `build-slot.sh run --step e2e -- bash tools/e2e.sh` | **PASS** + **`EXIT:0`** (`e2e-slice6-green.log`) |
+| control (same Nightly, no package) | `GAME=$CONTROL_GAME …` | **FAIL** + `EXIT:1` — *"the block at 41,64,1 is minecraft:air, expected facing=north"* |
+| selftest (flipped command range) | `SELFTEST=1 …` | **FAIL** + `EXIT:1` — *"expected … 'accepted (17.0 of 16 blocks', got … 'refused (out of range: 17.0 > 16 blocks)'"* |
+| selftest (flipped upgraded range) | `SELFTEST=range …` | **FAIL** + `EXIT:1` — *"expected … 'refused (out of range: 17.0 > 16 blocks', got … 'accepted (17.0 of 24 blocks, online network)'"* |
+| selftest (flipped creative range) | `SELFTEST=creative …` | **FAIL** + `EXIT:1` — *"expected the transmitter's range line to say 'range 48 blocks, active', got '… range unlimited, active'"* |
+| log gate | `check-e2e-logs.py refinedstorage-e2e --strict` | green |
+| package gate | `verify-sdk-package.py refinedstorage` | **1/1** |
+
+The scenario (quoted from `e2e-slice6-green.log`; the transmitter at 50,64,8 faces its cable west,
+inside the arena floor):
+
+```
+  use 17 blocks out: Wireless grid 50,64,8 in minecraft:the_end: refused (out of range: 17.0 > 16 blocks).
+  transmitter slots: [{"count":1,"item":"refinedstorage:range_upgrade"}]
+  info(50,64,8) range: Wireless transmitter at 50,64,8: range 24 blocks, active
+  /refinedstorage wireless 50 64 8 minecraft:the_end -> Wireless access at 50,64,8: accepted (17.0 of 24 blocks, online network)
+  use 17 blocks out with the range upgrade: Wireless grid 50,64,8 in minecraft:the_end: opened (17.0 of 24 blocks).
+  transmitter menu slots: 4
+  info(50,64,8) range: Wireless transmitter at 50,64,8: range 24 blocks, active
+  transmitter slots: [{"count":1,"item":"refinedstorage:range_upgrade"},{"count":1,"item":"refinedstorage:creative_range_upgrade"}]
+  info(50,64,8) range: Wireless transmitter at 50,64,8: range unlimited, active
+  /refinedstorage wireless 50 64 8 minecraft:the_end -> Wireless access at 50,64,8: accepted (70.5 of unlimited, online network)
+  /execute in minecraft:overworld run refinedstorage wireless 50 64 8 minecraft:the_end -> Wireless access at 50,64,8: refused (different dimension)
+```
+
+Every assertion has its differential or counterfactual: the same 17.0-block use is refused in the
+slice-4 phase (un-upgraded) and accepted after the upgrade; 24 is the named raised range (16 + 8);
+70.5 blocks is beyond the 48-block maximum of four range upgrades, so only the creative upgrade can
+accept it, and the same command from the overworld is still refused; a diamond shift-clicked into the
+menu stays in the inventory; `SELFTEST=range` and `SELFTEST=creative` assert the old behaviour and
+exit 1.
+
+### Coverage (parity rule) — every family this slice ships
+
+| family | state |
+|---|---|
+| `refinedstorage:range_upgrade` | **tested** — crafted by `recipe_check.py` (output id + count, ingredients consumed, wrong-ingredient control on `#c:ender_pearls`), given, inserted into the transmitter's slot, read back, and its rule proven at 17.0 / 24.0 blocks |
+| `refinedstorage:creative_range_upgrade` | **tested** — given (creative-only, no recipe), inserted beside the range upgrade, `range unlimited`, 70.5 blocks accepted, another dimension refused; `SELFTEST=creative` inverts it |
+| `refinedstorage:upgrade` (base) | **tested** — crafted (output id + count, `#c:glass_blocks` control) and consumed by the range upgrade's recipe |
+| the transmitter's four upgrade slots | **tested** — `ctl container` insert/read back, and the menu shows the same four slots |
+| the transmitter's menu (`refinedstorage:wireless_transmitter`, 4 slots) | **tested** — a right click with an empty hand opens it (`screen: container`, 4 container slots, the range upgrade in slot 0); the barrel template is what posts the open |
+| the slot rules (only upgrades, 1 per slot) | **tested** — a diamond shift-clicked from the inventory does not enter the slots and stays in the inventory |
+| the `range_label` readout | **tested** — `range 24 blocks` and `range unlimited` in the info line, `of 24 blocks`/`of unlimited` in both the command's and the item's replies |
+| `speed`, `stack`, `regulator`, `autocrafting`, `silk_touch`, `fortune_1/2/3` | **not ported** — `blocked(no-importer/exporter/destructor/crafting-grid)`; the four enchanted-book recipes also `blocked(no-recipe-type: refinedstorage:upgrade_with_enchanted_book)` |
+| network energy (upstream charges 8 FE/t per range upgrade) | **not ported** — parent gap 1 (no FE at all); the range rule is energy-independent |
+| the transmitter's upgrade drops when the block is broken | **not ported** — the game's mod block entity drops an empty item (ARCHITECTURE §3's `block_drops` route is the fix, a later slice) |
+| the dyed upgrade items / dyed transmitters | **not ported** — no colour variants in this port |
+
+### Deviations and traps (this slice)
+
+1. **The base `upgrade` item is shipped, the other eight are not.** The base item is not inert: the
+   range upgrade's recipe consumes it. The eight are, so they are not in the package.
+2. **The transmitter's template is `minecraft:barrel`.** It is what makes the block's use open the
+   menu (container classes only); the shape/collision stay the nub via `shapes`, the `open` state is
+   carried in the blockstate, and the drive already uses the same template.
+3. **The binding moved to `right_click_block`.** With a container class the game runs the block's
+   `use_item_on` before the item's `use_on`, so a wireless grid clicked onto a transmitter opened the
+   menu instead of binding. The hook cancels the click and binds, exactly as a disk onto a drive; the
+   item's `use_on` keeps the same helper for the prediction path.
+4. **The upgrade slot count is the menu's four.** A range upgrade past four cannot be placed (the
+   slot rule), and `upgraded_range` caps a stray count at four anyway, so the 48-block maximum holds
+   even if a save is edited.
+5. **Harness flake fixed in `tools/recipe_check.py`.** On a loaded box a right click on the crafting
+   table occasionally reached the server without opening the menu, and the driver died on "no menu is
+   open" rather than on a recipe. `reset_table` now asks up to three times and only then fails; the
+   same run passed all 24 recipes and 22 controls afterwards. (A first attempt had also read the
+   upgrade slot's JSON with a fixed key order — `jq` prints `count` before `item` — and compared
+   objects; the assertion now uses a `jq -e` predicate.)
+
+Skills: superpowers/using-superpowers,brainstorming,writing-plans,test-driven-development,systematic-debugging,verification-before-completion; BeautifulRust/rust-best-practices
+
+Evidence: `ports/_shared/evidence/refinedstorage/` — `plan-slice6-upgrades.md`,
+`runtime-red-slice6-upgrades.log`, `sdk-test-0.2.6.log`, `sdk-clippy-0.2.6.log`, `sdk-fmt-0.2.6.log`,
+`sdk-check-0.2.6.log`, `sdk-build-0.2.6-{1,2}.log`, `sdk-check-fits-0.2.6.log`, `sdk-fits-0.2.6.log`,
+`refinedstorage.hmod` (the delivered bytes) — and `ports/_shared/evidence/refinedstorage-e2e/` —
+`e2e-slice6-green.log` (green), `e2e-slice6-control.log`, `e2e-slice6-selftest.log`,
+`e2e-slice6-selftest-range.log`, `e2e-slice6-selftest-creative.log`, and `launcher-build-0.2.6.log`
+(`Compiling refinedstorage (1 of 1)`, `native-0a875da-3f241726424e` — the build every leg ran on).
