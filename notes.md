@@ -1894,3 +1894,204 @@ Evidence: `ports/_shared/evidence/refinedstorage/` — `plan-slice7-importer-exp
 `e2e-slice7-selftest-networks.log` (the slice-5 rule's counterfactual, still failing on purpose), and
 `launcher-build-0.2.7.log` (`Compiling refinedstorage (1 of 1)`, `native-0a875da-3a543f18b508` —
 the build every leg ran on).
+
+## Slice 8 — the controller's energy model (2026-11-22) — version 0.2.8
+
+Gap line this slice answers — §"Gaps / deviations (slice 1)" item 1, verbatim: *"**No energy.** The
+controller is the network's on/off root but consumes and stores nothing; its `energy_type` state has
+two values (`off`/`on`) where upstream has four energy levels. No FE hook is needed or used."* Every
+later slice cites it: the six refused upgrades, the wireless grid's per-open drain, the transmitter's
+16 FE/t and both machines' per-pass cost all wait on the network having a buffer at all. It is the
+family the slice-7 report named next for that reason.
+
+Pin **`0a875da91dbb0fdcb7ba8c42c11341aa229af51a`**, mixins
+`e59da9094f0c2fdda6c627fe9eff22dec6a906f0`, SDK `0a875da`, launcher 0.2.92, game 26.3. Class
+`content` / tier **deep**, shape **machines**, unchanged: one buffer, one pure cost rule, one gate and
+one consumer are below the tier. No third-party mod, and the only pin API this slice adds is the
+**block energy capability** (`Registrar::block_energy`, `ENERGY`/`EnergyHandler`).
+
+### The reference (read from `refinedmods/refinedstorage2` v2.0.9, MIT, commit `0dec63af`)
+
+| upstream | value | where |
+|---|---|---|
+| `CONTROLLER_CAPACITY` | 1000 FE | `common/content/DefaultEnergyUsage.java` |
+| `CABLE` / `CONTROLLER` usage | 0 / 0 | same, and `ControllerNetworkNode.getEnergyUsage` |
+| `GRID` | 10 | same |
+| `DISK_DRIVE` + `DISK_DRIVE_PER_DISK` | 10 + 4 | same |
+| `IMPORTER` / `EXPORTER` | 2 / 2 (a work pass) | same |
+| `WIRELESS_TRANSMITTER` | 16 | same |
+| `RANGE_UPGRADE` / `SPEED_UPGRADE` / `STACK_UPGRADE` | 8 / 4 / 16 | same |
+| the level thresholds | ≥0.4 `on`, ≥0.3 `nearly_on`, ≥0.01 `nearly_off`, else `off` | `api/network/impl/node/controller/ControllerNetworkNode.getState` |
+| the gate | a node works iff `stored >= getEnergyUsage()` | `common/support/network/AbstractBaseNetworkNodeContainerBlockEntity.calculateActive` |
+| the draw | an active node's `doWork` extracts its usage | `api/network/impl/node/AbstractNetworkNode.doWork` |
+| the admission order | dimension → `node.isActive()` → range | `common/networking/WirelessTransmitterNetworkNodeContainer.isValid` |
+
+The controller is active whatever its own (0) usage, so a network with a controller is **online**
+structurally — the port's `Network::online()` keeps that meaning — and the new rule is per node:
+without energy its nodes are inert. That is why the wireless refusal distinguishes `Offline` (no
+controller) from `NoEnergy` (a controller whose buffer cannot pay).
+
+### What was implemented
+
+- **runtime.rs** (tests first): `CONTROLLER_CAPACITY` and every reference rate as a named constant;
+  `Fit` (an upgrade census) and `usage(kind, fit, disks)`; `Energy { stored, usage }` with
+  `energized()`/`draw()`; `EnergyType::{Off, NearlyOff, NearlyOn, On}` with `of(stored, capacity)`
+  (integer thresholds, so 400/300/10 of 1000 are exact) and `property()`; `bank` (a network's
+  controllers summed); and `Refusal::NoEnergy { stored, usage }` inside `admit`, in upstream's order.
+- **support.rs**: the controller's buffer declared through `registrar.block_energy(…, ModEnergyBuffer
+  { capacity 1000, max_insert 1000, max_extract 1000, all six faces })` — the game's own handler, whose
+  amount lives in the entity's compound under `energy`, so an FE cable and this network share one
+  buffer; the controller's tick writes `energy_type` from the stored/capacity ratio; `pay` gates every
+  node and takes its charge through `ENERGY`/`EnergyHandler::extract` in a transaction (grid 10 a tick,
+  drive 10 + 4 a disk, transmitter 16 + 8 a range upgrade, a machine 2 per work pass + 4 a speed and
+  16 a stack upgrade); `/refinedstorage info` reads `energy <stored>/<capacity> FE, drawing <n>/tick[ +
+  <m> per work pass], t=<server tick>`; `/refinedstorage energy <pos> <amount>` fills or drains the
+  buffer through the same capability.
+- **Content** (from the jar, MIT): the controller's `energy_type` now carries upstream's four values
+  with the jar's `nearly` parent model, the two `nearly_*` models, the four `cutouts/nearly_*` textures
+  and their `.mcmeta` animations, and its default state is `off` (`AbstractControllerBlock`).
+
+### Port defects fixed while building it (not upstream's)
+
+1. **`entity.data()` is not a live read for another block entity.** The first cut read a controller's
+   amount from its saved compound; while one node writes through the capability another node's read
+   came back up to hundreds of FE behind, so a charged network looked empty (a grid went dark with 82
+   FE in the bank). Reads now go through the same handler as the writes (`ENERGY`,
+   `EnergyHandler::amount`), so the gate and the charge cannot disagree.
+2. **The controller's own tick must not write its amount back.** A block entity is out of the world
+   during its own tick (`native_block_entity_tick`: "it reads as a `Mod` with an empty id"), so the
+   capability cannot answer for it and its payload is the only reading; materialising the key or
+   clamping from that snapshot could undo another node's drain from the same tick. The tick now writes
+   `energy_type` only, and clamps solely when the buffer is over capacity.
+
+### Deviations (recorded, not defects)
+
+1. **`/refinedstorage energy` is a harness/behaviour addition**, like `/refinedstorage info`,
+   `/refinedstorage filter`, `/refinedstorage wireless` and `/refinedstorage bound`. Upstream's
+   controller is filled by its neighbours' FE cables; the harness has no generator at this pin, so the
+   command is the source and it goes through the *same* capability an FE cable would use.
+2. **The wireless grid's own item buffer is not ported.** Upstream gives the item 1000 FE and charges 5
+   per open/insert/extract (`WIRELESS_GRID_CAPACITY`, `WIRELESS_GRID_OPEN`); that is the *item* energy
+   capability (`item_energy_buffer`), a separate family from the network's, and it waits for a slice
+   that also carries the portable grid. The network-side gate it depends on (`stored > 0`) is covered
+   by the transmitter's charge.
+3. **No `isEnergyRequired` switch and no creative controller.** The pin has no config API at this tier
+   (`blocked(no-config-api)`), so an empty network is always gated; the creative controller
+   (`InfiniteEnergyHandler`, no recipe) is not shipped.
+4. **No controller menu / energy bar.** The buffer is read by `/refinedstorage info`; a gauge is a
+   server-side screen data value the pin's had no widget for at this tier (the same gap the grid's
+   sorting buttons record).
+
+### Red proof — the rules as tests, before the implementation
+
+Written against stubs (`usage` always 0, `energized` always true, `EnergyType::of` always `On`, the
+admission ignoring energy), then run: **9 failed of 89**
+(`ports/_shared/evidence/refinedstorage/runtime-red-slice8-energy.log`):
+
+```
+---- runtime::tests::a_transmitter_charges_sixteen_fe_a_tick stdout ----
+assertion `left == right` failed
+  left: 0
+ right: 16
+---- runtime::tests::no_energy_refuses_a_use_before_the_range_is_asked stdout ----
+  left: Err(OutOfRange { distance: 100.0, range: 16 })
+ right: Err(NoEnergy { stored: 0, usage: 16 })
+---- runtime::tests::the_energy_type_is_the_four_upstream_levels stdout ----
+  left: On
+ right: NearlyOn
+---- runtime::tests::a_tick_takes_exactly_the_charge_and_never_goes_negative stdout ----
+thread '…' panicked at src/runtime.rs:1286:34: attempt to subtract with overflow
+test result: FAILED. 80 passed; 9 failed; 0 ignored; 0 measured; 0 filtered out
+```
+
+Green after the rules: **89 passed, 0 failed** (`sdk-test.log`). The thirteen new tests cover the
+reference rates (transmitter 16 + 8 a range upgrade and the creative one's 0, drive 10 + 4 a disk,
+grid 10, machines 2 + their upgrades with the caps), the gate (`draw` is `None` below the charge and
+never negative), the four levels and their property strings, and the admission order.
+
+### Green — the ladder and the in-game leg (one launcher build at `0a875da`)
+
+| Step | Command | Result |
+|---|---|---|
+| runtime + glue tests | `cargo test --offline` | **89 passed**, 0 failed (`sdk-test.log`) |
+| lints | `cargo clippy --all-targets --offline -- -D warnings` | exit 0, **0 warnings** (`sdk-clippy.log`) |
+| formatting | `rustfmt --edition 2024 --check src/{lib,support,runtime}.rs` | clean, `FMT_EXIT:0` (`sdk-fmt.log`) |
+| SDK check | `cargo horizon-mod check` | *"…582 items of the API (5 Part kinds, 1 associated item, **4 capabilitys**, 20 hooks …). Made for 0a875da."* |
+| package | `rm -f Cargo.lock && cargo horizon-mod build` ×2 | **byte-identical** (`cmp`), **193,579 B**, SHA-256 `e755815241995fc2d4dc6123c6feaae24a0130aa6999b5d21d4548b16ecff72a`, **244 entries**, no `Cargo.lock` (`sdk-build-0.2.8-{1,2}.log`) |
+| package check | `cargo horizon-mod check refinedstorage.hmod` | `0.2.8 (native-mod, format native-1/0a875da…/e59da909…, for 26.3) 193579 bytes` |
+| fits (pin) | `… fits refinedstorage.hmod --build 0a875da` | *"0a875da made for"* |
+| fits (other build) | `… fits refinedstorage.hmod --build 0b14f8a` | *"0b14f8a fits"* (`sdk-check-fits-0.2.8.log`; the GitHub releases list answered 403 first — the unauthenticated limit — and the run was repeated after it reset) |
+| launcher build | `launcher-game.sh build refinedstorage --rebuild` | exit 0, **`Compiling refinedstorage (1 of 1)`**, `native-0a875da-0f48bca7346a` |
+| in-game leg | `build-slot.sh run --step e2e -- bash tools/e2e.sh` | **PASS** + **`EXIT:0`** (`e2e-slice8-energy.log`) |
+| control (same Nightly, no package) | `GAME=$CONTROL_GAME …` | **FAIL** + `EXIT:1` — *"the block at 41,64,1 is minecraft:air, expected facing=north"* |
+| selftest (existing range rule) | `SELFTEST=1 …` | **FAIL** + `EXIT:1` |
+| selftest (the new gate) | `SELFTEST=energy …` | **FAIL** + `EXIT:1` — *"expected … 'accepted (', got '… refused (not enough energy: 0 of 16 FE)'"* |
+| selftest (the 0.2.5 promise rule) | `SELFTEST=networks …` | **FAIL** + `EXIT:1` — the two-network rule is unchanged |
+| log gate | `check-e2e-logs.py refinedstorage-e2e --strict` | see below |
+| package gate | `verify-sdk-package.py refinedstorage` | **1/1** |
+
+The energy phase, quoted from `e2e-slice8-energy.log`:
+
+```
+  energy: 308 -> 116 FE over 12 ticks                              (exactly 16 a tick)
+  block(36,64,20): refinedstorage:controller[energy_type=off]      (0 FE)
+  block(36,64,20): refinedstorage:controller[energy_type=nearly_off]  (50 FE)
+  block(36,64,20): refinedstorage:controller[energy_type=nearly_on]   (350 FE)
+  block(36,64,20): refinedstorage:controller[energy_type=on]          (500 FE)
+  block(46,64,20): refinedstorage:wireless_transmitter[active=false,facing=west,open=false]
+  /refinedstorage wireless 46 64 20 minecraft:the_end -> … refused (not enough energy: 0 of 16 FE)
+  /refinedstorage wireless 46 64 20 minecraft:the_end -> … refused (not enough energy: 0 of 16 FE)   (17 blocks out: energy before range)
+  /refinedstorage wireless 46 64 20 minecraft:the_end -> … refused (out of range: 17.7 > 16 blocks)   (charged: the range speaks)
+  /refinedstorage wireless 46 64 20 minecraft:the_end -> … accepted (1.6 of 16 blocks, online network)
+  grid view: []                                                    (network A at 0 FE)
+  grid view: [{"count":3,"item":"minecraft:gold_ingot","slot":300}] (charged again)
+  after 20 ticks at 0 FE: 1 items on the network (was 1)            (the importer does no pass)
+  after 20 ticks without an upgrade: 4 items on the network, source [59 stone]   (charged: it does)
+  info(42,64,16): … energy 940/1000 FE, drawing 14/tick + 2 per work pass, t=8104
+```
+
+Every assertion has its differential or counterfactual: the same 12 ticks measure exactly 16 FE each
+(against the tick counter the line prints, not a sleep); the four levels are read at the reference
+thresholds on a network that draws nothing; the same use is refused *for energy* at 0 FE and refused
+*for range* at the same distance with energy, then accepted inside the range; the same grid lists
+nothing at 0 FE and its 3 gold when charged; the same importer moves nothing in 20 ticks at 0 FE and
+3 items in the same window when charged (1 → 4). `SELFTEST=energy` inverts the no-energy refusal and
+exits 1.
+
+### Harness facts learned here
+
+- **A 1,000 FE buffer is small.** A grid (10) + a drive with a disk (14) drains it in ~42 ticks, so a
+  scenario that keeps a network working must feed it like a player's generators do. The e2e's
+  `charge_net` (called before a menu click, a view read and a long wait) is that generator; a leg that
+  asserts the *absence* of energy clears it around the window (`NET=""`).
+- **`ctl tp` keeps velocity**: a spot chosen for an exact distance drifts (a 17.0-block use measured
+  17.7 here). The exact boundary belongs to the command's assertion, which reads the player's own
+  position; the in-range leg asserts only that it is accepted.
+- The energy phase's exact measurement reads the buffer and the printed tick together
+  (`energy_of` splits `energy <stored>/<capacity> FE … t=<n>`), so the assertion is
+  `stored₁ − stored₂ = 16 × (t₂ − t₁)` — independent of how long a `ctl` call took.
+
+### Coverage (parity rule) — every family this slice ships
+
+| family | state |
+|---|---|
+| the controller's buffer (1000 FE) | **tested** — `/refinedstorage energy` fills it through the capability (`Network energy at … 1000/1000 FE (was 0)`), `info` reads it back, and it drains as nodes pay |
+| per-block charge, read from the reference | **tested** — the transmitter's 16/tick measured exactly over N ticks (12 ticks → 192 FE), the drive's 14 (10 + 4 for its disk) and the importer's 2 a work pass printed in `info`, and unit tests for every constant and the upgrade additions |
+| the four `energy_type` levels | **tested** — 0 / 50 / 350 / 500 FE read back as `off`, `nearly_off`, `nearly_on`, `on` at upstream's thresholds |
+| the gate (no work without energy) | **tested** — the grid is `active=false` and lists nothing at 0 FE (its disk keeps the gold), the importer moves nothing in 20 ticks at 0 FE, and the transmitter refuses a use for energy |
+| the admission order | **tested** — 0 FE at 2.5 blocks and at 17 blocks both refuse `not enough energy`; with energy the same 17 blocks refuse `out of range` and 2.5 blocks are accepted |
+| the block energy capability | **tested** — every charge and every drain goes through it (the charge replies `1000/1000 FE (was …)`, i.e. the game's handler wrote the buffer) |
+| the wireless grid's own item buffer (1000 FE, 5/open) | **not ported** — item energy (`item_energy_buffer`) is a separate family; deviation 2 |
+| `isEnergyRequired` config switch | **blocked(no-config-api)** — the pin has no config surface at this tier |
+| the creative controller (`InfiniteEnergyHandler`) | **not ported** — no creative controller block in the port (no recipe upstream either) |
+| the controller's menu / energy gauge | **not ported** — a screen data value the pin's mod screens have no widget for at this tier; `/refinedstorage info` reads it |
+| everything slices 1–7 shipped | **unchanged** — the same assertions, the transmitter's facing rule, the range and creative upgrades, the promise table and both machines are still green in the same log |
+
+Skills: superpowers/using-superpowers,brainstorming,writing-plans,test-driven-development,systematic-debugging,verification-before-completion; BeautifulRust/rust-best-practices
+
+Evidence: `ports/_shared/evidence/refinedstorage/` — `plan-slice8-energy.md`,
+`runtime-red-slice8-energy.log`, `sdk-test.log`, `sdk-clippy.log`, `sdk-fmt.log`,
+`sdk-build-0.2.8-{1,2}.log`, `sdk-build-0.2.8-cmp.log`, `sdk-check-fits-0.2.8.log`,
+`refinedstorage.hmod` (the delivered bytes) — and `ports/_shared/evidence/refinedstorage-e2e/` —
+`e2e-slice8-energy.log` (green), `e2e-slice8-control.log`, `e2e-slice8-selftest.log`,
+`e2e-slice8-selftest-energy.log`, `e2e-slice8-selftest-networks.log`.

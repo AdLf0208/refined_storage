@@ -82,7 +82,19 @@
 # upgrade in; SELFTEST=creative asserts the creative upgrade left the finite
 # range; SELFTEST=speed asserts the un-upgraded importer moved a stack in
 # 20 ticks and SELFTEST=stack asserts the stack upgrade left the un-upgraded
-# count, so both fail on the working importer.
+# count, so both fail on the working importer; SELFTEST=energy asserts a use
+# with no energy in the network is accepted, so the run fails on the gate.
+#
+# Slice 8 (the controller's energy model):
+#  - the controller's buffer is 1,000 FE, its `energy_type` is upstream's four
+#    levels at 40 %, 30 % and 1 % (0 / 50 / 350 / 500 FE read back), and a
+#    transmitter's charge is exactly 16 FE a tick measured against the server
+#    tick counter the info line prints;
+#  - with no energy the transmitter is inactive and the same use is refused
+#    `not enough energy: 0 of 16 FE`, before the range is asked (17 blocks out
+#    with no energy is refused for energy, with energy it names the distance);
+#  - a grid and an importer on a 0-FE network do no work and are dark, while
+#    their disks keep what they hold; charged, both work again.
 set -euo pipefail
 export LC_ALL=C
 
@@ -233,6 +245,40 @@ expect_state() { # expect_state X Y Z TEXT
     echo "  block($1,$2,$3): $got"
 }
 
+# Charge a network's buffer through the controller's own energy capability, the
+# way an FE cable would: the harness has no generator at this pin, so the
+# command is the source (upstream's controller is filled by its neighbours).
+# `charge DIM X Y Z [amount]` names any block of the network, in that dimension.
+# A network pays per tick (a grid 10, a drive 10 plus 4 a disk, a transmitter
+# 16 plus 8 a range upgrade) and per work pass (a machine 2 plus its upgrades),
+# exactly as upstream's `doWork` does, so a long leg charges before it reads.
+charge() { # charge DIM X Y Z [amount]
+    say "execute in $1 run refinedstorage energy $2 $3 $4 ${5:-1000}"
+    ctl wait 4
+}
+# The same, asserted: the energy phase prints the reply and checks it names the
+# buffer, so the charge command itself is evidence there.
+charge_ok() { # charge_ok DIM X Y Z [amount]
+    expect_reply "execute in $1 run refinedstorage energy $2 $3 $4 ${5:-1000}" "FE"
+}
+# The network the current phase works on, and a top-up for it: every node pays
+# its reference charge per tick (a grid 10, a drive 10 + 4 a disk, a
+# transmitter 16 + 8 a range upgrade) and a machine per work pass, so a
+# 1,000 FE buffer lasts ordinary leg lengths. The harness has no generator, so
+# this stands in for one; a phase with no network set charges nothing.
+NET=""
+net() { # net DIM X Y Z
+    NET="$1 $2 $3 $4"
+}
+charge_net() {
+    # shellcheck disable=SC2086 # the four words are the network's coordinates
+    [ -n "$NET" ] && charge $NET
+}
+# The network's energy as `/refinedstorage info` prints it: STORED CAPACITY TICK.
+energy_of() { # energy_of X Y Z -> "stored capacity tick"
+    info "$1" "$2" "$3" | sed -n 's/.*energy \([0-9]*\)\/\([0-9]*\) FE, drawing [0-9]*\/tick.* t=\([0-9]*\)$/\1 \2 \3/p'
+}
+
 cleanup() {
     local status=$?
     ctl quit >/dev/null 2>&1 || true
@@ -289,9 +335,11 @@ if jq -e 'has("refinedstorage:wireless")' "$before" >/dev/null; then
 fi
 
 echo "== the overworld transmitter, for the cross-dimension use =="
+net minecraft:overworld 40 64 0
 # The player starts in the overworld; the network there is built and ticked now,
 # then the chunks are force-loaded so a use from the End can still find it.
 ctl command "execute in minecraft:overworld run tp @s 41.5 64 2.5"
+charge_net
 ctl wait 40
 ctl command "execute in minecraft:overworld run fill 32 63 -8 56 63 24 minecraft:stone"
 ctl command "execute in minecraft:overworld run fill 32 64 -8 56 74 24 minecraft:air"
@@ -301,26 +349,33 @@ ctl command "execute in minecraft:overworld run setblock 41 64 0 refinedstorage:
 ctl command "execute in minecraft:overworld run setblock 41 64 1 refinedstorage:wireless_transmitter[facing=north]"
 ctl command "execute in minecraft:overworld run forceload add 32 0 48 8"
 ctl wait 12
+charge minecraft:overworld 40 64 0
 expect_state 41 64 1 'facing=north'
 expect_state 41 64 1 'active=true'
+charge_net
 expect_info 41 64 1 "online (3 nodes, 1 controller, 0 drive, 0 grid, 1 transmitter)"
 # Back to the End: everything after this reads the End.
 ctl command "execute in minecraft:the_end run tp @s 40.5 64 3.5"
+charge_net
 ctl wait 20
 
 echo "== the network is built: controller, cable, disk drive, grid =="
+net minecraft:the_end 40 64 0
 ctl command "execute in minecraft:the_end run setblock 40 64 0 refinedstorage:controller"
 ctl command "execute in minecraft:the_end run setblock 41 64 0 refinedstorage:cable"
 ctl command "execute in minecraft:the_end run setblock 42 64 0 refinedstorage:disk_drive"
 ctl command "execute in minecraft:the_end run setblock 43 64 0 refinedstorage:grid"
 ctl wait 12
+charge minecraft:the_end 40 64 0
 expect_state 41 64 0 'west=true'
 expect_state 41 64 0 'east=true'
 expect_state 41 64 0 'north=false'
 expect_state 43 64 0 'active=true'
+charge_net
 expect_info 43 64 0 "online (4 nodes, 1 controller, 1 drive, 1 grid); 0 disks, 0 items in 0 resources"
 
 echo "== the wireless transmitter joins through its facing side only =="
+net minecraft:the_end 52 64 4
 ctl command "execute in minecraft:the_end run setblock 52 64 4 refinedstorage:controller"
 ctl command "execute in minecraft:the_end run setblock 53 64 4 refinedstorage:cable"
 ctl command "execute in minecraft:the_end run setblock 54 64 4 refinedstorage:wireless_transmitter[facing=east]"
@@ -328,12 +383,15 @@ ctl wait 12
 # Facing away from the cable (east, nothing there): its own offline component.
 expect_state 54 64 4 'facing=east'
 expect_state 54 64 4 'active=false'
+charge_net
 expect_info 54 64 4 "offline (1 nodes, 0 controller, 0 drive, 0 grid, 1 transmitter)"
 # Turned to face the cable (west): the controller's network, so active.
 ctl command "execute in minecraft:the_end run setblock 54 64 4 refinedstorage:wireless_transmitter[facing=west]"
 ctl wait 12
+charge minecraft:the_end 52 64 4
 expect_state 54 64 4 'facing=west'
 expect_state 54 64 4 'active=true'
+charge_net
 expect_info 54 64 4 "online (3 nodes, 1 controller, 0 drive, 0 grid, 1 transmitter)"
 
 echo "== /refinedstorage info names the transmitter and its range =="
@@ -349,6 +407,7 @@ if echo "$cable_lines" | grep -q 'range'; then
 fi
 
 echo "== a use in range is accepted, beyond it refused naming the reason =="
+charge minecraft:the_end 52 64 4
 ctl tp 54.5 64 6.5 # exact coordinates: `tp @s` would centre them
 ctl wait 6
 expect_reply "refinedstorage wireless 54 64 4 minecraft:the_end" "accepted (2.5 of 16 blocks"
@@ -373,6 +432,7 @@ expect_state 54 64 4 'active=false'
 expect_reply "refinedstorage wireless 54 64 4 minecraft:the_end" "refused (the network is offline)"
 ctl command "execute in minecraft:the_end run setblock 54 64 4 refinedstorage:wireless_transmitter[facing=west]"
 ctl wait 12
+charge minecraft:the_end 52 64 4
 expect_state 54 64 4 'active=true'
 # A position that holds no transmitter is not a wireless use at all.
 expect_reply "refinedstorage wireless 52 64 4 minecraft:the_end" "No wireless transmitter there."
@@ -382,6 +442,7 @@ echo "== a use from another dimension is refused, and only the dimension differs
 # two commands below differ in the dimension the use happens in and nothing else.
 ctl command "execute in minecraft:the_end run tp @s 41.5 64 2.5"
 ctl wait 6
+charge minecraft:overworld 40 64 0
 expect_reply "refinedstorage wireless 41 64 1 minecraft:overworld" "refused (different dimension)"
 expect_reply "execute in minecraft:overworld run refinedstorage wireless 41 64 1 minecraft:overworld" "accepted (1.6 of 16 blocks"
 
@@ -398,10 +459,12 @@ ctl give refinedstorage:wireless_transmitter 1
 ctl wait 4
 ctl select refinedstorage:wireless_transmitter
 ctl wait 4
+charge_net
 ctl interact 55 64 6 north
 ctl wait 8
 expect_state 55 64 5 'refinedstorage:wireless_transmitter'
 expect_state 55 64 5 'facing=south'
+charge_net
 ctl wait 20
 ctl save
 ctl wait 10
@@ -436,14 +499,18 @@ ctl command "clear @s"
 ctl wait 4
 
 echo "== the grid opens its 9x6 menu, empty with no disk =="
+net minecraft:the_end 40 64 0
+charge minecraft:the_end 40 64 0
 ctl command "execute in minecraft:the_end run tp @s 42.5 64 2.5"
 ctl wait 4
+charge_net
 ctl interact 43 64 0
 ctl wait 8
 ctl screen | jq -e '.screen == "container"' >/dev/null \
     || fail "the grid did not open a container menu: $(ctl screen | jq -c '{screen,slots:(.slots|length)}')"
 ctl screen | jq -e '[.slots[] | select(.slot >= 300)] | length == 54' >/dev/null \
     || fail "the grid menu does not have 54 container slots: $(ctl screen | jq -c '[.slots[] | select(.slot >= 300)] | length')"
+charge_net
 expect_slots '[]'
 ctl close
 ctl wait 4
@@ -455,6 +522,7 @@ ctl select refinedstorage:1k_storage_disk
 ctl wait 4
 ctl command "execute in minecraft:the_end run tp @s 41.5 64 2.5"
 ctl wait 4
+charge_net
 ctl interact 42 64 0
 ctl wait 8
 [ "$(count_of refinedstorage:1k_storage_disk)" = 0 ] \
@@ -462,51 +530,68 @@ ctl wait 8
 slots 42 64 0 | jq -e '[.[] | select(.item == "refinedstorage:1k_storage_disk")] | length == 1' >/dev/null \
     || fail "the drive does not hold the disk: $(slots 42 64 0)"
 echo "  drive: $(slots 42 64 0)"
+charge_net
 expect_info 43 64 0 "1 disks, 0 items in 0 resources"
 
 echo "== items deposited through the grid's menu are on the network =="
+charge minecraft:the_end 40 64 0
 ctl give minecraft:diamond 5
 ctl give minecraft:gold_ingot 3
 ctl wait 4
 ctl command "execute in minecraft:the_end run tp @s 42.5 64 2.5"
 ctl wait 4
+charge_net
 ctl interact 43 64 0
 ctl wait 8
 diamond_slot=$(inv_slot minecraft:diamond)
 [ -n "$diamond_slot" ] || fail "no diamond stack in the menu's player inventory: $(ctl screen | jq -c '[.slots[] | select(.item != null)]')"
+charge_net
 ctl click-slot "$diamond_slot"
 ctl wait 2
+charge_net
 ctl click-slot 300
 ctl wait 8
 gold_slot=$(inv_slot minecraft:gold_ingot)
 [ -n "$gold_slot" ] || fail "no gold stack in the menu's player inventory"
+charge_net
 ctl click-slot "$gold_slot"
 ctl wait 2
+charge_net
 ctl click-slot 301
 ctl wait 8
+charge_net
 expect_slots '[{"slot":300,"item":"minecraft:gold_ingot","count":3},{"slot":301,"item":"minecraft:diamond","count":5}]'
 [ "$(count_of minecraft:diamond)" = 0 ] || fail "5 diamonds are still in the inventory"
+charge_net
 expect_info 43 64 0 "1 disks, 8 items in 2 resources"
 
 echo "== the search filters the grid's listing =="
+charge minecraft:the_end 40 64 0
 say "refinedstorage filter 43 64 0 gold"
 ctl wait 8
+charge_net
 expect_slots '[{"slot":300,"item":"minecraft:gold_ingot","count":3}]'
 say "refinedstorage filter 43 64 0 diamond"
 ctl wait 8
+charge_net
 expect_slots '[{"slot":300,"item":"minecraft:diamond","count":5}]'
 ctl messages 6 | jq -r '.chat[]' | grep -q 'Grid search: diamond' \
     || fail "no search feedback in chat"
 say "refinedstorage filter 43 64 0"
 ctl wait 8
+charge_net
 expect_slots '[{"slot":300,"item":"minecraft:gold_ingot","count":3},{"slot":301,"item":"minecraft:diamond","count":5}]'
 
 echo "== a shift-click on the diamond view withdraws it into the inventory =="
+charge minecraft:the_end 40 64 0
+charge_net
 ctl click-slot 301 shift
 ctl wait 8
+charge_net
 expect_slots '[{"slot":300,"item":"minecraft:gold_ingot","count":3}]'
 [ "$(count_of minecraft:diamond)" = 5 ] \
     || fail "the withdrawn diamonds are not in the inventory: $(ctl inventory | jq -c '[.hotbar // [], .main // []]')"
+charge_net
 expect_info 43 64 0 "1 disks, 3 items in 1 resources"
 ctl close
 ctl wait 4
@@ -523,15 +608,19 @@ ctl wait 12
 ctl command "clear @s refinedstorage:controller"
 ctl command "execute in minecraft:the_end run kill @e[type=item]"
 expect_state 43 64 0 'active=false'
+charge_net
 expect_info 43 64 0 "offline (3 nodes, 0 controller, 1 drive, 1 grid)"
 ctl command "gamemode creative"
 ctl wait 4
+charge_net
 ctl interact 43 64 0
 ctl wait 8
 if [ "$SELFTEST" = offline ]; then
     echo "(selftest: asserting the offline grid still lists the gold)"
+    charge_net
     expect_slots '[{"slot":300,"item":"minecraft:gold_ingot","count":3}]'
 else
+    charge_net
     expect_slots '[]'
 fi
 ctl close
@@ -539,75 +628,103 @@ ctl wait 4
 # Put the controller back: the gold comes back, so it lived in the disk.
 ctl command "execute in minecraft:the_end run setblock 40 64 0 refinedstorage:controller"
 ctl wait 12
+charge minecraft:the_end 40 64 0
+echo "  info after the restore: $(info 43 64 0)"
 expect_state 43 64 0 'active=true'
+charge_net
 expect_info 43 64 0 "online (4 nodes, 1 controller, 1 drive, 1 grid); 1 disks, 3 items in 1 resources"
+charge_net
 ctl interact 43 64 0
 ctl wait 8
+charge_net
 expect_slots '[{"slot":300,"item":"minecraft:gold_ingot","count":3}]'
 ctl close
 ctl wait 4
 
 echo "== two grids on one network never offer the same items twice =="
+charge minecraft:the_end 40 64 0
 # A second grid joins the same component (on top of the drive). The first grid's
 # view has already promised the 3 gold, so the second shows nothing: with the old
 # per-grid view both showed the last 3 gold and both players could take them.
 ctl command "execute in minecraft:the_end run setblock 42 65 0 refinedstorage:grid"
 ctl wait 12
 expect_state 42 65 0 'active=true'
+charge_net
 ctl interact 42 65 0
 ctl wait 8
+charge_net
 expect_slots '[]'
 ctl close
 ctl wait 4
 # The first grid still shows the gold: the stock was not consumed, only promised.
+echo "  info after the second grid: $(info 43 64 0)"
+charge minecraft:the_end 40 64 0
+charge_net
 ctl interact 43 64 0
 ctl wait 8
+charge_net
 expect_slots '[{"slot":300,"item":"minecraft:gold_ingot","count":3}]'
 ctl close
 ctl wait 4
 # Breaking the first grid releases its promise; the second then shows the gold.
 ctl command "execute in minecraft:the_end run setblock 43 64 0 minecraft:air"
 ctl wait 12
+charge_net
 ctl interact 42 65 0
 ctl wait 8
+charge_net
 expect_slots '[{"slot":300,"item":"minecraft:gold_ingot","count":3}]'
 ctl close
 ctl wait 4
 ctl command "execute in minecraft:the_end run setblock 43 64 0 refinedstorage:grid"
 ctl command "execute in minecraft:the_end run setblock 42 65 0 minecraft:air"
 ctl wait 12
+charge_net
 expect_info 43 64 0 "online (4 nodes, 1 controller, 1 drive, 1 grid)"
 
 echo "== an online network with no disk drive lists nothing, beside it =="
+net minecraft:the_end 48 64 0
 ctl command "execute in minecraft:the_end run setblock 48 64 0 refinedstorage:controller"
 ctl command "execute in minecraft:the_end run setblock 49 64 0 refinedstorage:cable"
 ctl command "execute in minecraft:the_end run setblock 50 64 0 refinedstorage:grid"
 ctl wait 12
+charge minecraft:the_end 48 64 0
 expect_state 50 64 0 'active=true'
+charge_net
 expect_info 50 64 0 "online (3 nodes, 1 controller, 0 drive, 1 grid); 0 disks, 0 items in 0 resources"
 ctl command "execute in minecraft:the_end run tp @s 49.5 64 2.5"
 ctl wait 4
+charge_net
 ctl interact 50 64 0
 ctl wait 8
+charge_net
 expect_slots '[]'
 ctl close
 ctl wait 4
 # The first network still lists its gold.
+charge minecraft:the_end 40 64 0
 ctl command "execute in minecraft:the_end run tp @s 42.5 64 2.5"
 ctl wait 4
+charge_net
 ctl interact 43 64 0
 ctl wait 8
+charge_net
 expect_slots '[{"slot":300,"item":"minecraft:gold_ingot","count":3}]'
 ctl close
 ctl wait 4
 
 echo "== two networks in one dimension each show their own stock =="
+net minecraft:the_end 48 64 0
+charge minecraft:the_end 40 64 0
+charge minecraft:the_end 48 64 0
 # Network A (40..43,64,0) holds 3 gold. Network B (48..50,64,0) gets a drive of
 # its own and the same 3 gold: each grid must list its own 3. Keyed by dimension
 # alone, A's promise hid B's stock (and then B's promise hid A's), so one grid
 # reported 0 while the disk under it held 3.
+charge minecraft:the_end 48 64 0
 ctl command "execute in minecraft:the_end run setblock 51 64 0 refinedstorage:disk_drive"
 ctl wait 10
+charge_net
 expect_info 51 64 0 "online (4 nodes, 1 controller, 1 drive, 1 grid); 0 disks, 0 items in 0 resources"
 ctl give refinedstorage:1k_storage_disk 1 >/dev/null
 ctl wait 4
@@ -615,59 +732,166 @@ ctl select refinedstorage:1k_storage_disk >/dev/null
 ctl wait 4
 ctl command "execute in minecraft:the_end run tp @s 51.5 64 2.5"
 ctl wait 4
+charge_net
 ctl interact 51 64 0
 ctl wait 8
 [ "$(count_of refinedstorage:1k_storage_disk)" = 0 ] \
     || fail "network B's disk stayed in the hand"
+charge_net
 expect_info 51 64 0 "1 disks, 0 items in 0 resources"
 ctl close
 ctl wait 4
 # 3 gold deposited through network B's own grid.
+charge minecraft:the_end 48 64 0
 ctl give minecraft:gold_ingot 3 >/dev/null
 ctl wait 4
 ctl command "execute in minecraft:the_end run tp @s 49.5 64 2.5"
 ctl wait 4
+charge_net
 ctl interact 50 64 0
 ctl wait 8
 gold_slot=$(inv_slot minecraft:gold_ingot)
 [ -n "$gold_slot" ] || fail "no gold stack in network B's menu inventory"
+charge_net
 ctl click-slot "$gold_slot" shift
 ctl wait 8
+charge_net
 expect_info 51 64 0 "1 disks, 3 items in 1 resources"
 if [ "$SELFTEST" = networks ]; then
     echo "(selftest: asserting network B's grid hides network A's stock)"
+    charge_net
     expect_slots '[]'
 fi
+charge_net
 expect_slots '[{"slot":300,"item":"minecraft:gold_ingot","count":3}]'
 ctl close
 ctl wait 4
 # The differential, with B's promise now live: A's grid still lists its own 3.
+charge minecraft:the_end 40 64 0
 ctl command "execute in minecraft:the_end run tp @s 42.5 64 2.5"
 ctl wait 4
+charge_net
 ctl interact 43 64 0
 ctl wait 8
+charge_net
 expect_slots '[{"slot":300,"item":"minecraft:gold_ingot","count":3}]'
 ctl close
 ctl wait 4
 # And B's grid again, with both promises live: still its own 3.
+charge minecraft:the_end 48 64 0
 ctl command "execute in minecraft:the_end run tp @s 49.5 64 2.5"
 ctl wait 4
+charge_net
 ctl interact 50 64 0
 ctl wait 8
+charge_net
 expect_slots '[{"slot":300,"item":"minecraft:gold_ingot","count":3}]'
 ctl close
 ctl wait 4
 # The stock was promised, not consumed: each disk still holds its own 3.
+charge minecraft:the_end 40 64 0
+charge minecraft:the_end 48 64 0
+charge_net
 expect_info 43 64 0 "1 disks, 3 items in 1 resources"
+charge_net
 expect_info 51 64 0 "1 disks, 3 items in 1 resources"
 
+echo "== the controller's energy model: its buffer, its levels, and the gate =="
+net minecraft:the_end 44 64 20
+# Slice 8. Upstream's controller is the network's energy provider
+# (`ControllerNetworkNode`, `CONTROLLER_CAPACITY` 1000) and its nodes work only
+# when `stored >= getEnergyUsage()` (`calculateActive`), paying that charge in
+# `doWork`. The reference's rates: a grid 10, a drive 10 plus 4 a disk, a
+# transmitter 16 plus 8 a range upgrade, a machine 2 a work pass plus its
+# upgrades. Two networks here: E1 (44..46,64,20) is controller + cable + a
+# transmitter facing its cable, so its only charge is 16 FE a tick; E2 (36,64,20)
+# is a lone controller, so a charge set on it stays put for the level readout.
+ctl command "execute in minecraft:the_end run setblock 44 64 20 refinedstorage:controller"
+ctl command "execute in minecraft:the_end run setblock 45 64 20 refinedstorage:cable"
+ctl command "execute in minecraft:the_end run setblock 46 64 20 refinedstorage:wireless_transmitter[facing=west]"
+ctl command "execute in minecraft:the_end run setblock 36 64 20 refinedstorage:controller"
+ctl command "execute in minecraft:the_end run tp @s 46.5 64 22.5"
+ctl wait 12
+charge minecraft:the_end 44 64 20 500
+expect_reply "refinedstorage info 44 64 20" "drawing 16/tick"
+# The charge is exact and is measured against the server tick counter the line
+# prints, not against a wall clock: over `t2 - t1` ticks the buffer falls by
+# 16 × that many FE (and the buffer is well above the floor for the window).
+read -r s1 _ t1 <<<"$(energy_of 44 64 20)"
+ctl wait 5
+read -r s2 _ t2 <<<"$(energy_of 44 64 20)"
+echo "  energy: $s1 -> $s2 FE over $((t2 - t1)) ticks"
+[ $((s2)) -eq $((s1 - 16 * (t2 - t1))) ] \
+    || fail "the transmitter's charge was $((s1 - s2)) FE over $((t2 - t1)) ticks, expected 16 a tick"
+# Upstream's four energy levels, at its own thresholds (>= 40 %, >= 30 %,
+# >= 1 %, else off) on a network that draws nothing.
+for pair in "0 off" "50 nearly_off" "350 nearly_on" "500 on"; do
+    set -- $pair
+    charge minecraft:the_end 36 64 20 "$1"
+    ctl wait 4
+    expect_state 36 64 20 "energy_type=$2"
+done
+# No energy: the transmitter cannot pay its 16 FE, so it is inactive and the
+# same use at 2.5 blocks is refused for energy — not for range.
+charge minecraft:the_end 44 64 20 0
+ctl wait 2
+expect_state 46 64 20 'active=false'
+if [ "$SELFTEST" = energy ]; then
+    echo "(selftest: asserting a use with no energy is accepted)"
+    expect_reply "refinedstorage wireless 46 64 20 minecraft:the_end" "accepted ("
+else
+    expect_reply "refinedstorage wireless 46 64 20 minecraft:the_end" "refused (not enough energy: 0 of 16 FE)"
+fi
+# The order of the checks: 17 blocks out with no energy is refused for energy
+# (the node's activeness comes before the range), and the same 17 blocks with
+# energy is refused naming the distance — so the energy refusal is not the range
+# refusal in disguise.
+ctl tp 46 64 37
+ctl wait 4
+charge minecraft:the_end 44 64 20 0
+expect_reply "refinedstorage wireless 46 64 20 minecraft:the_end" "refused (not enough energy: 0 of 16 FE)"
+charge minecraft:the_end 44 64 20 500
+expect_reply "refinedstorage wireless 46 64 20 minecraft:the_end" "refused (out of range"
+# With energy and inside the range the same use is accepted.
+ctl tp 46.5 64 18.5
+ctl wait 4
+charge minecraft:the_end 44 64 20 500
+expect_reply "refinedstorage wireless 46 64 20 minecraft:the_end" "accepted ("
+# The grid's gate, on network A (which holds the 3 gold): at 0 FE it is dark and
+# lists nothing while the disk keeps the gold; charged, it lists it again.
+charge minecraft:the_end 40 64 0 0
+ctl wait 6
+expect_state 43 64 0 'active=false'
+ctl command "execute in minecraft:the_end run tp @s 42.5 64 2.5"
+ctl wait 4
+charge_net
+ctl interact 43 64 0
+ctl wait 8
+charge_net
+expect_slots '[]'
+ctl close
+ctl wait 4
+charge minecraft:the_end 40 64 0
+ctl wait 6
+expect_state 43 64 0 'active=true'
+charge_net
+ctl interact 43 64 0
+ctl wait 8
+charge_net
+expect_slots '[{"slot":300,"item":"minecraft:gold_ingot","count":3}]'
+ctl close
+ctl wait 4
+
 echo "== a stick is not a storage disk: the drive takes nothing =="
+net minecraft:the_end 40 64 0
+charge minecraft:the_end 40 64 0
 ctl give minecraft:stick 1
 ctl wait 4
 ctl select minecraft:stick
 ctl wait 4
 ctl command "execute in minecraft:the_end run tp @s 41.5 64 2.5"
 ctl wait 4
+charge_net
 ctl interact 42 64 0
 ctl wait 8
 [ "$(count_of minecraft:stick)" = 1 ] || fail "the drive took the stick"
@@ -682,6 +906,7 @@ ctl wait 4
 echo "== a vanilla barrel is not a network block =="
 ctl command "execute in minecraft:the_end run setblock 56 64 0 minecraft:barrel"
 ctl wait 6
+charge_net
 expect_info 56 64 0 "No Refined Storage network block there."
 
 echo "== the crafting chain: every carried recipe crafts in game =="
@@ -712,6 +937,7 @@ ctl command "clear @s" >/dev/null
 ctl wait 4
 
 echo "== the wireless grid: bind it, open the network's view, move items through it =="
+net minecraft:the_end 48 64 8
 # A network of its own (48..50,64,8 with the drive at 49,64,9) inside the arena
 # floor, so the player never falls out of the world while a leg waits; no block
 # grid promises its stock, so the item's view must come from the disks itself.
@@ -721,8 +947,10 @@ ctl command "execute in minecraft:the_end run setblock 50 64 8 refinedstorage:wi
 ctl command "execute in minecraft:the_end run setblock 49 64 9 refinedstorage:disk_drive"
 ctl command "execute in minecraft:the_end run tp @s 50.5 64 10.5"
 ctl wait 14
+charge minecraft:the_end 48 64 8
 expect_state 50 64 8 'facing=west'
 expect_state 50 64 8 'active=true'
+charge_net
 expect_info 49 64 9 "online (4 nodes, 1 controller, 1 drive, 0 grid, 1 transmitter); 0 disks, 0 items in 0 resources"
 
 # The disk goes into the drive; the five diamonds are deposited through the
@@ -733,10 +961,13 @@ ctl select refinedstorage:1k_storage_disk >/dev/null
 ctl wait 4
 ctl command "execute in minecraft:the_end run tp @s 49.5 64 10.5"
 ctl wait 4
+charge minecraft:the_end 48 64 8
+charge_net
 ctl interact 49 64 9
 ctl wait 8
 [ "$(count_of refinedstorage:1k_storage_disk)" = 0 ] \
     || fail "the wireless network's disk stayed in the hand"
+charge_net
 expect_info 49 64 9 "1 disks, 0 items in 0 resources"
 
 # The item is unbound until it is used on a transmitter: the use says so.
@@ -747,6 +978,8 @@ ctl wait 4
 expect_reply "refinedstorage bound" "The wireless grid is not bound."
 ctl command "execute in minecraft:the_end run tp @s 50.5 64 10.5"
 ctl wait 4
+charge minecraft:the_end 48 64 8
+charge_net
 use_on_block 50 64 8 south
 ctl wait 6
 # The binding is the item's own component: the dimension and the block it was
@@ -760,6 +993,8 @@ ctl screen | jq -e '.screen != "container"' >/dev/null \
 # A use inside the range opens the 9x6 view of that network.
 ctl give minecraft:diamond 5 >/dev/null
 ctl wait 4
+charge minecraft:the_end 48 64 8
+charge_net
 use_held
 ctl wait 10
 ctl screen | jq -e '.screen == "container"' >/dev/null \
@@ -768,28 +1003,38 @@ ctl screen | jq -e '[.slots[] | select(.slot >= 300)] | length == 54' >/dev/null
     || fail "the wireless grid's menu does not have 54 container slots: $(ctl screen | jq -c '[.slots[] | select(.slot >= 300)] | length')"
 if [ "$SELFTEST" = grid ]; then
     echo "(selftest: asserting the wireless grid's empty view lists a diamond)"
+    charge_net
     expect_slots '[{"slot":300,"item":"minecraft:diamond","count":5}]'
 fi
+charge_net
 expect_slots '[]'
 # The menu's title names the item (upstream's `ContentNames.WIRELESS_GRID`).
 ctl screen | jq -r '.title // .name // empty' | grep -qi 'wireless grid' \
     || echo "  (note: the screen reply names no title: $(ctl screen | jq -c '{title,name}'))"
 
 # A shift-click on a player's inventory slot deposits that stack on the network.
+charge minecraft:the_end 48 64 8
 diamond_slot=$(inv_slot minecraft:diamond)
 [ -n "$diamond_slot" ] || fail "no diamond stack in the wireless grid's player inventory"
+charge_net
 ctl click-slot "$diamond_slot" shift
 ctl wait 10
+charge_net
 expect_slots '[{"slot":300,"item":"minecraft:diamond","count":5}]'
 [ "$(count_of minecraft:diamond)" = 0 ] || fail "the deposited diamonds are still in the inventory"
+charge_net
 expect_info 49 64 9 "1 disks, 5 items in 1 resources"
 
 # A shift-click on the view withdraws the stack into the inventory.
+charge minecraft:the_end 48 64 8
+charge_net
 ctl click-slot 300 shift
 ctl wait 10
+charge_net
 expect_slots '[]'
 [ "$(count_of minecraft:diamond)" = 5 ] \
     || fail "the withdrawn diamonds are not in the inventory: $(ctl inventory | jq -c '[.hotbar // [], .main // []]')"
+charge_net
 expect_info 49 64 9 "1 disks, 0 items in 0 resources"
 ctl close
 ctl wait 4
@@ -798,7 +1043,9 @@ ctl wait 4
 # The floor runs x 32..56, so both spots stay on it.
 ctl tp 33 64 8
 ctl wait 6
+charge minecraft:the_end 48 64 8
 echo "  bound in range 17: $(reply "refinedstorage bound")"
+charge_net
 use_held
 ctl wait 6
 refusal=$(ctl messages 6 | jq -r '.chat[]' | grep -m1 'Wireless grid' || true)
@@ -817,10 +1064,13 @@ ctl screen | jq -e '.screen != "container"' >/dev/null \
 # player position without a fresh teleport.
 ctl tp 34.5 64 8
 ctl wait 8
+charge minecraft:the_end 48 64 8
+charge_net
 use_held
 ctl wait 10
 ctl screen | jq -e '.screen == "container"' >/dev/null \
     || fail "a use exactly 16 blocks out did not open the view: $(ctl screen | jq -c '{screen}')"
+charge_net
 expect_slots '[]'
 ctl close
 ctl wait 4
@@ -830,6 +1080,8 @@ ctl wait 4
 # dimension the use happens in differs, which is the differential.
 ctl command "execute in minecraft:overworld run tp @s 41.5 64 2.5"
 ctl wait 10
+charge minecraft:the_end 48 64 8
+charge_net
 use_held
 ctl wait 6
 refusal=$(ctl messages 6 | jq -r '.chat[]' | grep -m1 'Wireless grid' || true)
@@ -843,15 +1095,19 @@ ctl screen | jq -e '.screen != "container"' >/dev/null \
 # Back in the binding's dimension: the same item opens the view.
 ctl command "execute in minecraft:the_end run tp @s 50.5 64 10.5"
 ctl wait 10
+charge minecraft:the_end 48 64 8
+charge_net
 use_held
 ctl wait 10
 ctl screen | jq -e '.screen == "container"' >/dev/null \
     || fail "the same use in the bound dimension did not open the view: $(ctl screen | jq -c '{screen}')"
+charge_net
 expect_slots '[]'
 ctl close
 ctl wait 4
 
 echo "== the range upgrade: the transmitter's own slot raises its range =="
+net minecraft:the_end 48 64 8
 # Upstream's transmitter has a four-slot upgrade container behind its menu
 # (`WirelessTransmitterBlockEntity`), and its range is the base 16 plus 8 per
 # range upgrade (`WirelessTransmitterRangeModifier`, `rangeUpgradeRange` 8,
@@ -859,18 +1115,21 @@ echo "== the range upgrade: the transmitter's own slot raises its range =="
 # rule is asked.
 ctl command "execute in minecraft:the_end run tp @s 50.5 64 10.5"
 ctl wait 6
+charge minecraft:the_end 48 64 8
 ctl container 50 64 8 refinedstorage:range_upgrade 1 >/dev/null
 ctl wait 4
 upgrade_slots=$(slots 50 64 8)
 echo "  transmitter slots: $upgrade_slots"
 echo "$upgrade_slots" | jq -e 'length == 1 and .[0].item == "refinedstorage:range_upgrade" and .[0].count == 1' >/dev/null \
     || fail "the transmitter's upgrade slot does not hold the range upgrade: $upgrade_slots"
+charge_net
 expect_range 50 64 8 "range 24 blocks, active"
 
 # The differential: the same 17.0-block use the phase above refused with 16
 # blocks is accepted with the upgrade, and names the raised range.
 ctl tp 33 64 8
 ctl wait 6
+charge minecraft:the_end 48 64 8
 if [ "$SELFTEST" = range ]; then
     echo "(selftest: asserting a use 17 blocks out is still refused with the range upgrade in)"
     expect_reply "refinedstorage wireless 50 64 8 minecraft:the_end" "refused (out of range: 17.0 > 16 blocks"
@@ -880,6 +1139,8 @@ fi
 # And the wireless grid item itself opens the view from the same spot.
 ctl select refinedstorage:wireless_grid >/dev/null
 ctl wait 4
+charge minecraft:the_end 48 64 8
+charge_net
 use_held
 ctl wait 10
 opened=$(ctl messages 8 | jq -r '.chat[]' | grep -m1 'Wireless grid' || true)
@@ -890,6 +1151,7 @@ case "$opened" in
 esac
 ctl screen | jq -e '.screen == "container"' >/dev/null \
     || fail "the raised range did not open the grid's view: $(ctl screen | jq -c '{screen}')"
+charge_net
 expect_slots '[]'
 ctl close
 ctl wait 4
@@ -900,6 +1162,8 @@ echo "== the transmitter's menu: four upgrade slots, and only upgrades fit =="
 ctl command "execute in minecraft:the_end run tp @s 50.5 64 10.5"
 ctl command "clear @s" >/dev/null
 ctl wait 4
+charge minecraft:the_end 48 64 8
+charge_net
 ctl interact 50 64 8 south
 ctl wait 10
 ctl screen | jq -e '.screen == "container"' >/dev/null \
@@ -915,11 +1179,13 @@ ctl give minecraft:diamond 1 >/dev/null
 ctl wait 4
 diamond_slot=$(inv_slot minecraft:diamond)
 [ -n "$diamond_slot" ] || fail "no diamond stack in the transmitter menu's inventory"
+charge_net
 ctl click-slot "$diamond_slot" shift
 ctl wait 8
 ctl screen | jq -e '[.slots[] | select(.slot >= 300 and .item == "minecraft:diamond")] == []' >/dev/null \
     || fail "a diamond entered the transmitter's upgrade slot"
 [ "$(count_of minecraft:diamond)" = 1 ] || fail "the refused diamond left the inventory"
+charge_net
 expect_range 50 64 8 "range 24 blocks, active"
 ctl close
 ctl wait 4
@@ -927,19 +1193,23 @@ ctl wait 4
 echo "== the creative range upgrade: unlimited, and still one dimension =="
 ctl command "execute in minecraft:the_end run tp @s 50.5 64 10.5"
 ctl wait 4
+charge minecraft:the_end 48 64 8
 ctl container 50 64 8 refinedstorage:creative_range_upgrade 1 >/dev/null
 ctl wait 4
 echo "  transmitter slots: $(slots 50 64 8)"
 if [ "$SELFTEST" = creative ]; then
     echo "(selftest: asserting the creative upgrade leaves the finite range)"
+    charge_net
     expect_range 50 64 8 "range 48 blocks, active"
 fi
+charge_net
 expect_range 50 64 8 "range unlimited, active"
 # A platform 70.5 blocks out: beyond the 48-block maximum of four range
 # upgrades, so only the creative upgrade accepts it.
 ctl command "execute in minecraft:the_end run fill 118 63 -2 122 63 2 minecraft:stone"
 ctl tp 120 64 0
 ctl wait 8
+charge minecraft:the_end 48 64 8
 expect_reply "refinedstorage wireless 50 64 8 minecraft:the_end" "accepted (70.5 of unlimited"
 # The creative upgrade gives no cross-dimension access: the dimension is
 # checked first, as it was without it.
@@ -948,6 +1218,7 @@ ctl command "execute in minecraft:the_end run tp @s 50.5 64 10.5"
 ctl wait 6
 
 echo "== the importer: the work interval, the quota and the filter =="
+net minecraft:the_end 40 64 16
 # Slice 7. Upstream's importer (`ImporterNetworkNode`) reads the inventory its
 # `direction` points at; the work ticker is `UpgradeContainer`'s (9 ticks, two
 # fewer per speed upgrade), and one pass moves 1 item, or 64 with a stack
@@ -964,8 +1235,11 @@ ctl command "execute in minecraft:the_end run setblock 42 64 16 refinedstorage:d
 ctl command "execute in minecraft:the_end run setblock 43 64 16 refinedstorage:importer[facing=east]"
 ctl command "execute in minecraft:the_end run setblock 44 64 16 minecraft:hopper[enabled=true,facing=down]"
 ctl wait 10
+charge minecraft:the_end 40 64 16
 expect_state 43 64 16 'facing=east'
+charge_net
 expect_info 42 64 16 "online (4 nodes, 1 controller, 1 drive, 0 grid, 1 importer)"
+charge_net
 expect_machine 43 64 16 "0 speed upgrades, 0 stack upgrades, work interval 9 ticks, 0 filters"
 # The two blocks' items are real items: given, read back, and used below.
 ctl give refinedstorage:importer 1 >/dev/null
@@ -982,14 +1256,36 @@ ctl wait 4
 ctl select refinedstorage:1k_storage_disk >/dev/null
 ctl command "execute in minecraft:the_end run tp @s 41.5 64 16.5" >/dev/null
 ctl wait 4
+charge_net
 ctl interact 42 64 16
 ctl wait 8
-expect_info 42 64 16 "1 disks, 0 items in 0 resources"
+# The network's charge as the info line names it: the drive's 10 plus 4 for its
+# one disk, and the importer's 2 a work pass (upstream's `DefaultEnergyUsage`).
+charge_net
+expect_info 42 64 16 "1 disks, 0 items in 0 resources; energy "
+charge_net
+expect_info 42 64 16 "drawing 14/tick + 2 per work pass"
 ctl container 44 64 16 minecraft:stone 64 >/dev/null
 ctl wait 4
+charge minecraft:the_end 40 64 16
 echo "  importer source: $(slots 44 64 16)"
+# A machine its network cannot pay does no pass: at 0 FE the same 20 ticks move
+# nothing, while the driver and the source are unchanged. Charged, the same
+# window moves again — the differential is the charge and nothing else.
+saved_net=$NET
+NET="" # no top-up during the starved window: the window *is* the 0 FE state
+charge minecraft:the_end 40 64 16 0
+starved_base=$(net_items 42 64 16)
+ctl wait 20
+starved=$(net_items 42 64 16)
+NET=$saved_net
+echo "  after 20 ticks at 0 FE: ${starved:-0} items on the network (was ${starved_base:-0})"
+[ "${starved:-0}" = "${starved_base:-0}" ] \
+    || fail "an importer its network cannot pay moved $((starved - starved_base)) items"
+charge minecraft:the_end 40 64 16
 # The un-upgraded machine moves one item per nine ticks: a 20-tick window sees
 # the first pass and one or two more, never a stack.
+charge_net
 ctl wait 20
 slow=$(net_items 42 64 16)
 echo "  after 20 ticks without an upgrade: $slow items on the network, source $(slots 44 64 16)"
@@ -1005,14 +1301,17 @@ ctl give refinedstorage:stack_upgrade 1 >/dev/null
 ctl wait 4
 ctl command "execute in minecraft:the_end run tp @s 43.5 64 17.5" >/dev/null
 ctl wait 4
+charge_net
 ctl interact 43 64 16
 ctl wait 8
 ctl screen | jq -e '[.slots[] | select(.slot >= 300)] | length == 13' >/dev/null \
     || fail "the importer's menu does not have 13 container slots: $(ctl screen | jq -c '[.slots[] | select(.slot >= 300)] | length')"
 up=$(inv_slot refinedstorage:stack_upgrade)
 [ -n "$up" ] || fail "no stack upgrade in the importer menu's inventory"
+charge_net
 ctl click-slot "$up"
 ctl wait 2
+charge_net
 ctl click-slot 309
 ctl wait 8
 ctl close
@@ -1021,7 +1320,10 @@ upgrade_slots=$(slots 43 64 16)
 echo "  importer slots: $upgrade_slots"
 echo "$upgrade_slots" | jq -e '[.[] | select(.item == "refinedstorage:stack_upgrade")] | length == 1' >/dev/null \
     || fail "the importer's upgrade slot does not hold the stack upgrade: $upgrade_slots"
+charge_net
 expect_machine 43 64 16 "1 stack upgrade, work interval 9 ticks"
+charge minecraft:the_end 40 64 16
+charge_net
 ctl wait 20
 fast=$(net_items 42 64 16)
 echo "  after the stack upgrade: $fast items on the network, source $(slots 44 64 16)"
@@ -1039,14 +1341,17 @@ echo "== the importer: four speed upgrades shorten the interval to one tick =="
 # off the interval per speed upgrade (9, 7, 5, 3, 1).
 ctl command "execute in minecraft:the_end run tp @s 43.5 64 17.5" >/dev/null
 ctl wait 4
+charge_net
 ctl interact 43 64 16
 ctl wait 8
 stack_slot=$(ctl screen | jq -r '[.slots[] | select(.slot >= 309 and .slot <= 312 and .item == "refinedstorage:stack_upgrade")][0].slot // empty')
 [ -n "$stack_slot" ] || fail "the stack upgrade is not in the importer's upgrade row"
+charge_net
 ctl click-slot "$stack_slot"
 ctl wait 2
 free=$(empty_inv_slot)
 [ -n "$free" ] || fail "no empty inventory slot to put the stack upgrade back into"
+charge_net
 ctl click-slot "$free"
 ctl wait 4
 ctl close
@@ -1058,12 +1363,15 @@ for n in 1 2 3 4; do
     ctl give refinedstorage:speed_upgrade 1 >/dev/null
     ctl wait 3
     ctl command "execute in minecraft:the_end run tp @s 43.5 64 17.5" >/dev/null
+    charge_net
     ctl interact 43 64 16
     ctl wait 8
     speed_slot=$(inv_slot refinedstorage:speed_upgrade)
     [ -n "$speed_slot" ] || fail "no speed upgrade in the importer menu's inventory"
+    charge_net
     ctl click-slot "$speed_slot"
     ctl wait 2
+    charge_net
     ctl click-slot $((308 + n))
     ctl wait 8
     ctl close
@@ -1072,18 +1380,24 @@ done
 echo "  importer slots: $(slots 43 64 16)"
 [ "$(slots 43 64 16 | jq '[.[] | select(.item == "refinedstorage:speed_upgrade")] | length')" = 4 ] \
     || fail "the importer does not hold four speed upgrades: $(slots 43 64 16)"
+charge_net
 expect_machine 43 64 16 "4 speed upgrades, 0 stack upgrades, work interval 1 tick"
 # The differential: with four speed upgrades the same 20-tick window moves a
 # stack's worth (one per tick), not one per nine ticks.
 ctl container 44 64 16 minecraft:dirt 64 >/dev/null
 ctl wait 4
+charge minecraft:the_end 40 64 16
+charge_net
 ctl wait 20
 rapid=$(net_items 42 64 16)
 echo "  after 20 ticks with four speed upgrades: $rapid items on the network"
 # One pass per tick: about 20 more items, far past the 1 to 5 the same window
 # moved without them (and the differential is that exact comparison).
 [ "${rapid:-0}" -ge 79 ] || fail "four speed upgrades moved to $rapid items in 20 ticks, expected at least 79"
+charge minecraft:the_end 40 64 16
+charge_net
 ctl wait 60
+charge_net
 expect_info 42 64 16 "128 items in 2 resources"
 
 echo "== the importer's filter blocks the resource it names =="
@@ -1092,11 +1406,14 @@ echo "== the importer's filter blocks the resource it names =="
 # that is not imported. Dirt is named, so the stone goes and the dirt stays.
 ctl container 43 64 16 minecraft:dirt 1 >/dev/null
 ctl wait 4
+charge minecraft:the_end 40 64 16
 ctl container 44 64 16 minecraft:stone 5 >/dev/null
 ctl container 44 64 16 minecraft:dirt 5 >/dev/null
 ctl wait 4
 echo "  importer filter: $(slots 43 64 16)"
+charge_net
 expect_machine 43 64 16 "1 filter"
+charge_net
 ctl wait 30
 echo "  source after the filtered pass: $(slots 44 64 16)"
 [ "$(slots 44 64 16 | jq '[.[] | select(.item == "minecraft:stone")] | length')" = 0 ] \
@@ -1105,15 +1422,20 @@ echo "  source after the filtered pass: $(slots 44 64 16)"
     || fail "the filtered importer imported the blocked dirt: $(slots 44 64 16)"
 
 echo "== the exporter: the resources its filter names leave the network =="
+net minecraft:the_end 40 64 16
 # The exporter at 41,64,17 faces south into the chest at 41,64,18 and joins the
 # network through the cable above it. Upstream's exporter works one filter entry
 # at a time (`ExporterNetworkNode`), so an empty filter exports nothing.
 ctl command "execute in minecraft:the_end run setblock 41 64 17 refinedstorage:exporter[facing=south]" >/dev/null
 ctl command "execute in minecraft:the_end run setblock 41 64 18 minecraft:chest" >/dev/null
 ctl wait 12
+charge_net
 expect_info 41 64 17 "online (5 nodes, 1 controller, 1 drive, 0 grid, 1 importer, 1 exporter)"
+charge_net
 expect_machine 41 64 17 "0 filters"
+charge minecraft:the_end 40 64 16
 before=$(net_items 41 64 17)
+charge_net
 ctl wait 20
 after=$(net_items 41 64 17)
 echo "  exporter with no filter: $before -> $after items"
@@ -1121,6 +1443,7 @@ echo "  exporter with no filter: $before -> $after items"
 # One gold ingot in the filter, four gold on the network: only the gold leaves.
 ctl container 41 64 17 minecraft:gold_ingot 1 >/dev/null
 ctl wait 4
+charge_net
 expect_machine 41 64 17 "1 filter"
 # The gold goes on the network the same way everything else did: into the
 # hopper the importer faces (its filter blocks dirt only). The exporter has its
@@ -1128,7 +1451,9 @@ expect_machine 41 64 17 "1 filter"
 # proves the pass is the *destination* gaining four and the network returning to
 # where it was, not a spike on the network.
 gold_base=$(net_items 41 64 17)
+charge minecraft:the_end 40 64 16
 ctl container 44 64 16 minecraft:gold_ingot 4 >/dev/null
+charge_net
 ctl wait 60
 echo "  exporter destination: $(slots 41 64 18)"
 [ "$(slots 41 64 18 | jq '[.[] | select(.item == "minecraft:gold_ingot")][0].count // 0')" = 4 ] \
@@ -1141,20 +1466,24 @@ echo "== a machine's upgrade slot refuses what is not an upgrade =="
 ctl command "execute in minecraft:the_end run tp @s 43.5 64 17.5" >/dev/null
 ctl command "clear @s" >/dev/null
 ctl wait 4
+charge_net
 ctl interact 43 64 16
 ctl wait 8
 ctl give minecraft:diamond 1 >/dev/null
 ctl wait 4
 diamond_slot=$(inv_slot minecraft:diamond)
 [ -n "$diamond_slot" ] || fail "no diamond in the machine menu's inventory"
+charge_net
 ctl click-slot "$diamond_slot"
 ctl wait 2
+charge_net
 ctl click-slot 309
 ctl wait 6
 ctl screen | jq -e '[.slots[] | select(.slot >= 300 and .slot <= 312 and .item == "minecraft:diamond")] == []' >/dev/null \
     || fail "a diamond entered a machine's upgrade slot"
 free=$(empty_inv_slot)
 [ -n "$free" ] || fail "no empty inventory slot to put the refused diamond back into"
+charge_net
 ctl click-slot "$free"
 ctl wait 4
 ctl close
@@ -1195,6 +1524,7 @@ ctl wait 4
 ctl command "execute in minecraft:the_end run tp @s 50.5 64 10.5"
 ctl give refinedstorage:wireless_grid 1 >/dev/null
 ctl give refinedstorage:wireless_transmitter 1 >/dev/null
+charge_net
 ctl wait 20
 ctl save
 ctl wait 10
@@ -1221,16 +1551,22 @@ esac
 echo "  refinedstorage:no_such_item refused, refinedstorage:no_such_block did not place ($unknown_state)"
 
 echo "== the disk keeps its contents across a relaunch =="
+net minecraft:the_end 40 64 0
 ctl command "execute in minecraft:the_end run tp @s 42.5 64 2.5"
 ctl save
 ctl wait 10
 ctl quit
 sleep 3
 launch
+charge_net
 ctl wait 20
+charge minecraft:the_end 40 64 0
+charge_net
 expect_info 43 64 0 "online (4 nodes, 1 controller, 1 drive, 1 grid); 1 disks, 3 items in 1 resources"
+charge_net
 ctl interact 43 64 0
 ctl wait 10
+charge_net
 expect_slots '[{"slot":300,"item":"minecraft:gold_ingot","count":3}]'
 ctl close
 ctl wait 4

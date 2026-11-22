@@ -19,19 +19,19 @@ use mod_api::item::containers::ModBlockEntityFields;
 use mod_api::{
     self, BlockEntityEvent, BlockEntityPart, BlockEntityTickEvent, BlockEntityTicksEvent, BlockKey,
     BlockPart, BlockState, Command, CommandArgumentValue, CommandInvocation, CommandSource,
-    Component, Compound, Flow, Hand, Host, HostSide, HostTransaction, ITEMS, InteractionResult,
-    ItemKey, ItemPart, ItemPlace, ItemResource, ItemStack, LevelHost, LevelRef, LevelSide,
-    MenuClickedEvent, MenuClosedEvent, MenuContainer, MenuPart, MenuRef, MenuReplace,
-    MenuSlotBacking, MenuSlotRulesEvent, ModBlockEntityView, ModContainer, RegisterCommandsEvent,
-    Registrar, RegistrationContext, RightClickBlockEvent, RunModCommandEvent, Screen, ScreenEvent,
-    ServerHost, ServerTickEvent, ServerTickPhase, StateForPlacementEvent, Tag, Text, UseItemEvent,
-    UseOnEvent, WorldPhase,
+    Component, Compound, ENERGY, Flow, Hand, Host, HostSide, HostTransaction, ITEMS,
+    InteractionResult, ItemKey, ItemPart, ItemPlace, ItemResource, ItemStack, LevelHost, LevelRef,
+    LevelSide, MenuClickedEvent, MenuClosedEvent, MenuContainer, MenuPart, MenuRef, MenuReplace,
+    MenuSlotBacking, MenuSlotRulesEvent, ModBlockEntityView, ModContainer, ModEnergyBuffer,
+    RegisterCommandsEvent, Registrar, RegistrationContext, RightClickBlockEvent,
+    RunModCommandEvent, Screen, ScreenEvent, ServerHost, ServerTickEvent, ServerTickPhase,
+    StateForPlacementEvent, Tag, Text, UseItemEvent, UseOnEvent, WorldPhase,
 };
 
 use crate::runtime::{
-    self, Binding, CAPACITY_1K, Cursor, DRIVE_SLOTS, Delta, Destination, Disk, Face, GRID_SLOTS,
-    Kind, Node, Place, Plan, Promises, Region, Stored, ViewKey, extract, insert, network,
-    plan_click, view_with,
+    self, Binding, CAPACITY_1K, Cursor, DRIVE_SLOTS, Delta, Destination, Disk, EnergyType, Face,
+    Fit, GRID_SLOTS, Kind, Node, Place, Plan, Promises, Region, Stored, ViewKey, extract, insert,
+    network, plan_click, view_with,
 };
 
 /// The five content ids of the slice, exactly as the content declares them.
@@ -102,6 +102,11 @@ const EXPORTER_MENU: &str = "refinedstorage:exporter";
 
 /// The saved compound key the grid's view marks live under.
 const VIEW_KEY: &str = "RefinedStorageView";
+
+/// The saved compound key a controller's buffer lives under: the key the game's
+/// `block_energy` handler keeps the amount in (`ModEnergyBuffer`: "the amount is
+/// not here: it lives in the entity's saved compound, under `energy`").
+const ENERGY_KEY: &str = "energy";
 
 /// A disk cache key: the dimension, the drive's position and its slot.
 type DiskKey = (String, [i32; 3], usize);
@@ -277,6 +282,26 @@ pub(crate) fn register(registrar: &mut dyn Registrar, _cx: &RegistrationContext)
         ..ModContainer::default()
     };
     registrar.block_container(&keys.transmitter, container);
+
+    // The controller's energy buffer (slice 8): the game's own FE handler on the
+    // block (`Registrar::block_energy`, NeoForge's `SimpleEnergyHandler`), whose
+    // amount lives in the block entity's compound under `energy`, so an FE
+    // cable fills the same buffer the network draws from. Upstream's
+    // `ControllerBlockEntity` is a `TransferableBlockEntityEnergy` with
+    // `CONTROLLER_CAPACITY` 1000 and the same six faces.
+    #[expect(
+        clippy::needless_update,
+        reason = "the update is for a field a later game build may add"
+    )]
+    let buffer = ModEnergyBuffer {
+        capacity: runtime::CONTROLLER_CAPACITY as i32,
+        max_insert: runtime::CONTROLLER_CAPACITY as i32,
+        max_extract: runtime::CONTROLLER_CAPACITY as i32,
+        insert_faces: [true; 6],
+        extract_faces: [true; 6],
+        ..ModEnergyBuffer::default()
+    };
+    registrar.block_energy(&keys.controller, buffer);
 }
 
 /// The transmitter's menu Part: its four upgrade slots take an upgrade item
@@ -700,7 +725,10 @@ fn open_wireless_grid(host: &mut dyn ServerHost, uuid: u128, stack: &ItemStack) 
     let online = net.online();
     let distance = runtime::distance(from, binding.pos());
     let range = range_at(host, level, binding.pos());
-    match runtime::admit(online, here == binding.dimension(), distance, range) {
+    let fit = fit_at(host, level, binding.pos(), TRANSMITTER_SLOTS);
+    let charge = runtime::usage(Kind::WirelessTransmitter, fit, 0);
+    let energy = runtime::Energy::new(stored_in(host, level, &net), charge);
+    match runtime::admit(online, here == binding.dimension(), energy, distance, range) {
         Ok(()) => show_wireless_grid(host, uuid, &binding, level, distance, range),
         Err(refusal) => tell(
             host,
@@ -1305,6 +1333,7 @@ pub(crate) fn on_server_tick(host: &mut dyn ServerHost, event: &ServerTickEvent<
     if !matches!(event.phase, ServerTickPhase::ServerTickStart { .. }) {
         return;
     }
+    with_core(|core| core.ticks = core.ticks.wrapping_add(1));
     let open: Vec<(u128, i32, Binding)> = with_core(|core| {
         core.menus
             .iter()
@@ -1362,29 +1391,144 @@ fn network_in(host: &dyn Host, level: mod_api::LevelRef, start: [i32; 3]) -> run
     network(start, |pos| node_at(host, level, pos))
 }
 
+/// The upgrades a network block holds in its own slots, as the energy model
+/// counts them (`Fit`): the transmitter's range and creative range upgrades,
+/// a machine's speed and stack upgrades. One reader for both, so the charge
+/// and the range can never disagree about what a slot holds.
+fn fit_at(host: &dyn Host, level: LevelRef, pos: [i32; 3], slots: usize) -> Fit {
+    let Some(entity) = host.block_entity(level, pos) else {
+        return Fit::default();
+    };
+    let keys = keys();
+    let mut fit = Fit::default();
+    for slot in 0..slots as u32 {
+        let Ok(Some(stack)) = entity.item_slot(host, slot) else {
+            continue;
+        };
+        let item = stack.item();
+        if item == keys.range_upgrade {
+            fit.range += 1;
+        }
+        if item == keys.creative_range_upgrade {
+            fit.creative_range = true;
+        }
+        if item == keys.speed_upgrade {
+            fit.speed += 1;
+        }
+        if item == keys.stack_upgrade {
+            fit.stack += 1;
+        }
+    }
+    fit
+}
+
 /// A wireless transmitter's range, read from its four upgrade slots: the base
 /// 16 blocks plus 8 per range upgrade, or unlimited with a creative range
 /// upgrade (upstream's composite range modifier, which reads the same
 /// container the menu edits).
 fn range_at(host: &dyn Host, level: LevelRef, pos: [i32; 3]) -> u32 {
+    let fit = fit_at(host, level, pos, TRANSMITTER_SLOTS);
+    runtime::upgraded_range(fit.range, fit.creative_range)
+}
+
+/// How many storage disks a drive holds (upstream charges
+/// `DISK_DRIVE_PER_DISK` for each).
+fn disks_at(host: &dyn Host, level: LevelRef, pos: [i32; 3]) -> u32 {
     let Some(entity) = host.block_entity(level, pos) else {
-        return runtime::upgraded_range(0, false);
+        return 0;
     };
-    let keys = keys();
-    let mut range_upgrades = 0;
-    let mut creative = false;
-    for slot in 0..TRANSMITTER_SLOTS as u32 {
-        let Ok(Some(stack)) = entity.item_slot(host, slot) else {
+    (0..DRIVE_SLOTS as u32)
+        .filter(|slot| {
+            entity
+                .item_slot(host, *slot)
+                .ok()
+                .flatten()
+                .is_some_and(|held| is_disk(&held))
+        })
+        .count() as u32
+}
+
+/// What one controller holds, asked of the game's own `block_energy` handler —
+/// the same handler a drain goes through, so the gate and the charge cannot
+/// disagree about the buffer. (The handler keeps the amount in the saved
+/// compound under `energy`, but reading that compound directly while another
+/// node writes through the capability lags the write, and a charged network read
+/// as empty.)
+fn controller_stored(host: &mut dyn ServerHost, level: LevelRef, pos: [i32; 3]) -> u32 {
+    level
+        .capability(host, &ENERGY, pos, None)
+        .map_or(0, |handler| handler.amount(host))
+}
+
+/// The network's buffer: what all its controllers hold together (upstream's
+/// `EnergyNetworkComponentImpl.getStored` sums its providers).
+fn stored_in(host: &mut dyn ServerHost, level: LevelRef, net: &runtime::Network) -> u32 {
+    let mut held = Vec::new();
+    for pos in net.of_kind(Kind::Controller) {
+        held.push(controller_stored(host, level, pos));
+    }
+    runtime::bank(held)
+}
+
+/// The network's capacity: one controller's buffer for each controller
+/// (`CONTROLLER_CAPACITY` × controllers).
+fn capacity_in(net: &runtime::Network) -> u32 {
+    runtime::CONTROLLER_CAPACITY * net.count(Kind::Controller) as u32
+}
+
+/// Take a node's charge from the network's controllers, in order, through the
+/// game's energy capability so the write is journaled in the transaction and an
+/// FE cable sees the same buffer. Returns how much was taken.
+fn draw_from(
+    host: &mut dyn ServerHost,
+    level: LevelRef,
+    net: &runtime::Network,
+    amount: u32,
+) -> u32 {
+    let mut left = amount;
+    let mut taken = 0;
+    for pos in net.of_kind(Kind::Controller) {
+        if left == 0 {
+            break;
+        }
+        let Some(handler) = level.capability(host, &ENERGY, pos, None) else {
             continue;
         };
-        if stack.item() == keys.range_upgrade {
-            range_upgrades += 1;
-        }
-        if stack.item() == keys.creative_range_upgrade {
-            creative = true;
-        }
+        let got = host
+            .transaction(|host, tx| {
+                Ok::<u32, mod_api::PlayerDataRefusal>(handler.extract(host, tx, left))
+            })
+            .unwrap_or(0);
+        taken += got;
+        left = left.saturating_sub(got);
     }
-    runtime::upgraded_range(range_upgrades, creative)
+    taken
+}
+
+/// One node's work gate: upstream's `calculateActive` (`stored >= usage`) and,
+/// when it passes, its `doWork` charge. A node that cannot pay does no work and
+/// nothing is taken — the network refuses the work, it does not run it on debt.
+fn pay(host: &mut dyn ServerHost, level: LevelRef, net: &runtime::Network, usage: u32) -> bool {
+    if !runtime::Energy::new(stored_in(host, level, net), usage).energized() {
+        return false;
+    }
+    draw_from(host, level, net, usage) == usage
+}
+
+/// A node's charge, as the two places that gate and that read the network's
+/// draw both compute it.
+fn charge_of(host: &dyn Host, level: LevelRef, kind: Kind, pos: [i32; 3]) -> u32 {
+    let fit = match kind {
+        Kind::WirelessTransmitter => fit_at(host, level, pos, TRANSMITTER_SLOTS),
+        Kind::Importer | Kind::Exporter => fit_at(host, level, pos, MACHINE_SLOTS),
+        _ => Fit::default(),
+    };
+    let disks = if kind == Kind::DiskDrive {
+        disks_at(host, level, pos)
+    } else {
+        0
+    };
+    runtime::usage(kind, fit, disks)
 }
 
 /// The network the block at `start` belongs to, in the level in place.
@@ -1438,14 +1582,15 @@ impl BlockEntityPart for Network {
         Some(Compound::new())
     }
 
-    /// The cable (its connections), the drive (its disks), the grid (its
-    /// view), the transmitter (its `active` state) and the two machines (their
-    /// work tick) tick; the controller holds no state.
+    /// The controller (its `energy_type`), the cable (its connections), the
+    /// drive (its disks), the grid (its view), the transmitter (its `active`
+    /// state) and the two machines (their work tick) tick.
     fn block_entity_ticks(&self, _host: &dyn Host, event: &mut BlockEntityTicksEvent<'_>) {
         event.ticks = matches!(
             Kind::from_block(event.block),
             Some(
-                Kind::Cable
+                Kind::Controller
+                    | Kind::Cable
                     | Kind::DiskDrive
                     | Kind::Grid
                     | Kind::WirelessTransmitter
@@ -1459,6 +1604,7 @@ impl BlockEntityPart for Network {
     fn block_entity_tick(&self, host: &mut dyn ServerHost, event: &mut BlockEntityTickEvent<'_>) {
         let pos = event.pos;
         match kind_at(host, pos) {
+            Some(Kind::Controller) => controller_tick(host, pos, &mut event.entity),
             Some(Kind::Cable) => cable_tick(host, pos),
             Some(Kind::DiskDrive) => drive_tick(host, pos, &mut event.entity),
             Some(Kind::Grid) => grid_tick(host, pos, &mut event.entity),
@@ -1466,7 +1612,7 @@ impl BlockEntityPart for Network {
             Some(kind @ (Kind::Importer | Kind::Exporter)) => {
                 machine_tick(host, pos, kind, &mut event.entity);
             }
-            Some(Kind::Controller) | None => {}
+            None => {}
         }
     }
 
@@ -1553,6 +1699,37 @@ impl BlockEntityPart for Network {
 
 // --- the ticks -------------------------------------------------------------
 
+/// A controller's tick: keep its buffer inside the declared capacity and say
+/// which of upstream's four energy levels it is at, in the block's
+/// `energy_type` state (`ControllerBlockEntityTicker.updateEnergyTypeInLevel`).
+/// The buffer itself is the game's `block_energy` handler's; this only clamps
+/// and reads it.
+fn controller_tick(host: &mut dyn ServerHost, pos: [i32; 3], entity: &mut ModBlockEntityView<'_>) {
+    let capacity = runtime::CONTROLLER_CAPACITY;
+    let held = match field(&entity.nbt, ENERGY_KEY) {
+        Some(Tag::Int(held)) => u32::try_from(*held).unwrap_or(0),
+        _ => 0,
+    };
+    // Clamp only. A block entity is out of the world during its own tick, so the
+    // capability cannot answer for it here and its payload is the only reading;
+    // writing the amount back from a snapshot would undo another node's drain
+    // from the same tick, so nothing is written unless the buffer is over its
+    // capacity (which the handler itself refuses to do).
+    let stored = held.min(capacity);
+    if stored != held {
+        entity.nbt.insert(
+            ENERGY_KEY.into(),
+            Tag::Int(i32::try_from(stored).unwrap_or(0)),
+        );
+    }
+    let energy_type = EnergyType::of(stored, capacity);
+    let key = (host.dimension().to_owned(), pos);
+    let previous = with_core(|core| core.energy.insert(key, energy_type));
+    if previous != Some(energy_type) {
+        host.set_block_property(pos, "energy_type", energy_type.property());
+    }
+}
+
 /// A cable's six connection bits, from the blocks beside it (upstream's
 /// `computeConnections`: a neighbour with a network node accepts the
 /// connection, and every network block of the slice has one).
@@ -1581,9 +1758,20 @@ fn cable_tick(host: &mut dyn ServerHost, pos: [i32; 3]) {
     with_core(|core| core.connections.insert(key, bits));
 }
 
-/// A drive's tick: mirror its disk items into the cache, or write a change the
-/// grid made back into the disk's component.
+/// A drive's tick: pay its charge (10 FE plus 4 per disk), then mirror its disk
+/// items into the cache, or write a change the grid made back into the disk's
+/// component. A drive its network cannot pay does no work: the disks are not
+/// mirrored, so the grids of that network list nothing (upstream's inactive
+/// node).
 fn drive_tick(host: &mut dyn ServerHost, pos: [i32; 3], entity: &mut ModBlockEntityView<'_>) {
+    let net = network_at(host, pos);
+    let Some(level) = host.level(host.dimension()) else {
+        return;
+    };
+    let cost = charge_of(host, level, Kind::DiskDrive, pos);
+    if !pay(host, level, &net, cost) {
+        return;
+    }
     let dimension = host.dimension().to_owned();
     for slot in 0..DRIVE_SLOTS {
         let key = (dimension.clone(), pos, slot);
@@ -1691,6 +1879,18 @@ fn grid_tick(host: &mut dyn ServerHost, pos: [i32; 3], entity: &mut ModBlockEnti
     let dimension = host.dimension().to_owned();
     let net = network_at(host, pos);
     let online = net.online();
+    // The node works only when the network can pay its grid charge: a grid on a
+    // 0-FE network is inactive and lists nothing, while the disks keep what they
+    // hold (upstream's `calculateActive` + `doWork`).
+    let mut works = false;
+    if online && let Some(level) = host.level(host.dimension()) {
+        works = pay(
+            host,
+            level,
+            &net,
+            runtime::usage(Kind::Grid, Fit::default(), 0),
+        );
+    }
     let drives: Vec<[i32; 3]> = net.of_kind(Kind::DiskDrive).collect();
     let keys: Vec<DiskKey> = drive_keys(&dimension, &drives);
     // Only the slots the drives already mirror, in the same order, so a
@@ -1733,7 +1933,7 @@ fn grid_tick(host: &mut dyn ServerHost, pos: [i32; 3], entity: &mut ModBlockEnti
                     // answer is an `Option`, not a zero-count stack: a stack
                     // cannot hold zero items, and a clamped one reads as a
                     // refused deposit — the 1-item ghost this fix removes.)
-                    let left = if online {
+                    let left = if works {
                         insert(&mut disks, stack)
                     } else {
                         Some(stack)
@@ -1792,7 +1992,7 @@ fn grid_tick(host: &mut dyn ServerHost, pos: [i32; 3], entity: &mut ModBlockEnti
         });
         core.promises.promised_elsewhere(&key)
     });
-    let entries = if online {
+    let entries = if works {
         view_with(&disks, &held, &filter, GRID_SLOTS, |stack| {
             host.max_stack_size(stack.stack().item()).unwrap_or(64)
         })
@@ -1832,26 +2032,37 @@ fn grid_tick(host: &mut dyn ServerHost, pos: [i32; 3], entity: &mut ModBlockEnti
         .collect();
     save_view(host, entity, &rebuilt, &owned);
 
-    // The block state says whether the network works: an offline grid is dark.
+    // The block state says whether the grid works: an offline or unpowered grid
+    // is dark.
     let previous = with_core(|core| core.active.get(&(dimension.clone(), pos)).copied());
-    if previous != Some(online) {
-        host.set_block_property(pos, "active", if online { "true" } else { "false" });
-        with_core(|core| core.active.insert((dimension, pos), online));
+    if previous != Some(works) {
+        host.set_block_property(pos, "active", if works { "true" } else { "false" });
+        with_core(|core| core.active.insert((dimension, pos), works));
     }
 }
 
 /// A transmitter's tick: `active` is whether the network it joins has a
-/// controller. It joins through its facing side only, so a transmitter placed
-/// with its face away from a cable is offline and answers no use.
+/// controller **and can pay the transmitter's charge** (16 FE a tick plus 8 per
+/// range upgrade). It joins through its facing side only, so a transmitter
+/// placed with its face away from a cable is offline and answers no use; one
+/// whose network cannot pay is inactive and answers no use either (upstream's
+/// `stored >= getEnergyUsage()`).
 fn transmitter_tick(host: &mut dyn ServerHost, pos: [i32; 3]) {
-    let online = network_at(host, pos).online();
+    let net = network_at(host, pos);
+    let mut active = false;
+    if net.online()
+        && let Some(level) = host.level(host.dimension())
+    {
+        let cost = charge_of(host, level, Kind::WirelessTransmitter, pos);
+        active = pay(host, level, &net, cost);
+    }
     let key = (host.dimension().to_owned(), pos);
     let previous = with_core(|core| core.active.get(&key).copied());
-    if previous == Some(online) {
+    if previous == Some(active) {
         return;
     }
-    host.set_block_property(pos, "active", if online { "true" } else { "false" });
-    with_core(|core| core.active.insert(key, online));
+    host.set_block_property(pos, "active", if active { "true" } else { "false" });
+    with_core(|core| core.active.insert(key, active));
 }
 
 // --- the two transfer machines (slice 7) -----------------------------------
@@ -1946,6 +2157,16 @@ fn machine_tick(
     let Some(level) = host.level(host.dimension()) else {
         return;
     };
+    // The pass's charge, upstream's `stored >= getEnergyUsage()` gate and its
+    // `doWork` draw: 2 FE plus 4 per speed upgrade and 16 per stack upgrade.
+    let fit = Fit {
+        speed,
+        stack: stacks,
+        ..Fit::default()
+    };
+    if !pay(host, level, &net, runtime::usage(kind, fit, 0)) {
+        return;
+    }
     let target = neighbour(pos, face);
     let live = live_disks(host, level, &net);
     let mut disks = disks_of(&live);
@@ -2099,6 +2320,13 @@ struct Core {
     /// The wireless grids whose menu is open: the player and window id, the
     /// transmitter it is bound to and what it last showed.
     menus: HashMap<(u128, i32), OpenGrid>,
+    /// The energy level each controller's `energy_type` state was last written
+    /// with.
+    energy: HashMap<(String, [i32; 3]), EnergyType>,
+    /// The server ticks this world has seen, counted on `server_tick`: the tick
+    /// counter the energy readout prints, so a fall over N ticks can be checked
+    /// against N ticks rather than against a wall clock.
+    ticks: u64,
 }
 
 static CORE: Mutex<Option<Core>> = Mutex::new(None);
@@ -2235,6 +2463,13 @@ pub(crate) fn on_register_commands(event: &mut RegisterCommandsEvent<'_>) {
     // client hook this port does not subscribe, so the readout is a command,
     // like `/refinedstorage info`).
     event.commands.push(Command::new("refinedstorage bound"));
+    // The network's buffer, filled through the capability an FE cable uses.
+    // Upstream's controller is filled by its neighbours; the harness has no FE
+    // generator, so this command is the source, as `/refinedstorage info` is
+    // the screen (a recorded harness/behaviour addition).
+    event.commands.push(Command::new(
+        "refinedstorage energy <pos:block_pos> <amount:integer>",
+    ));
 }
 
 /// The `/refinedstorage` commands' bodies (`run_mod_command`).
@@ -2250,6 +2485,18 @@ pub(crate) fn on_run_mod_command(
     }
     if sub == "bound" {
         bound(host, event.source);
+        return Flow::Cancel;
+    }
+    if sub == "energy" {
+        let Some(CommandArgumentValue::BlockPos(pos)) = event.command.argument("pos") else {
+            feedback(host, "Usage: /refinedstorage energy <x> <y> <z> <amount>");
+            return Flow::Cancel;
+        };
+        let Some(CommandArgumentValue::Integer(amount)) = event.command.argument("amount") else {
+            feedback(host, "Usage: /refinedstorage energy <x> <y> <z> <amount>");
+            return Flow::Cancel;
+        };
+        charge(host, *pos, u32::try_from(*amount).unwrap_or(0));
         return Flow::Cancel;
     }
     let Some(CommandArgumentValue::BlockPos(pos)) = event.command.argument("pos") else {
@@ -2332,6 +2579,7 @@ fn info(host: &mut dyn ServerHost, pos: [i32; 3]) {
     }
     let net = network_at(host, pos);
     let dimension = host.dimension().to_owned();
+    let level = host.level(host.dimension());
     let drives: Vec<[i32; 3]> = net.of_kind(Kind::DiskDrive).collect();
     let (disks, items, resources) = {
         let keys: Vec<DiskKey> = drive_keys(&dimension, &drives);
@@ -2346,6 +2594,25 @@ fn info(host: &mut dyn ServerHost, pos: [i32; 3]) {
         })
     };
     let online = net.online();
+    // The buffer and what the network charges: the control readout a machine
+    // menu would show as a bar, and the number the energy assertions compare.
+    // `drawing` is what the always-on nodes take per tick (grid 10, drive 10 +
+    // 4 a disk, transmitter 16 + 8 a range upgrade); `per work pass` is what the
+    // two machines take once every `work_interval` ticks.
+    let mut per_tick = 0;
+    let mut per_pass = 0;
+    if let Some(level) = level {
+        for &(kind, at) in &net.nodes {
+            let charge = charge_of(host, level, kind, at);
+            match kind {
+                Kind::Importer | Kind::Exporter => per_pass += charge,
+                _ => per_tick += charge,
+            }
+        }
+    }
+    let stored = level.map_or(0, |level| stored_in(host, level, &net));
+    let capacity = capacity_in(&net);
+    let ticks = with_core(|core| core.ticks);
     let mut census = format!(
         "{} nodes, {} controller, {} drive, {} grid",
         net.nodes.len(),
@@ -2366,12 +2633,17 @@ fn info(host: &mut dyn ServerHost, pos: [i32; 3]) {
     feedback(
         host,
         &format!(
-            "Refined Storage network at {},{},{}: {state} ({census}); {} disks, {items} items in {resources} resources",
+            "Refined Storage network at {},{},{}: {state} ({census}); {} disks, {items} items in {resources} resources; energy {stored}/{capacity} FE, drawing {per_tick}/tick{pass}, t={ticks}",
             pos[0],
             pos[1],
             pos[2],
             disks,
             state = if online { "online" } else { "offline" },
+            pass = if per_pass > 0 {
+                format!(" + {per_pass} per work pass")
+            } else {
+                String::new()
+            },
         ),
     );
     if kind_at(host, pos) == Some(Kind::WirelessTransmitter) {
@@ -2426,7 +2698,13 @@ fn wireless(
         feedback(host, "No wireless transmitter there.");
         return;
     }
-    let online = network_in(host, level, pos).online();
+    let net = network_in(host, level, pos);
+    let online = net.online();
+    // The transmitter's own charge (16 FE plus 8 a range upgrade) against what
+    // the network holds: upstream's `node.isActive()` step, before the range.
+    let fit = fit_at(host, level, pos, TRANSMITTER_SLOTS);
+    let charge = runtime::usage(Kind::WirelessTransmitter, fit, 0);
+    let energy = runtime::Energy::new(stored_in(host, level, &net), charge);
     // Upstream hands the validator the *player's* coordinates; the command's
     // own dimension is the dimension the use happens in (`execute in` moves it),
     // and a player's real position is used for the distance so a rewritten
@@ -2444,6 +2722,7 @@ fn wireless(
     match runtime::admit(
         online,
         command.dimension == level.dimension(),
+        energy,
         distance,
         range,
     ) {
@@ -2486,6 +2765,60 @@ fn filter_at(host: &mut dyn ServerHost, pos: [i32; 3], filter: &str) {
     } else {
         feedback(host, &format!("Grid search: {filter}"));
     }
+}
+
+/// `/refinedstorage energy <pos> <amount>`: bring the network's buffer to
+/// `amount` FE through the controller's declared energy capability — an insert
+/// the way an FE cable fills it, an extract the way a consumer takes it. The
+/// harness has no generator at this pin, so the command is the source; it
+/// writes only what the game's own handler would.
+fn charge(host: &mut dyn ServerHost, pos: [i32; 3], amount: u32) {
+    let net = network_at(host, pos);
+    if net.count(Kind::Controller) == 0 {
+        feedback(host, "No controller on the network: nothing to charge.");
+        return;
+    }
+    let Some(level) = host.level(host.dimension()) else {
+        return;
+    };
+    let before = stored_in(host, level, &net);
+    let capacity = capacity_in(&net);
+    let target = amount.min(capacity);
+    let mut insert = target.saturating_sub(before);
+    let mut extract = before.saturating_sub(target);
+    for at in net.of_kind(Kind::Controller) {
+        if insert == 0 && extract == 0 {
+            break;
+        }
+        let Some(handler) = level.capability(host, &ENERGY, at, None) else {
+            continue;
+        };
+        let (put, got) = host
+            .transaction(|host, tx| {
+                let put = if insert > 0 {
+                    handler.insert(host, tx, insert)
+                } else {
+                    0
+                };
+                let got = if extract > 0 {
+                    handler.extract(host, tx, extract)
+                } else {
+                    0
+                };
+                Ok::<(u32, u32), mod_api::PlayerDataRefusal>((put, got))
+            })
+            .unwrap_or((0, 0));
+        insert = insert.saturating_sub(put);
+        extract = extract.saturating_sub(got);
+    }
+    let after = stored_in(host, level, &net);
+    feedback(
+        host,
+        &format!(
+            "Network energy at {},{},{}: {after}/{capacity} FE (was {before})",
+            pos[0], pos[1], pos[2]
+        ),
+    );
 }
 
 #[cfg(test)]

@@ -35,9 +35,9 @@ The two `check`/`build`/`fits` steps need `BUILD_LOCAL=1` on the slot runner:
 the second build machine has no `cargo-horizon-mod`.
 
 Pin **`0a875da91dbb0fdcb7ba8c42c11341aa229af51a`** + mixins
-`e59da9094f0c2fdda6c627fe9eff22dec6a906f0`. Delivered package (0.2.7):
-`refinedstorage.hmod`, **179,081 B**, SHA-256
-`3223f32ae80773769dd4a5b3ac1dc350477d7608778131223a6ba43e93bb6bb9`, 235 entries, no packed
+`e59da9094f0c2fdda6c627fe9eff22dec6a906f0`. Delivered package (0.2.8):
+`refinedstorage.hmod`, **193,579 B**, SHA-256
+`e755815241995fc2d4dc6123c6feaae24a0130aa6999b5d21d4548b16ecff72a`, 244 entries, no packed
 `Cargo.lock`; a copy of the delivered bytes is at
 `ports/_shared/evidence/refinedstorage/refinedstorage.hmod`, which is the file both `fits`
 runs used.
@@ -104,3 +104,13 @@ exporter moves exactly the four gold its filter names into the chest it faces an
 exporter moves nothing; a machine menu shows 13 slots and refuses a diamond in its upgrade row; and
 the exporter block drops itself. `SELFTEST=speed` and `SELFTEST=stack` invert the two new
 differentials and exit 1.
+
+Slice 8's assertions are `notes.md` §"Slice 8": an isolated controller + cable + transmitter at 500
+FE falls by exactly 16 × the server ticks the `info` line's counter shows; a lone controller reads
+`off`/`nearly_off`/`nearly_on`/`on` at 0/50/350/500 FE (upstream's 1 %, 30 % and 40 % thresholds);
+at 0 FE the transmitter is inactive and the same use is refused `not enough energy: 0 of 16 FE`
+both inside and 17 blocks outside the range, while with energy the same 17 blocks name the distance
+and 2.5 blocks are accepted; a grid at 0 FE is `active=false` and lists nothing while its disk keeps
+the 3 gold (charged, it lists them); and an importer at 0 FE moves nothing in a 20-tick window that
+moves 3 items once charged. `SELFTEST=energy` inverts the no-energy refusal and exits 1; the
+slice-5 promise rule's `SELFTEST=networks` is re-run and still fails on purpose.

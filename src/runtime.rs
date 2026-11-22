@@ -315,6 +315,9 @@ pub enum Refusal {
     /// The transmitter's network has no controller, so every node of it is
     /// inactive.
     Offline,
+    /// The transmitter's network cannot pay the transmitter's charge, so the
+    /// node is inactive (upstream's `stored >= getEnergyUsage()` gate).
+    NoEnergy { stored: u32, usage: u32 },
     /// The user is further from the transmitter's block than its range.
     OutOfRange { distance: f64, range: u32 },
 }
@@ -324,6 +327,9 @@ impl std::fmt::Display for Refusal {
         match self {
             Refusal::DifferentDimension => write!(f, "different dimension"),
             Refusal::Offline => write!(f, "the network is offline"),
+            Refusal::NoEnergy { stored, usage } => {
+                write!(f, "not enough energy: {stored} of {usage} FE")
+            }
             Refusal::OutOfRange { distance, range } => {
                 write!(f, "out of range: {distance:.1} > {range} blocks")
             }
@@ -344,19 +350,35 @@ pub fn distance(from: [f64; 3], block: [i32; 3]) -> f64 {
 /// Whether a network-bound use may use the network a wireless transmitter
 /// exposes. `online` is whether the transmitter's component has a controller
 /// (otherwise every node of it is inactive); `same_dimension` whether the user
-/// and the transmitter are in one dimension; `distance` the value
-/// [`distance`] answered; `range` the transmitter's range in blocks.
+/// and the transmitter are in one dimension; `energy` what the network holds
+/// against the transmitter's own charge; `distance` the value [`distance`]
+/// answered; `range` the transmitter's range in blocks.
 ///
 /// The checks run in upstream's order (`NetworkItemPlayerValidator.isValid`):
-/// dimension first, then the node's activeness, then the range, so a use in
-/// another dimension is refused as such even when the transmitter is offline
-/// too. The boundary is inclusive, as upstream's `<=` is.
-pub fn admit(online: bool, same_dimension: bool, distance: f64, range: u32) -> Result<(), Refusal> {
+/// dimension first, then the node's activeness — which is the controller's
+/// presence and then the energy gate, upstream's `calculateActive` — then the
+/// range, so a use in another dimension is refused as such even when the
+/// transmitter is offline too, and a use with no energy is refused as such
+/// before the range is even asked. The boundary is inclusive, as upstream's
+/// `<=` is.
+pub fn admit(
+    online: bool,
+    same_dimension: bool,
+    energy: Energy,
+    distance: f64,
+    range: u32,
+) -> Result<(), Refusal> {
     if !same_dimension {
         return Err(Refusal::DifferentDimension);
     }
     if !online {
         return Err(Refusal::Offline);
+    }
+    if !energy.energized() {
+        return Err(Refusal::NoEnergy {
+            stored: energy.stored,
+            usage: energy.usage,
+        });
     }
     if distance > f64::from(range) {
         return Err(Refusal::OutOfRange { distance, range });
@@ -1183,6 +1205,160 @@ pub fn inventory_click(slot_has: bool, cursor: Cursor, button: u8) -> CursorMove
     }
 }
 
+// --- the network's energy (slice 8) ---------------------------------------
+
+/// The controller's buffer, in FE (upstream
+/// `DefaultEnergyUsage.CONTROLLER_CAPACITY`).
+pub const CONTROLLER_CAPACITY: u32 = 1000;
+
+/// What a controller charges: nothing (upstream `ControllerNetworkNode
+/// ::getEnergyUsage` is 0; the controller is the network's provider).
+pub const CONTROLLER_USAGE: u32 = 0;
+
+/// What a cable charges: nothing (upstream `DefaultEnergyUsage.CABLE`).
+pub const CABLE_USAGE: u32 = 0;
+
+/// What a grid charges per tick it works (upstream `DefaultEnergyUsage.GRID`).
+pub const GRID_USAGE: u32 = 10;
+
+/// What a disk drive charges per tick, plus [`DISK_DRIVE_PER_DISK_USAGE`] for
+/// each disk in it (upstream `DISK_DRIVE` and `DISK_DRIVE_PER_DISK`).
+pub const DISK_DRIVE_USAGE: u32 = 10;
+pub const DISK_DRIVE_PER_DISK_USAGE: u32 = 4;
+
+/// What each transfer machine charges per work pass (upstream `IMPORTER` and
+/// `EXPORTER`).
+pub const IMPORTER_USAGE: u32 = 2;
+pub const EXPORTER_USAGE: u32 = 2;
+
+/// What a wireless transmitter charges per tick (upstream
+/// `WIRELESS_TRANSMITTER`).
+pub const TRANSMITTER_USAGE: u32 = 16;
+
+/// What each upgrade adds to the holder's charge (upstream `SPEED_UPGRADE`,
+/// `STACK_UPGRADE`, `RANGE_UPGRADE` and `CREATIVE_RANGE_UPGRADE`).
+pub const SPEED_UPGRADE_USAGE: u32 = 4;
+pub const STACK_UPGRADE_USAGE: u32 = 16;
+pub const RANGE_UPGRADE_USAGE: u32 = 8;
+pub const CREATIVE_RANGE_UPGRADE_USAGE: u32 = 0;
+
+/// A node's upgrades, as the charge cares about them: the four counts that
+/// upstream's `UpgradeContainer.getEnergyUsage` asks each item for.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Fit {
+    pub speed: u32,
+    pub stack: u32,
+    pub range: u32,
+    pub creative_range: bool,
+}
+
+/// What one node charges: one tick for the always-on nodes (a grid, a drive, a
+/// transmitter, a cable), one work pass for a machine (upstream's throttled
+/// ticker calls `doWork` every interval, and `doWork` is where the charge is
+/// taken). `disks` is how many storage disks a drive holds.
+pub fn usage(kind: Kind, fit: Fit, disks: u32) -> u32 {
+    match kind {
+        Kind::Controller => CONTROLLER_USAGE,
+        Kind::Cable => CABLE_USAGE,
+        Kind::Grid => GRID_USAGE,
+        Kind::DiskDrive => DISK_DRIVE_USAGE + DISK_DRIVE_PER_DISK_USAGE * disks,
+        Kind::WirelessTransmitter => {
+            let range = if fit.creative_range {
+                CREATIVE_RANGE_UPGRADE_USAGE
+            } else {
+                RANGE_UPGRADE_USAGE * fit.range.min(MAX_RANGE_UPGRADES)
+            };
+            TRANSMITTER_USAGE + range
+        }
+        Kind::Importer => {
+            IMPORTER_USAGE
+                + SPEED_UPGRADE_USAGE * fit.speed.min(MAX_SPEED_UPGRADES)
+                + STACK_UPGRADE_USAGE * fit.stack.min(MAX_STACK_UPGRADES)
+        }
+        Kind::Exporter => {
+            EXPORTER_USAGE
+                + SPEED_UPGRADE_USAGE * fit.speed.min(MAX_SPEED_UPGRADES)
+                + STACK_UPGRADE_USAGE * fit.stack.min(MAX_STACK_UPGRADES)
+        }
+    }
+}
+
+/// What a network holds and what a node about to work needs, in FE. Upstream's
+/// gate is `stored >= getEnergyUsage()` (`calculateActive`), and an active
+/// node's `doWork` takes exactly that charge (`AbstractNetworkNode.doWork`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Energy {
+    pub stored: u32,
+    pub usage: u32,
+}
+
+impl Energy {
+    pub fn new(stored: u32, usage: u32) -> Self {
+        Energy { stored, usage }
+    }
+
+    /// Whether the node may work: upstream's `stored >= usage`.
+    pub fn energized(self) -> bool {
+        self.stored >= self.usage
+    }
+
+    /// What the network holds after one charge, or `None` when it cannot pay
+    /// it (the node then does no work, and nothing is taken).
+    pub fn draw(self) -> Option<u32> {
+        self.energized().then(|| self.stored - self.usage)
+    }
+}
+
+/// The controller's `energy_type`: upstream's four levels
+/// (`ControllerEnergyType`), chosen from the stored/capacity ratio by
+/// `ControllerNetworkNode.getState`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EnergyType {
+    Off,
+    NearlyOff,
+    NearlyOn,
+    On,
+}
+
+impl EnergyType {
+    /// The level a buffer is at: `pct >= 0.4` on, `>= 0.3` nearly on, `>= 0.01`
+    /// nearly off, else off. The comparisons are integer so the thresholds are
+    /// exact (400, 300 and 10 of 1000).
+    pub fn of(stored: u32, capacity: u32) -> EnergyType {
+        if capacity == 0 {
+            return EnergyType::Off;
+        }
+        let capacity = u64::from(capacity);
+        let stored = u64::from(stored).min(capacity);
+        if stored * 100 >= capacity * 40 {
+            EnergyType::On
+        } else if stored * 100 >= capacity * 30 {
+            EnergyType::NearlyOn
+        } else if stored * 100 >= capacity {
+            EnergyType::NearlyOff
+        } else {
+            EnergyType::Off
+        }
+    }
+
+    /// The value the block's `energy_type` state carries.
+    pub fn property(self) -> &'static str {
+        match self {
+            EnergyType::Off => "off",
+            EnergyType::NearlyOff => "nearly_off",
+            EnergyType::NearlyOn => "nearly_on",
+            EnergyType::On => "on",
+        }
+    }
+}
+
+/// A network's whole buffer: what each of its controllers holds. A controller
+/// with no energy still counts as a controller (the network is structurally
+/// online), so the sum, not the count, is what gates every node.
+pub fn bank(stored: impl IntoIterator<Item = u32>) -> u32 {
+    stored.into_iter().sum()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1221,6 +1397,12 @@ mod tests {
         let mut disk = Disk::new(CAPACITY_1K);
         assert_eq!(disk.insert(TestItem::new(id, count)), count);
         disk
+    }
+
+    /// A full controller's worth of energy against a transmitter's charge: the
+    /// power side of every admission that is not about energy.
+    fn powered() -> Energy {
+        Energy::new(CONTROLLER_CAPACITY, TRANSMITTER_USAGE)
     }
 
     // --- network -----------------------------------------------------------
@@ -1466,12 +1648,12 @@ mod tests {
     #[test]
     fn a_use_in_another_dimension_is_refused_as_such_even_when_offline() {
         assert_eq!(
-            admit(false, false, 0.0, WIRELESS_RANGE),
+            admit(false, false, powered(), 0.0, WIRELESS_RANGE),
             Err(Refusal::DifferentDimension),
             "upstream checks the dimension before the node's activeness"
         );
         assert_eq!(
-            admit(true, false, 1.0, WIRELESS_RANGE),
+            admit(true, false, powered(), 1.0, WIRELESS_RANGE),
             Err(Refusal::DifferentDimension)
         );
     }
@@ -1479,7 +1661,7 @@ mod tests {
     #[test]
     fn an_offline_transmitter_refuses_a_use_within_its_range() {
         assert_eq!(
-            admit(false, true, 1.0, WIRELESS_RANGE),
+            admit(false, true, powered(), 1.0, WIRELESS_RANGE),
             Err(Refusal::Offline)
         );
     }
@@ -1487,7 +1669,7 @@ mod tests {
     #[test]
     fn a_use_beyond_the_range_is_refused_naming_the_distance() {
         assert_eq!(
-            admit(true, true, 16.5, WIRELESS_RANGE),
+            admit(true, true, powered(), 16.5, WIRELESS_RANGE),
             Err(Refusal::OutOfRange {
                 distance: 16.5,
                 range: WIRELESS_RANGE
@@ -1505,9 +1687,9 @@ mod tests {
 
     #[test]
     fn the_range_boundary_itself_is_accepted() {
-        assert_eq!(admit(true, true, 16.0, WIRELESS_RANGE), Ok(()));
-        assert!(admit(true, true, 16.000_1, WIRELESS_RANGE).is_err());
-        assert_eq!(admit(true, true, 0.0, WIRELESS_RANGE), Ok(()));
+        assert_eq!(admit(true, true, powered(), 16.0, WIRELESS_RANGE), Ok(()));
+        assert!(admit(true, true, powered(), 16.000_1, WIRELESS_RANGE).is_err());
+        assert_eq!(admit(true, true, powered(), 0.0, WIRELESS_RANGE), Ok(()));
     }
 
     #[test]
@@ -1546,7 +1728,7 @@ mod tests {
     fn a_creative_range_upgrade_reaches_any_finite_distance() {
         let range = upgraded_range(0, true);
         assert_eq!(range, CREATIVE_RANGE);
-        assert_eq!(admit(true, true, 1_000_000.0, range), Ok(()));
+        assert_eq!(admit(true, true, powered(), 1_000_000.0, range), Ok(()));
         assert_eq!(
             upgraded_range(4, true),
             CREATIVE_RANGE,
@@ -1559,7 +1741,7 @@ mod tests {
         // `WirelessTransmitterNetworkNodeContainer.isValid` checks the dimension
         // before the range, so the creative upgrade cannot cross one.
         assert_eq!(
-            admit(true, false, 1.0, upgraded_range(0, true)),
+            admit(true, false, powered(), 1.0, upgraded_range(0, true)),
             Err(Refusal::DifferentDimension)
         );
     }
@@ -1568,15 +1750,21 @@ mod tests {
     fn a_raised_range_accepts_what_the_base_range_refused() {
         // the differential the in-game leg uses: the same 17.0-block use.
         assert_eq!(
-            admit(true, true, 17.0, upgraded_range(0, false)),
+            admit(true, true, powered(), 17.0, upgraded_range(0, false)),
             Err(Refusal::OutOfRange {
                 distance: 17.0,
                 range: 16
             })
         );
-        assert_eq!(admit(true, true, 17.0, upgraded_range(1, false)), Ok(()));
-        assert_eq!(admit(true, true, 48.0, upgraded_range(4, false)), Ok(()));
-        assert!(admit(true, true, 48.1, upgraded_range(4, false)).is_err());
+        assert_eq!(
+            admit(true, true, powered(), 17.0, upgraded_range(1, false)),
+            Ok(())
+        );
+        assert_eq!(
+            admit(true, true, powered(), 48.0, upgraded_range(4, false)),
+            Ok(())
+        );
+        assert!(admit(true, true, powered(), 48.1, upgraded_range(4, false)).is_err());
     }
 
     #[test]
@@ -2420,6 +2608,188 @@ mod tests {
         assert_eq!(
             machine_readout("Exporter", [41, 64, 17], 4, 1, 0),
             "Exporter at 41,64,17: 4 speed upgrades, 1 stack upgrade, work interval 1 tick, 0 filters"
+        );
+    }
+
+    // --- the network's energy (slice 8) ------------------------------------
+
+    #[test]
+    fn a_transmitter_charges_sixteen_fe_a_tick() {
+        assert_eq!(usage(Kind::WirelessTransmitter, Fit::default(), 0), 16);
+    }
+
+    #[test]
+    fn each_range_upgrade_adds_eight_fe_to_the_transmitters_charge() {
+        let fit = |range| Fit {
+            range,
+            ..Fit::default()
+        };
+        assert_eq!(usage(Kind::WirelessTransmitter, fit(1), 0), 24);
+        assert_eq!(usage(Kind::WirelessTransmitter, fit(4), 0), 48);
+        assert_eq!(
+            usage(Kind::WirelessTransmitter, fit(9), 0),
+            48,
+            "a fifth range upgrade is not counted, as the range rule caps it"
+        );
+        assert_eq!(
+            usage(
+                Kind::WirelessTransmitter,
+                Fit {
+                    range: 4,
+                    creative_range: true,
+                    ..Fit::default()
+                },
+                0
+            ),
+            16,
+            "the creative range upgrade replaces the range fee with its own 0"
+        );
+    }
+
+    #[test]
+    fn a_drive_charges_ten_and_four_for_each_disk() {
+        assert_eq!(usage(Kind::DiskDrive, Fit::default(), 0), 10);
+        assert_eq!(usage(Kind::DiskDrive, Fit::default(), 1), 14);
+        assert_eq!(usage(Kind::DiskDrive, Fit::default(), 9), 46);
+    }
+
+    #[test]
+    fn a_grid_a_machine_a_cable_and_the_controller_charge_their_upstream_rates() {
+        assert_eq!(usage(Kind::Grid, Fit::default(), 0), 10);
+        assert_eq!(usage(Kind::Importer, Fit::default(), 0), 2);
+        assert_eq!(usage(Kind::Exporter, Fit::default(), 0), 2);
+        assert_eq!(usage(Kind::Cable, Fit::default(), 0), 0);
+        assert_eq!(usage(Kind::Controller, Fit::default(), 0), 0);
+    }
+
+    #[test]
+    fn a_machines_upgrades_add_to_its_charge() {
+        let four_speed_and_a_stack = Fit {
+            speed: 4,
+            stack: 1,
+            ..Fit::default()
+        };
+        assert_eq!(
+            usage(Kind::Importer, four_speed_and_a_stack, 0),
+            34,
+            "2 + 4 × 4 + 16"
+        );
+        assert_eq!(
+            usage(
+                Kind::Exporter,
+                Fit {
+                    speed: 1,
+                    ..Fit::default()
+                },
+                0
+            ),
+            6
+        );
+        assert_eq!(
+            usage(
+                Kind::Importer,
+                Fit {
+                    speed: 9,
+                    stack: 4,
+                    ..Fit::default()
+                },
+                0
+            ),
+            34,
+            "a stray stack of upgrades cannot charge past the caps"
+        );
+    }
+
+    #[test]
+    fn a_node_works_only_when_the_network_can_pay_its_charge() {
+        assert!(
+            Energy::new(16, 16).energized(),
+            "exactly its charge is enough"
+        );
+        assert!(!Energy::new(15, 16).energized());
+        assert_eq!(Energy::new(16, 16).draw(), Some(0));
+        assert_eq!(Energy::new(15, 16).draw(), None, "no work, nothing taken");
+    }
+
+    #[test]
+    fn a_tick_takes_exactly_the_charge_and_never_goes_negative() {
+        let mut stored = 100;
+        let mut ticks = 0;
+        while let Some(left) = Energy::new(stored, TRANSMITTER_USAGE).draw() {
+            stored = left;
+            ticks += 1;
+        }
+        assert_eq!(ticks, 6, "100 / 16 is 6 whole ticks");
+        assert_eq!(stored, 4, "the remainder stays (100 - 96)");
+    }
+
+    #[test]
+    fn a_networks_energy_is_the_sum_of_its_controllers() {
+        assert_eq!(bank([400, 600]), CONTROLLER_CAPACITY);
+        assert_eq!(bank([]), 0);
+    }
+
+    #[test]
+    fn the_energy_type_is_the_four_upstream_levels() {
+        assert_eq!(EnergyType::of(1000, 1000), EnergyType::On);
+        assert_eq!(EnergyType::of(400, 1000), EnergyType::On, "40 % is on");
+        assert_eq!(EnergyType::of(399, 1000), EnergyType::NearlyOn);
+        assert_eq!(
+            EnergyType::of(300, 1000),
+            EnergyType::NearlyOn,
+            "30 % is nearly on"
+        );
+        assert_eq!(EnergyType::of(299, 1000), EnergyType::NearlyOff);
+        assert_eq!(
+            EnergyType::of(10, 1000),
+            EnergyType::NearlyOff,
+            "1 % is nearly off"
+        );
+        assert_eq!(EnergyType::of(9, 1000), EnergyType::Off);
+        assert_eq!(EnergyType::of(0, 1000), EnergyType::Off);
+        assert_eq!(EnergyType::of(5, 0), EnergyType::Off, "no capacity is off");
+    }
+
+    #[test]
+    fn the_energy_type_has_the_property_values_the_content_declares() {
+        assert_eq!(EnergyType::Off.property(), "off");
+        assert_eq!(EnergyType::NearlyOff.property(), "nearly_off");
+        assert_eq!(EnergyType::NearlyOn.property(), "nearly_on");
+        assert_eq!(EnergyType::On.property(), "on");
+    }
+
+    #[test]
+    fn no_energy_refuses_a_use_before_the_range_is_asked() {
+        assert_eq!(
+            admit(true, true, Energy::new(0, TRANSMITTER_USAGE), 100.0, 16),
+            Err(Refusal::NoEnergy {
+                stored: 0,
+                usage: TRANSMITTER_USAGE
+            }),
+            "the node is inactive, so the use is refused for energy, not for range"
+        );
+        assert_eq!(
+            Refusal::NoEnergy {
+                stored: 0,
+                usage: 16
+            }
+            .to_string(),
+            "not enough energy: 0 of 16 FE"
+        );
+    }
+
+    #[test]
+    fn a_use_with_energy_still_names_the_range() {
+        assert_eq!(
+            admit(true, true, Energy::new(100, TRANSMITTER_USAGE), 17.0, 16),
+            Err(Refusal::OutOfRange {
+                distance: 17.0,
+                range: 16
+            })
+        );
+        assert_eq!(
+            admit(true, true, Energy::new(16, TRANSMITTER_USAGE), 2.5, 16),
+            Ok(())
         );
     }
 }

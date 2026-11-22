@@ -9,8 +9,8 @@
     "sounds": "minecraft:stone"
   },
   "state_properties": {
-    "energy_type": { "type": "enum", "values": ["off", "on"] }
+    "energy_type": { "type": "enum", "values": ["off", "nearly_off", "nearly_on", "on"] }
   },
-  "default_state": { "energy_type": "on" },
+  "default_state": { "energy_type": "off" },
   "item": true
 }
