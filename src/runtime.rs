@@ -318,6 +318,9 @@ pub enum Refusal {
     /// The transmitter's network cannot pay the transmitter's charge, so the
     /// node is inactive (upstream's `stored >= getEnergyUsage()` gate).
     NoEnergy { stored: u32, usage: u32 },
+    /// The wireless grid item's own buffer cannot pay for the use it is being
+    /// put to (upstream's `ItemEnergyStorage` on the wireless grid).
+    NoItemEnergy { stored: u32, cost: u32 },
     /// The user is further from the transmitter's block than its range.
     OutOfRange { distance: f64, range: u32 },
 }
@@ -329,6 +332,9 @@ impl std::fmt::Display for Refusal {
             Refusal::Offline => write!(f, "the network is offline"),
             Refusal::NoEnergy { stored, usage } => {
                 write!(f, "not enough energy: {stored} of {usage} FE")
+            }
+            Refusal::NoItemEnergy { stored, cost } => {
+                write!(f, "not enough item energy: {stored} of {cost} FE")
             }
             Refusal::OutOfRange { distance, range } => {
                 write!(f, "out of range: {distance:.1} > {range} blocks")
@@ -1357,6 +1363,53 @@ impl EnergyType {
 /// online), so the sum, not the count, is what gates every node.
 pub fn bank(stored: impl IntoIterator<Item = u32>) -> u32 {
     stored.into_iter().sum()
+}
+
+// --- the wireless grid's own buffer (slice 9) ------------------------------
+
+/// What a wireless grid item holds, in FE (upstream
+/// `DefaultEnergyUsage.WIRELESS_GRID_CAPACITY`): the item carries its own
+/// buffer, charged before it is used, so a portable grid is not the network's
+/// battery.
+pub const WIRELESS_GRID_CAPACITY: u32 = 1000;
+
+/// What one use of the wireless grid costs its own buffer (upstream
+/// `DefaultEnergyUsage.WIRELESS_GRID_OPEN`, `WIRELESS_GRID_INSERT` and
+/// `WIRELESS_GRID_EXTRACT`).
+pub const WIRELESS_GRID_OPEN: u32 = 5;
+pub const WIRELESS_GRID_INSERT: u32 = 5;
+pub const WIRELESS_GRID_EXTRACT: u32 = 5;
+
+/// The three things a wireless grid charges its own buffer for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WirelessUse {
+    /// Opening the grid's view.
+    Open,
+    /// A deposit from the player into the network.
+    Insert,
+    /// A withdrawal from the network to the player.
+    Extract,
+}
+
+impl WirelessUse {
+    /// What this use costs: the reference's three constants.
+    pub fn cost(self) -> u32 {
+        match self {
+            WirelessUse::Open => WIRELESS_GRID_OPEN,
+            WirelessUse::Insert => WIRELESS_GRID_INSERT,
+            WirelessUse::Extract => WIRELESS_GRID_EXTRACT,
+        }
+    }
+}
+
+/// The wireless grid's own buffer after `used` is paid for, or a refusal that
+/// names the *item's* energy (upstream's `ItemEnergyStorage`), so a player can
+/// tell an empty grid from an empty network.
+pub fn charge_item(stored: u32, used: WirelessUse) -> Result<u32, Refusal> {
+    let cost = used.cost();
+    Energy::new(stored, cost)
+        .draw()
+        .ok_or(Refusal::NoItemEnergy { stored, cost })
 }
 
 #[cfg(test)]
@@ -2791,5 +2844,70 @@ mod tests {
             admit(true, true, Energy::new(16, TRANSMITTER_USAGE), 2.5, 16),
             Ok(())
         );
+    }
+
+    // --- the wireless grid's own buffer (slice 9) ---------------------------
+
+    #[test]
+    fn each_wireless_grid_use_costs_five_fe() {
+        assert_eq!(
+            charge_item(WIRELESS_GRID_CAPACITY, WirelessUse::Open),
+            Ok(995),
+            "a full grid pays 5 to open"
+        );
+        assert_eq!(
+            charge_item(WIRELESS_GRID_CAPACITY, WirelessUse::Insert),
+            Ok(995),
+            "a deposit pays 5"
+        );
+        assert_eq!(
+            charge_item(WIRELESS_GRID_CAPACITY, WirelessUse::Extract),
+            Ok(995),
+            "a withdrawal pays 5"
+        );
+    }
+
+    #[test]
+    fn the_item_buffer_pays_exactly_and_refuses_below_the_cost() {
+        assert_eq!(
+            charge_item(5, WirelessUse::Open),
+            Ok(0),
+            "exactly the cost is enough"
+        );
+        assert_eq!(
+            charge_item(4, WirelessUse::Insert),
+            Err(Refusal::NoItemEnergy { stored: 4, cost: 5 })
+        );
+        assert_eq!(
+            charge_item(0, WirelessUse::Extract),
+            Err(Refusal::NoItemEnergy { stored: 0, cost: 5 })
+        );
+    }
+
+    #[test]
+    fn the_item_refusal_names_the_items_own_energy_not_the_networks() {
+        let item = Refusal::NoItemEnergy {
+            stored: 0,
+            cost: WIRELESS_GRID_OPEN,
+        }
+        .to_string();
+        let network = Refusal::NoEnergy {
+            stored: 0,
+            usage: TRANSMITTER_USAGE,
+        }
+        .to_string();
+        assert_eq!(item, "not enough item energy: 0 of 5 FE");
+        assert_ne!(
+            item, network,
+            "an empty grid and an empty network must not read alike"
+        );
+    }
+
+    #[test]
+    fn the_wireless_grids_buffer_is_the_reference_capacity_and_costs() {
+        assert_eq!(WIRELESS_GRID_CAPACITY, 1000, "WIRELESS_GRID_CAPACITY");
+        assert_eq!(WirelessUse::Open.cost(), 5, "WIRELESS_GRID_OPEN");
+        assert_eq!(WirelessUse::Insert.cost(), 5, "WIRELESS_GRID_INSERT");
+        assert_eq!(WirelessUse::Extract.cost(), 5, "WIRELESS_GRID_EXTRACT");
     }
 }

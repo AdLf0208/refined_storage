@@ -83,7 +83,9 @@
 # range; SELFTEST=speed asserts the un-upgraded importer moved a stack in
 # 20 ticks and SELFTEST=stack asserts the stack upgrade left the un-upgraded
 # count, so both fail on the working importer; SELFTEST=energy asserts a use
-# with no energy in the network is accepted, so the run fails on the gate.
+# with no energy in the network is accepted, so the run fails on the gate;
+# SELFTEST=itemenergy asserts a deposit at 0 item FE went through, so the run
+# fails on the grid's own gate.
 #
 # Slice 8 (the controller's energy model):
 #  - the controller's buffer is 1,000 FE, its `energy_type` is upstream's four
@@ -95,6 +97,14 @@
 #    with no energy is refused for energy, with energy it names the distance);
 #  - a grid and an importer on a 0-FE network do no work and are dark, while
 #    their disks keep what they hold; charged, both work again.
+#
+# Slice 9 (the wireless grid's own item buffer):
+#  - the grid item holds its own 1,000 FE and pays exactly 5 for the open, 5 for
+#    a deposit and 5 for a withdrawal (read against the server tick its readout
+#    prints; ticks alone cost nothing);
+#  - at 0 item FE the same deposit is refused `not enough item energy: 0 of 5 FE`
+#    while the network stays online and still prints its own energy line, and a
+#    use at 0 opens nothing; charged, both work again.
 set -euo pipefail
 export LC_ALL=C
 
@@ -146,7 +156,12 @@ count_of() { # count_of ITEM
 }
 # Use the held item in the air: `ctl interact` leaves the crosshair on a block,
 # and a use on the transmitter would bind again instead of opening the grid.
-use_held() { ctl look 0 -90 >/dev/null; ctl wait 2; ctl use-item; }
+# Slice 9: the wireless grid is an item with its own 1,000 FE buffer, charged
+# 5 FE per open, and it starts empty — so a use charges it first, as a player's
+# charger would. `use_held_raw` skips that charge (the phase that proves an empty
+# item opens nothing).
+use_held() { charge_grid 1000; ctl look 0 -90 >/dev/null; ctl wait 2; ctl use-item; }
+use_held_raw() { ctl look 0 -90 >/dev/null; ctl wait 2; ctl use-item; }
 # Aim level at a block before right-clicking it (`ctl interact` needs a face of
 # the block visible from where the player stands; `use_held` looks at the sky).
 # Right-click a block with the held item, aiming the crosshair at one of its
@@ -260,6 +275,19 @@ charge() { # charge DIM X Y Z [amount]
 # buffer, so the charge command itself is evidence there.
 charge_ok() { # charge_ok DIM X Y Z [amount]
     expect_reply "execute in $1 run refinedstorage energy $2 $3 $4 ${5:-1000}" "FE"
+}
+# The wireless grid's own buffer (slice 9), the item-side twin of the two above:
+# upstream's grid item is an `ItemEnergyStorage` of 1,000 FE, and the harness has
+# no charger at this pin.
+charge_grid() { # charge_grid [amount]
+    say "refinedstorage charge ${1:-1000}"
+    ctl wait 4
+}
+# The held grid's buffer as `/refinedstorage grid` prints it: STORED CAPACITY
+# TICK (`Wireless grid energy: <stored>/<capacity> FE, t=<server tick>`).
+grid_energy() {
+    reply "refinedstorage grid" \
+        | sed -n 's/.*energy: \([0-9]*\)\/\([0-9]*\) FE, t=\([0-9]*\)$/\1 \2 \3/p'
 }
 # The network the current phase works on, and a top-up for it: every node pays
 # its reference charge per tick (a grid 10, a drive 10 + 4 a disk, a
@@ -812,11 +840,14 @@ ctl command "execute in minecraft:the_end run setblock 46 64 20 refinedstorage:w
 ctl command "execute in minecraft:the_end run setblock 36 64 20 refinedstorage:controller"
 ctl command "execute in minecraft:the_end run tp @s 46.5 64 22.5"
 ctl wait 12
-charge minecraft:the_end 44 64 20 500
+charge minecraft:the_end 44 64 20 1000
 expect_reply "refinedstorage info 44 64 20" "drawing 16/tick"
 # The charge is exact and is measured against the server tick counter the line
 # prints, not against a wall clock: over `t2 - t1` ticks the buffer falls by
-# 16 × that many FE (and the buffer is well above the floor for the window).
+# 16 × that many FE. The window starts **full**: each harness call waits a few
+# ticks and a loaded box stretches that, so a 500 FE top-up once ran dry inside
+# the window (196 -> 4 over 16 ticks, a false red on 2026-11-22); 1,000 FE at
+# 16 a tick covers ~60 ticks, and a node that cannot pay stops at the floor.
 read -r s1 _ t1 <<<"$(energy_of 44 64 20)"
 ctl wait 5
 read -r s2 _ t2 <<<"$(energy_of 44 64 20)"
@@ -1048,7 +1079,7 @@ echo "  bound in range 17: $(reply "refinedstorage bound")"
 charge_net
 use_held
 ctl wait 6
-refusal=$(ctl messages 6 | jq -r '.chat[]' | grep -m1 'Wireless grid' || true)
+refusal=$(ctl messages 8 | jq -r '.chat[]' | grep -m1 'Wireless grid .*: refused' || true)
 echo "  use 17 blocks out: $refusal"
 case "$refusal" in
     *"refused (out of range: 17.0 > 16 blocks)"*) ;;
@@ -1084,7 +1115,7 @@ charge minecraft:the_end 48 64 8
 charge_net
 use_held
 ctl wait 6
-refusal=$(ctl messages 6 | jq -r '.chat[]' | grep -m1 'Wireless grid' || true)
+refusal=$(ctl messages 8 | jq -r '.chat[]' | grep -m1 'Wireless grid .*: refused' || true)
 echo "  use of the End transmitter from the overworld: $refusal"
 case "$refusal" in
     *"refused (different dimension)"*) ;;
@@ -1103,6 +1134,123 @@ ctl screen | jq -e '.screen == "container"' >/dev/null \
     || fail "the same use in the bound dimension did not open the view: $(ctl screen | jq -c '{screen}')"
 charge_net
 expect_slots '[]'
+ctl close
+ctl wait 4
+
+echo "== the wireless grid's own item buffer: 1,000 FE, 5 a use =="
+net minecraft:the_end 48 64 8
+# Slice 9. The grid is an item with its own 1,000 FE buffer (upstream
+# `WIRELESS_GRID_CAPACITY`), charged 5 FE per open, insert and extract
+# (`WIRELESS_GRID_OPEN`/`_INSERT`/`_EXTRACT`). It starts empty, so it is charged
+# the way a charger would: `/refinedstorage charge`, the item-side twin of
+# `/refinedstorage energy` for the network's buffer.
+ctl command "execute in minecraft:the_end run tp @s 50.5 64 10.5"
+ctl wait 6
+charge minecraft:the_end 48 64 8
+charge_net
+expect_reply "refinedstorage grid" "/1000 FE, t="
+expect_reply "refinedstorage charge 1000" "1000/1000 FE"
+read -r g1 _ t1 <<<"$(grid_energy)"
+echo "  item energy: $g1/1000 FE at t=$t1"
+[ "$g1" = 1000 ] || fail "the charged grid reads $g1 FE, expected 1000"
+# Ticks alone cost nothing: unlike the network's nodes, an item's buffer is not
+# drained per tick — its charges are per operation. (The network beside it does
+# fall over the same window; that is the differential.)
+charge minecraft:the_end 48 64 8
+ctl wait 6
+read -r g2 _ t2 <<<"$(grid_energy)"
+echo "  item energy: $g2/1000 FE at t=$t2 ($((t2 - t1)) ticks later)"
+[ "$t2" -gt "$t1" ] || fail "the tick counter did not advance: $t1 -> $t2"
+[ "$g2" = "$g1" ] \
+    || fail "the item's buffer fell $((g1 - g2)) FE over $((t2 - t1)) ticks without a use"
+# The open costs exactly 5.
+charge_net
+use_held_raw
+ctl wait 10
+ctl screen | jq -e '.screen == "container"' >/dev/null \
+    || fail "a charged wireless grid did not open its view"
+read -r g3 _ t3 <<<"$(grid_energy)"
+echo "  item energy: $g3/1000 FE at t=$t3 after the open"
+[ $((g1 - g3)) -eq 5 ] || fail "opening the grid took $((g1 - g3)) FE, expected 5"
+# The deposit costs 5 (the phase above withdrew 5 diamonds into the inventory).
+charge minecraft:the_end 48 64 8
+diamond_slot=$(inv_slot minecraft:diamond)
+[ -n "$diamond_slot" ] || fail "no diamond stack in the wireless grid's player inventory"
+charge_net
+ctl click-slot "$diamond_slot" shift
+ctl wait 10
+read -r g4 _ t4 <<<"$(grid_energy)"
+echo "  item energy: $g4/1000 FE at t=$t4 after the deposit"
+[ $((g3 - g4)) -eq 5 ] || fail "the deposit took $((g3 - g4)) FE of the item's buffer, expected 5"
+charge_net
+expect_slots '[{"slot":300,"item":"minecraft:diamond","count":5}]'
+# The withdrawal costs 5.
+charge minecraft:the_end 48 64 8
+charge_net
+ctl click-slot 300 shift
+ctl wait 10
+read -r g5 _ t5 <<<"$(grid_energy)"
+echo "  item energy: $g5/1000 FE at t=$t5 after the withdrawal"
+[ $((g4 - g5)) -eq 5 ] || fail "the withdrawal took $((g4 - g5)) FE of the item's buffer, expected 5"
+charge_net
+expect_slots '[]'
+[ "$(count_of minecraft:diamond)" = 5 ] \
+    || fail "the withdrawn diamonds are not in the inventory: $(ctl inventory | jq -c '[.hotbar // [], .main // []]')"
+# 0 item FE: the same deposit is refused for the item's energy, while the
+# network stays online and draws from its own buffer.
+expect_reply "refinedstorage charge 0" "0/1000 FE"
+charge minecraft:the_end 48 64 8
+charge_net
+expect_info 49 64 9 "online (4 nodes, 1 controller, 1 drive, 0 grid, 1 transmitter)"
+network_before=$(net_items 49 64 9)
+diamond_slot=$(inv_slot minecraft:diamond)
+charge_net
+ctl click-slot "$diamond_slot" shift
+ctl wait 8
+refusal=$(ctl messages 8 | jq -r '.chat[]' | grep -m1 'refused (not enough item energy' || true)
+echo "  deposit at 0 item FE: $refusal"
+case "$refusal" in
+    *"not enough item energy: 0 of 5 FE"*) ;;
+    *) fail "a deposit at 0 item FE was not refused for the item's energy: '$refusal'" ;;
+esac
+if [ "$SELFTEST" = itemenergy ]; then
+    echo "(selftest: asserting the deposit at 0 item FE went through)"
+    [ "$(count_of minecraft:diamond)" = 0 ] \
+        || fail "expected the 0-FE deposit to have moved the stack, it is still in the inventory"
+fi
+[ "$(count_of minecraft:diamond)" = 5 ] || fail "the refused deposit still left the inventory"
+[ "$(net_items 49 64 9)" = "$network_before" ] \
+    || fail "the network's item count changed on a refused deposit: $network_before -> $(net_items 49 64 9)"
+# The network's own buffer is untouched by the item's emptiness: it is online and
+# its info line still prints the network's energy.
+charge minecraft:the_end 48 64 8
+expect_info 49 64 9 "FE, drawing"
+# A use at 0 item FE opens nothing and names the item's buffer; the same use,
+# charged, opens (the differential for the open's charge).
+ctl close
+ctl wait 4
+expect_reply "refinedstorage charge 0" "0/1000 FE"
+charge minecraft:the_end 48 64 8
+charge_net
+use_held_raw
+ctl wait 6
+refusal=$(ctl messages 8 | jq -r '.chat[]' | grep -m1 'refused (not enough item energy' || true)
+echo "  open at 0 item FE: $refusal"
+case "$refusal" in
+    *"not enough item energy: 0 of 5 FE"*) ;;
+    *) fail "a use at 0 item FE was not refused for the item's energy: '$refusal'" ;;
+esac
+ctl screen | jq -e '.screen != "container"' >/dev/null \
+    || fail "a use at 0 item FE opened the grid's menu"
+expect_reply "refinedstorage charge 1000" "1000/1000 FE"
+charge_net
+use_held_raw
+ctl wait 10
+ctl screen | jq -e '.screen == "container"' >/dev/null \
+    || fail "the same use with the item charged did not open the view"
+read -r g6 _ _ <<<"$(grid_energy)"
+echo "  item energy: $g6/1000 FE after the charged open"
+[ $((1000 - g6)) -eq 5 ] || fail "the open after a full charge took $((1000 - g6)) FE, expected 5"
 ctl close
 ctl wait 4
 
@@ -1143,7 +1291,7 @@ charge minecraft:the_end 48 64 8
 charge_net
 use_held
 ctl wait 10
-opened=$(ctl messages 8 | jq -r '.chat[]' | grep -m1 'Wireless grid' || true)
+opened=$(ctl messages 8 | jq -r '.chat[]' | grep -m1 'Wireless grid .*: opened' || true)
 echo "  use 17 blocks out with the range upgrade: $opened"
 case "$opened" in
     *"opened (17.0 of 24 blocks"*) ;;
@@ -1571,5 +1719,5 @@ expect_slots '[{"slot":300,"item":"minecraft:gold_ingot","count":3}]'
 ctl close
 ctl wait 4
 
-echo "PASS: the wireless transmitter joined its network through the facing side only (offline facing away, active facing the cable), /refinedstorage info named it and its range 16 blocks, a use 2.5 blocks away and one exactly 16 blocks away were accepted, 17 blocks away was refused naming the distance, an offline transmitter refused and a position without one answered so, a use from the End against the overworld transmitter was refused as a different dimension while the same command under execute in was accepted, the item placed against the clicked face and the block dropped itself, every carried recipe crafts in game with its declared output and count (29 now, each with its wrong-ingredient control), the machine casing places, reads back and drops itself, the wireless grid is unbound until it is used on a transmitter and then names it (dimension and position in its own component), a use inside the range opens the network's 9x6 view with 54 slots, a shift-click in the player inventory deposits 5 diamonds on the network and a shift-click on the view withdraws them back, 17 blocks out is refused naming the distance while 16 blocks out opens the view, the same item and binding is refused as a different dimension from the overworld and accepted in the End, the refinedstorage:wireless advancement is not granted by a transmitter alone and is granted by the grid and a transmitter together, two networks in one dimension each listed their own 3 gold while the other network held 3 too, two grids on one network never offered the same items twice, the cable follows its neighbours and the grid is active with a controller, the disk went into the drive and the grid listed what was deposited through its menu, the search filtered it, a shift-click withdrew the diamonds, breaking the controller took the network offline and putting it back restored the disk's gold, a network without a drive listed nothing, a stick did not enter the drive, a vanilla barrel is not a network block, a range upgrade in the transmitter's own upgrade slot raised its range to 24 blocks so the same 17.0-block use was accepted and the wireless grid opened its view naming 24 blocks, the transmitter's four-slot menu showed the upgrade and refused a diamond, a creative range upgrade gave unlimited range (70.5 blocks out accepted, another dimension still refused), the importer turned on its network moved 3 items in 20 ticks without an upgrade and emptied its source in one pass with a stack upgrade (64 in 20 ticks), four speed upgrades made the same 20 ticks move a stack and /refinedstorage info named the upgrade counts and the work interval (9 ticks down to 1), its filter blocked the resource it names while an empty filter imported everything, the exporter moved exactly the 4 gold its filter names into the chest it faces and an exporter with no filter moved nothing, a machine menu showed its 13 slots and its upgrade row refused a diamond, both machine items were given and read back, both machine blocks dropped themselves, and the disk kept its 3 gold across a relaunch"
+echo "PASS: the wireless transmitter joined its network through the facing side only (offline facing away, active facing the cable), /refinedstorage info named it and its range 16 blocks, a use 2.5 blocks away and one exactly 16 blocks away were accepted, 17 blocks away was refused naming the distance, an offline transmitter refused and a position without one answered so, a use from the End against the overworld transmitter was refused as a different dimension while the same command under execute in was accepted, the item placed against the clicked face and the block dropped itself, every carried recipe crafts in game with its declared output and count (29 now, each with its wrong-ingredient control), the machine casing places, reads back and drops itself, the wireless grid is unbound until it is used on a transmitter and then names it (dimension and position in its own component), a use inside the range opens the network's 9x6 view with 54 slots, a shift-click in the player inventory deposits 5 diamonds on the network and a shift-click on the view withdraws them back, 17 blocks out is refused naming the distance while 16 blocks out opens the view, the same item and binding is refused as a different dimension from the overworld and accepted in the End, the refinedstorage:wireless advancement is not granted by a transmitter alone and is granted by the grid and a transmitter together, two networks in one dimension each listed their own 3 gold while the other network held 3 too, two grids on one network never offered the same items twice, the cable follows its neighbours and the grid is active with a controller, the disk went into the drive and the grid listed what was deposited through its menu, the search filtered it, a shift-click withdrew the diamonds, breaking the controller took the network offline and putting it back restored the disk's gold, a network without a drive listed nothing, a stick did not enter the drive, a vanilla barrel is not a network block, a range upgrade in the transmitter's own upgrade slot raised its range to 24 blocks so the same 17.0-block use was accepted and the wireless grid opened its view naming 24 blocks, the transmitter's four-slot menu showed the upgrade and refused a diamond, a creative range upgrade gave unlimited range (70.5 blocks out accepted, another dimension still refused), the importer turned on its network moved 3 items in 20 ticks without an upgrade and emptied its source in one pass with a stack upgrade (64 in 20 ticks), four speed upgrades made the same 20 ticks move a stack and /refinedstorage info named the upgrade counts and the work interval (9 ticks down to 1), its filter blocked the resource it names while an empty filter imported everything, the exporter moved exactly the 4 gold its filter names into the chest it faces and an exporter with no filter moved nothing, a machine menu showed its 13 slots and its upgrade row refused a diamond, both machine items were given and read back, both machine blocks dropped themselves, the wireless grid's own 1,000 FE buffer fell by exactly 5 on the open, 5 on a deposit and 5 on a withdrawal with no drift over ticks, and at 0 item FE the same deposit was refused for the item's energy while the network stayed online and still printed its own energy line, and the disk kept its 3 gold across a relaunch"
 # The cleanup trap prints EXIT:<status> as the last line.

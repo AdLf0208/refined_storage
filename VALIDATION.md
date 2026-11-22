@@ -5,8 +5,8 @@ table of the SDK migration, the deviations, the gap list, and the verification
 tables (the retired `.hnmod` ladder, the SDK-format one, slice 2's red→green
 recipe proof, slice 3's wireless-transmitter red→green and in-game leg, slice
 4's wireless-grid one, slice 5's network-keyed promise table, slice 6's upgrade
-items and the raised range, and slice 7's importer/exporter pair with the speed and stack
-upgrades).
+items and the raised range, slice 7's importer/exporter pair with the speed and stack
+upgrades, and slice 9's wireless-grid item buffer).
 
 Quick reproduction (a build slot is required; see the campaign's AGENTS.md):
 
@@ -35,9 +35,9 @@ The two `check`/`build`/`fits` steps need `BUILD_LOCAL=1` on the slot runner:
 the second build machine has no `cargo-horizon-mod`.
 
 Pin **`0a875da91dbb0fdcb7ba8c42c11341aa229af51a`** + mixins
-`e59da9094f0c2fdda6c627fe9eff22dec6a906f0`. Delivered package (0.2.8):
-`refinedstorage.hmod`, **193,579 B**, SHA-256
-`e755815241995fc2d4dc6123c6feaae24a0130aa6999b5d21d4548b16ecff72a`, 244 entries, no packed
+`e59da9094f0c2fdda6c627fe9eff22dec6a906f0`. Delivered package (0.2.9):
+`refinedstorage.hmod`, **197,142 B**, SHA-256
+`397bb8c0cd23c708b80e0b2b253f85280c89dfbc6a5d991d34d0e98b505d2014`, 244 entries, no packed
 `Cargo.lock`; a copy of the delivered bytes is at
 `ports/_shared/evidence/refinedstorage/refinedstorage.hmod`, which is the file both `fits`
 runs used.
@@ -59,6 +59,7 @@ SELFTEST=range … tools/e2e.sh                                     # flipped ra
 SELFTEST=creative … tools/e2e.sh                                  # flipped creative-range assertion: EXIT:1
 SELFTEST=speed … tools/e2e.sh                                     # flipped importer interval: EXIT:1
 SELFTEST=stack … tools/e2e.sh                                     # flipped importer quota: EXIT:1
+SELFTEST=itemenergy … tools/e2e.sh                                # flipped item-energy gate: EXIT:1
 python3 ../tools/check-e2e-logs.py refinedstorage-e2e --strict
 ```
 
@@ -114,3 +115,10 @@ and 2.5 blocks are accepted; a grid at 0 FE is `active=false` and lists nothing 
 the 3 gold (charged, it lists them); and an importer at 0 FE moves nothing in a 20-tick window that
 moves 3 items once charged. `SELFTEST=energy` inverts the no-energy refusal and exits 1; the
 slice-5 promise rule's `SELFTEST=networks` is re-run and still fails on purpose.
+
+Slice 9's assertions are `notes.md` §"Slice 9": the grid item's own 1,000 FE buffer read twice 17
+ticks apart does not move while the network beside it drains 30 FE a tick; the open, a deposit and a
+withdrawal each cost exactly 5; at 0 item FE the same deposit is refused `not enough item energy: 0 of
+5 FE` while the network stays online with its own energy line, and a use at 0 opens nothing while the
+same use charged opens for 5. `SELFTEST=itemenergy` inverts the 0-FE deposit and exits 1. The
+slice-8 rate window starts full (1,000 FE) after it ran dry under load and produced a false red.

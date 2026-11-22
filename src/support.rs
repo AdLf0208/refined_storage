@@ -19,7 +19,7 @@ use mod_api::item::containers::ModBlockEntityFields;
 use mod_api::{
     self, BlockEntityEvent, BlockEntityPart, BlockEntityTickEvent, BlockEntityTicksEvent, BlockKey,
     BlockPart, BlockState, Command, CommandArgumentValue, CommandInvocation, CommandSource,
-    Component, Compound, ENERGY, Flow, Hand, Host, HostSide, HostTransaction, ITEMS,
+    Component, Compound, ENERGY, Flow, Hand, Host, HostSide, HostTransaction, ITEM_ENERGY, ITEMS,
     InteractionResult, ItemKey, ItemPart, ItemPlace, ItemResource, ItemStack, LevelHost, LevelRef,
     LevelSide, MenuClickedEvent, MenuClosedEvent, MenuContainer, MenuPart, MenuRef, MenuReplace,
     MenuSlotBacking, MenuSlotRulesEvent, ModBlockEntityView, ModContainer, ModEnergyBuffer,
@@ -30,8 +30,8 @@ use mod_api::{
 
 use crate::runtime::{
     self, Binding, CAPACITY_1K, Cursor, DRIVE_SLOTS, Delta, Destination, Disk, EnergyType, Face,
-    Fit, GRID_SLOTS, Kind, Node, Place, Plan, Promises, Region, Stored, ViewKey, extract, insert,
-    network, plan_click, view_with,
+    Fit, GRID_SLOTS, Kind, Node, Place, Plan, Promises, Refusal, Region, Stored, ViewKey,
+    WirelessUse, extract, insert, network, plan_click, view_with,
 };
 
 /// The five content ids of the slice, exactly as the content declares them.
@@ -69,6 +69,9 @@ const COMPONENT: &str = "refinedstorage:storage";
 /// The item component that names the transmitter a wireless grid is bound to
 /// (upstream's `refinedstorage:network_location`, a `GlobalPos`).
 const NETWORK_LOCATION: &str = "refinedstorage:network_location";
+/// The item component a wireless grid keeps its own energy in: upstream's
+/// `ItemEnergyStorage` on the grid item, an int under one component id.
+const ENERGY_COMPONENT: &str = "refinedstorage:energy";
 
 /// The title the wireless grid's menu shows (upstream's `ContentNames.WIRELESS_GRID`).
 const WIRELESS_GRID_TITLE: &str = "Wireless Grid";
@@ -177,6 +180,15 @@ pub(crate) fn register(registrar: &mut dyn Registrar, _cx: &RegistrationContext)
     };
     let _ = KEYS.set(keys);
     registrar.item_part(keys.wireless_grid, WirelessGrid);
+    // The wireless grid's own energy buffer (slice 9): upstream's item is an
+    // `ItemEnergyStorage` of `WIRELESS_GRID_CAPACITY`, charged 5 FE per open,
+    // insert and extract. The buffer is the item's `refinedstorage:energy`
+    // component, answered through the item energy capability (NeoForge's
+    // `Capabilities.Energy.ITEM`), so an FE charger fills the same buffer the
+    // port's own charges drain.
+    registrar.item_capability(&ITEM_ENERGY, WIRELESS_GRID, |_, place| {
+        Some(Box::new(GridBattery(place.clone())))
+    });
     registrar.menu_part(TRANSMITTER_MENU, Upgrades);
     registrar.menu_part(IMPORTER_MENU, MachineSlots);
     registrar.menu_part(EXPORTER_MENU, MachineSlots);
@@ -405,11 +417,12 @@ impl MenuPart for MachineSlots {
     }
 }
 
-/// The disk's item component and the wireless grid's binding (`component_types`,
-/// before content loads).
+/// The disk's, the wireless grid's and the battery's item components
+/// (`component_types`, before content loads).
 pub(crate) fn register_component_types(event: &mut mod_api::ComponentTypesEvent<'_>) {
     event.types.push(COMPONENT.to_owned());
     event.types.push(NETWORK_LOCATION.to_owned());
+    event.types.push(ENERGY_COMPONENT.to_owned());
 }
 
 // --- one item as the network sees it --------------------------------------
@@ -621,6 +634,155 @@ fn bind_grid(
     wrote
 }
 
+// --- the wireless grid's own buffer ---------------------------------------
+
+/// The wireless grid's charge, in its own `refinedstorage:energy` component
+/// (upstream's `ItemEnergyStorage`): a grid carrying none reads empty.
+struct Battery;
+
+impl Component for Battery {
+    type Value = u32;
+
+    fn id(&self) -> &str {
+        ENERGY_COMPONENT
+    }
+
+    fn decode(&self, value: &Tag) -> Option<u32> {
+        match value {
+            Tag::Int(held) => u32::try_from(*held).ok(),
+            _ => None,
+        }
+    }
+
+    fn encode(&self, value: u32) -> Tag {
+        Tag::Int(i32::try_from(value).unwrap_or(i32::MAX))
+    }
+}
+
+/// What the stack holds: its charge, or nothing when it carries none.
+fn battery_of(stack: &ItemStack) -> u32 {
+    stack.get(&Battery).unwrap_or(0)
+}
+
+/// `stack` with its charge set to `energy`.
+fn with_battery(mut stack: ItemStack, energy: u32) -> ItemStack {
+    let _ = stack.set(&Battery, energy);
+    stack
+}
+
+/// The grid's own buffer as the item energy capability answers it (NeoForge's
+/// `Capabilities.Energy.ITEM`, the port's fifth capability), so an FE charger
+/// fills the same component the port's own charges drain.
+struct GridBattery(ItemPlace);
+
+impl mod_api::EnergyHandler for GridBattery {
+    fn amount(&self, host: &mut dyn ServerHost) -> u32 {
+        self.0.stack(host).map_or(0, |stack| battery_of(&stack))
+    }
+
+    fn capacity(&self, _: &mut dyn ServerHost) -> u32 {
+        runtime::WIRELESS_GRID_CAPACITY
+    }
+
+    fn insert(&self, host: &mut dyn ServerHost, tx: &mod_api::Transaction, amount: u32) -> u32 {
+        let held = self.amount(host);
+        let went = amount.min(runtime::WIRELESS_GRID_CAPACITY.saturating_sub(held));
+        match went {
+            0 => 0,
+            went if store_battery(host, tx, &self.0, held + went) => went,
+            _ => 0,
+        }
+    }
+
+    fn extract(&self, host: &mut dyn ServerHost, tx: &mod_api::Transaction, amount: u32) -> u32 {
+        let held = self.amount(host);
+        let came = amount.min(held);
+        match came {
+            0 => 0,
+            came if store_battery(host, tx, &self.0, held - came) => came,
+            _ => 0,
+        }
+    }
+}
+
+/// Put `energy` into the stack at `place`, in `tx`: whether it went.
+///
+/// A **held** grid is rewritten through the player's own slot, as a binding is
+/// (`bind_grid`). An exchange of the hand is not interchangeable with it: in
+/// creative a hand's extract gives without losing the stack, so `exchange`
+/// leaves the old, uncharged grid in the hand and puts the charged one in the
+/// inventory — measured in this slice's first leg, and the reason the SDK's
+/// stock `ItemComponentEnergy` cannot charge a held grid. Every other place is
+/// a container slot, whose exchange is the right write.
+fn store_battery(
+    host: &mut dyn ServerHost,
+    tx: &mod_api::Transaction,
+    place: &ItemPlace,
+    energy: u32,
+) -> bool {
+    let Some(stack) = place.stack(host) else {
+        return false;
+    };
+    let changed = with_battery(stack, energy);
+    match place {
+        ItemPlace::PlayerHand { player, hand } => {
+            let (uuid, hand) = (*player, *hand);
+            let Some(player) = host.player(uuid) else {
+                return false;
+            };
+            let Some(slot) = held_slot(host, &player, hand) else {
+                return false;
+            };
+            host.transaction(|host, _tx| {
+                player.set_inventory_slot(host, slot, Some(changed.clone()))
+            })
+            .is_ok()
+        }
+        _ => place.exchange(host, tx, &ItemResource::of(&changed), 1) == 1,
+    }
+}
+
+/// The grid's own buffer, read through the item energy capability the same way
+/// a write goes: `(stored, capacity)`, or none where the held item is not a
+/// wireless grid (the port answers `ITEM_ENERGY` for that item only).
+fn grid_energy(host: &mut dyn ServerHost, uuid: u128, hand: Hand) -> Option<(u32, u32)> {
+    let place = ItemPlace::PlayerHand { player: uuid, hand };
+    let handler = place.capability(host, &ITEM_ENERGY)?;
+    Some((handler.amount(host), handler.capacity(host)))
+}
+
+/// Pay `used` from the held wireless grid's own buffer, inside a transaction
+/// through the item's capability: how much is left, or the refusal that names
+/// the item's energy. A grid whose buffer cannot pay does the use not at all,
+/// which is upstream's gate on an item's storage (`stored >= getEnergyUsage()`).
+fn pay_grid(
+    host: &mut dyn ServerHost,
+    uuid: u128,
+    hand: Hand,
+    used: WirelessUse,
+) -> Result<u32, Refusal> {
+    let cost = used.cost();
+    let place = ItemPlace::PlayerHand { player: uuid, hand };
+    let Some(handler) = place.capability(host, &ITEM_ENERGY) else {
+        // Not a wireless grid (or no buffer): nothing to pay from.
+        return Err(Refusal::NoItemEnergy { stored: 0, cost });
+    };
+    let stored = handler.amount(host);
+    let left = runtime::charge_item(stored, used)?;
+    let took = host
+        .transaction(|host, tx| {
+            Ok::<u32, mod_api::PlayerDataRefusal>(handler.extract(host, tx, cost))
+        })
+        .unwrap_or(0);
+    if took == cost {
+        Ok(left)
+    } else {
+        // The item could not be rewritten (a stack of one in a read-only place):
+        // the use does not happen either, so the gate and the charge agree.
+        Err(Refusal::NoItemEnergy { stored, cost })
+    }
+}
+
 // --- the wireless grid item ------------------------------------------------
 
 /// The wireless grid: bind it on a transmitter, use it to open that network's
@@ -663,7 +825,7 @@ impl ItemPart for WirelessGrid {
         let HostSide::Server(host) = host else {
             return Some(InteractionResult::Success);
         };
-        open_wireless_grid(host, event.player, event.stack);
+        open_wireless_grid(host, event.player, event.stack, event.hand);
         Some(InteractionResult::Success)
     }
 }
@@ -678,8 +840,10 @@ fn held_slot(host: &dyn Host, player: &mod_api::PlayerRef, hand: Hand) -> Option
 }
 
 /// The resolve a wireless grid's use makes, and what it does with it: the
-/// bound transmitter's network, or the reason the use is refused.
-fn open_wireless_grid(host: &mut dyn ServerHost, uuid: u128, stack: &ItemStack) {
+/// bound transmitter's network, or the reason the use is refused. A successful
+/// resolve then pays the item's own 5 FE for the open (slice 9): the grid is an
+/// item with a buffer of its own, and an empty one opens nothing.
+fn open_wireless_grid(host: &mut dyn ServerHost, uuid: u128, stack: &ItemStack, hand: Hand) {
     let Some(binding) = binding_of(stack) else {
         tell(
             host,
@@ -729,7 +893,17 @@ fn open_wireless_grid(host: &mut dyn ServerHost, uuid: u128, stack: &ItemStack) 
     let charge = runtime::usage(Kind::WirelessTransmitter, fit, 0);
     let energy = runtime::Energy::new(stored_in(host, level, &net), charge);
     match runtime::admit(online, here == binding.dimension(), energy, distance, range) {
-        Ok(()) => show_wireless_grid(host, uuid, &binding, level, distance, range),
+        Ok(()) => match pay_grid(host, uuid, hand, WirelessUse::Open) {
+            Ok(_) => show_wireless_grid(host, uuid, &binding, level, distance, range, hand),
+            Err(refusal) => tell(
+                host,
+                uuid,
+                &format!(
+                    "Wireless grid {}: refused ({refusal}).",
+                    binding_name(&binding)
+                ),
+            ),
+        },
         Err(refusal) => tell(
             host,
             uuid,
@@ -761,6 +935,7 @@ fn show_wireless_grid(
     level: LevelRef,
     distance: f64,
     range: u32,
+    hand: Hand,
 ) {
     // Open empty and let the refresh fill it: one place computes the view.
     let items: Vec<Option<ItemStack>> = vec![None; GRID_SLOTS];
@@ -781,6 +956,7 @@ fn show_wireless_grid(
             OpenGrid {
                 binding: binding.clone(),
                 view: items,
+                hand,
             },
         );
     });
@@ -902,11 +1078,13 @@ fn promises_elsewhere(net: &runtime::Network, dimension: &str, place: Place) -> 
     with_core(|core| core.promises.promised_elsewhere(&key))
 }
 
-/// A wireless grid's open menu: its binding and what it currently shows.
+/// A wireless grid's open menu: its binding, what it currently shows and the
+/// hand the grid is in (its own energy is paid from that item).
 #[derive(Clone, Debug)]
 struct OpenGrid {
     binding: Binding,
     view: Vec<Option<ItemStack>>,
+    hand: Hand,
 }
 
 /// A click in a wireless grid's menu: what the click asks for, applied to the
@@ -948,6 +1126,27 @@ pub(crate) fn on_menu_clicked(host: &mut dyn ServerHost, event: &MenuClickedEven
         u8::from(event.button == 1),
         event.mode == 1,
     );
+    // A click that moves items into or out of the network pays the grid's own
+    // 5 FE first (upstream's `WIRELESS_GRID_INSERT`/`_EXTRACT`): an empty grid
+    // moves nothing, and says why, while the network keeps its own buffer.
+    let used = match plan {
+        Plan::Withdraw { .. } => Some(WirelessUse::Extract),
+        Plan::Deposit { .. } => Some(WirelessUse::Insert),
+        _ => None,
+    };
+    if let Some(used) = used
+        && let Err(refusal) = pay_grid(host, uuid, open.hand, used)
+    {
+        tell(
+            host,
+            uuid,
+            &format!(
+                "Wireless grid {}: refused ({refusal}).",
+                binding_name(&binding)
+            ),
+        );
+        return;
+    }
     let click = Click {
         player: uuid,
         menu,
@@ -2470,6 +2669,15 @@ pub(crate) fn on_register_commands(event: &mut RegisterCommandsEvent<'_>) {
     event.commands.push(Command::new(
         "refinedstorage energy <pos:block_pos> <amount:integer>",
     ));
+    // The wireless grid's own buffer, read back from the item's component, and
+    // filled through the item's energy capability the way an FE charger would
+    // (upstream's grid item is an `ItemEnergyStorage`; the harness has no
+    // charger at this pin). Two recorded harness/behaviour additions, twins of
+    // `/refinedstorage energy` for the network's buffer.
+    event.commands.push(Command::new("refinedstorage grid"));
+    event
+        .commands
+        .push(Command::new("refinedstorage charge <amount:integer>"));
 }
 
 /// The `/refinedstorage` commands' bodies (`run_mod_command`).
@@ -2485,6 +2693,18 @@ pub(crate) fn on_run_mod_command(
     }
     if sub == "bound" {
         bound(host, event.source);
+        return Flow::Cancel;
+    }
+    if sub == "grid" {
+        grid_buffer(host, event.source);
+        return Flow::Cancel;
+    }
+    if sub == "charge" {
+        let Some(CommandArgumentValue::Integer(amount)) = event.command.argument("amount") else {
+            feedback(host, "Usage: /refinedstorage charge <amount>");
+            return Flow::Cancel;
+        };
+        charge_grid(host, event.source, u32::try_from(*amount).unwrap_or(0));
         return Flow::Cancel;
     }
     if sub == "energy" {
@@ -2569,6 +2789,91 @@ fn bound(host: &mut dyn ServerHost, source: &CommandSource) {
             &format!("Wireless grid bound to {}.", binding_name(&binding)),
         ),
         None => feedback(host, "The wireless grid is not bound."),
+    }
+}
+
+/// The body of `/refinedstorage grid`: the held wireless grid's own buffer,
+/// read from the item's `refinedstorage:energy` component through the same
+/// capability a charge goes through, with the server tick the reading was taken
+/// at (so a fall can be checked against ticks, not a wall clock).
+fn grid_buffer(host: &mut dyn ServerHost, source: &CommandSource) {
+    let Some(uuid) = player_of(host, source, "Only a player holds a wireless grid.") else {
+        return;
+    };
+    let place = ItemPlace::PlayerHand {
+        player: uuid,
+        hand: Hand::Main,
+    };
+    let Some(stack) = place.stack(host) else {
+        feedback(host, "No item in the main hand.");
+        return;
+    };
+    if stack.item() != keys().wireless_grid {
+        feedback(host, "The item in the main hand is not a wireless grid.");
+        return;
+    }
+    let Some((stored, capacity)) = grid_energy(host, uuid, Hand::Main) else {
+        feedback(host, "The wireless grid has no energy buffer.");
+        return;
+    };
+    let ticks = with_core(|core| core.ticks);
+    feedback(
+        host,
+        &format!("Wireless grid energy: {stored}/{capacity} FE, t={ticks}"),
+    );
+}
+
+/// The body of `/refinedstorage charge <amount>`: bring the held wireless
+/// grid's own buffer to `amount` FE through the item energy capability — an
+/// insert the way a charger fills it, an extract the way a use drains it.
+fn charge_grid(host: &mut dyn ServerHost, source: &CommandSource, amount: u32) {
+    let Some(uuid) = player_of(host, source, "Only a player holds a wireless grid.") else {
+        return;
+    };
+    let place = ItemPlace::PlayerHand {
+        player: uuid,
+        hand: Hand::Main,
+    };
+    let Some(handler) = place.capability(host, &ITEM_ENERGY) else {
+        feedback(host, "The item in the main hand is not a wireless grid.");
+        return;
+    };
+    let before = handler.amount(host);
+    let capacity = handler.capacity(host);
+    let target = amount.min(capacity);
+    let insert = target.saturating_sub(before);
+    let extract = before.saturating_sub(target);
+    let _ = host
+        .transaction(|host, tx| {
+            let put = if insert > 0 {
+                handler.insert(host, tx, insert)
+            } else {
+                0
+            };
+            let got = if extract > 0 {
+                handler.extract(host, tx, extract)
+            } else {
+                0
+            };
+            Ok::<(u32, u32), mod_api::PlayerDataRefusal>((put, got))
+        })
+        .unwrap_or((0, 0));
+    let after = handler.amount(host);
+    feedback(
+        host,
+        &format!("Wireless grid energy: {after}/{capacity} FE (was {before})"),
+    );
+}
+
+/// The acting player a command's body needs, or a feedback line saying why it
+/// has none.
+fn player_of(host: &mut dyn ServerHost, source: &CommandSource, why_not: &str) -> Option<u128> {
+    match source {
+        CommandSource::Player { player, .. } => Some(player.uuid()),
+        _ => {
+            feedback(host, why_not);
+            None
+        }
     }
 }
 

@@ -19,12 +19,13 @@ the network; no entities, renderers, dimensions or new vanilla hooks.
 Ported now because it is the **#1 core base** of the core-first queue: 13
 pending ATM10 mods depend on it (`ports/tools/port_queue.py`).
 
-Status: **slice 7 — the importer and the exporter (0.2.7)** — the network core of slice 1, the
+Status: **slice 9 — the wireless grid's own item buffer (0.2.9)** — the network core of slice 1, the
 crafting chain of slice 2, the finite-range, same-dimension transmitter of slice 3, the item that
 asks its admission (slice 4), the promise table keyed by network (slice 5), the transmitter's four
-upgrade slots with the range and creative range upgrades (slice 6), and now the two transfer
-machines: a filter, four upgrade slots, a work tick and a menu each, with the speed and stack
-upgrades they make real. Everything else is the gap list below, not a claim.
+upgrade slots with the range and creative range upgrades (slice 6), the two transfer machines with
+the speed and stack upgrades (slice 7), the network's energy model (slice 8), and now the grid item's
+own 1,000 FE buffer: 5 FE per open, per deposit and per withdrawal, through the item energy
+capability. Everything else is the gap list below, not a claim.
 
 > The sections from `## Behaviour` to `### Verification after the repairs`
 > describe the **retired `.hnmod`** layout. They are kept as history: the
@@ -1974,7 +1975,8 @@ controller) from `NoEnergy` (a controller whose buffer cannot pay).
    per open/insert/extract (`WIRELESS_GRID_CAPACITY`, `WIRELESS_GRID_OPEN`); that is the *item* energy
    capability (`item_energy_buffer`), a separate family from the network's, and it waits for a slice
    that also carries the portable grid. The network-side gate it depends on (`stored > 0`) is covered
-   by the transmitter's charge.
+   by the transmitter's charge. **(Done in slice 9, 0.2.9:** the 1,000 FE buffer and the three 5 FE
+   charges, through the item energy capability; §"Slice 9".)
 3. **No `isEnergyRequired` switch and no creative controller.** The pin has no config API at this tier
    (`blocked(no-config-api)`), so an empty network is always gated; the creative controller
    (`InfiniteEnergyHandler`, no recipe) is not shipped.
@@ -2095,3 +2097,214 @@ Evidence: `ports/_shared/evidence/refinedstorage/` — `plan-slice8-energy.md`,
 `refinedstorage.hmod` (the delivered bytes) — and `ports/_shared/evidence/refinedstorage-e2e/` —
 `e2e-slice8-energy.log` (green), `e2e-slice8-control.log`, `e2e-slice8-selftest.log`,
 `e2e-slice8-selftest-energy.log`, `e2e-slice8-selftest-networks.log`.
+
+## Slice 9 — the wireless grid's own item buffer (2026-11-22) — version 0.2.9
+
+Gap line this slice answers — §"Slice 8" → "Coverage (parity rule)", verbatim: *"the wireless grid's own
+item buffer (1000 FE, 5/open) | **not ported** — item energy (`item_energy_buffer`) is a separate
+family; deviation 2"*, and deviation 2 itself: *"Upstream gives the item 1000 FE and charges 5 per
+open/insert/extract (`WIRELESS_GRID_CAPACITY`, `WIRELESS_GRID_OPEN`)."* The slice-8 report named it next
+for that reason: it is the item half of the energy model slice 8 built for the network.
+
+Pin **`0a875da91dbb0fdcb7ba8c42c11341aa229af51a`**, mixins
+`e59da9094f0c2fdda6c627fe9eff22dec6a906f0`, SDK `0a875da`, launcher 0.2.92, game 26.3. Class
+`content` / tier **deep**, shape **machines**, unchanged: one item capability, one item component,
+one pure cost rule and one gate on the open and on each moving click are below the tier. No new
+content id and no third-party mod.
+
+### The reference (upstream `refinedmods/refinedstorage2` v2.0.9, MIT, `DefaultEnergyUsage`)
+
+| constant | value |
+|---|---|
+| `WIRELESS_GRID_CAPACITY` | 1000 FE |
+| `WIRELESS_GRID_OPEN` | 5 FE |
+| `WIRELESS_GRID_INSERT` | 5 FE |
+| `WIRELESS_GRID_EXTRACT` | 5 FE |
+
+Recorded by slice 8's read of the same file (§"Slice 8", the `WIRELESS_TRANSMITTER` row and deviation 2);
+this slice implements it, and the brief asserts the same four values.
+
+### What was implemented
+
+- **runtime.rs** (tests first): `WIRELESS_GRID_CAPACITY`, `WIRELESS_GRID_OPEN`/`_INSERT`/`_EXTRACT`;
+  `WirelessUse { Open, Insert, Extract }` with `cost()`; `charge_item(stored, use)` — the buffer after
+  paying, or `Refusal::NoItemEnergy { stored, cost }`, whose `Display` is **`not enough item energy:
+  {stored} of {cost} FE`**, deliberately distinct from the network's `not enough energy: …`.
+- **support.rs**: the grid's charge lives in the item's own `refinedstorage:energy` component (a
+  `Component` impl, as the binding is); the item energy capability (`mod_api::ITEM_ENERGY`, NeoForge's
+  `Capabilities.Energy.ITEM`, the port's **fifth** capability) is registered for
+  `refinedstorage:wireless_grid` with `GridBattery`, whose writes go through the player's own slot;
+  `pay_grid` is the gate plus the charge, in one transaction through the capability; the open pays
+  `WirelessUse::Open` before the menu is opened, and a menu click that moves items pays
+  `Insert`/`Extract` **before** it moves anything (a click that moves nothing is free); two commands,
+  `/refinedstorage grid` (the readout, with the server tick) and `/refinedstorage charge <amount>`
+  (the item-side twin of `/refinedstorage energy`).
+- **Content**: none — the buffer is a data component of an item that already ships.
+
+### Port defect fixed (found by this slice's first in-game leg)
+
+**A held item cannot be charged through `ItemPlace::exchange` in creative.** The first cut used the
+SDK's stock `ItemComponentEnergy` (NeoForge's `ItemAccessEnergyHandler`), which rewrites the item with
+`place.exchange(host, tx, &changed, 1)`. In creative a hand's *extract* gives without losing the stack,
+so the exchange left the old, uncharged grid in the hand and put a charged copy in the inventory: the
+command answered `0/1000 FE (was 0)` while the hand's component stayed absent (measured in
+`e2e-slice9-green.log`'s first run, `charge 1000` → `Wireless grid energy: 0/1000 FE (was 0)`). The
+port now writes the changed stack through the player's own slot (`player.set_inventory_slot`, the path
+`bind_grid` has used since slice 4, which the same leg proves), and keeps `exchange` only for places
+that are container slots. A user notices that charging a held grid works in creative and survival
+alike, and that no second grid appears.
+
+### Harness defect fixed while proving it (not the mod's)
+
+**The slice-8 rate window could run dry.** `== the controller's energy model ==` topped the transmitter
+network up to 500 FE and then measured `stored₁ - stored₂ = 16 × (t₂ - t₁)` over a window whose harness
+calls each wait a few ticks; on a loaded box the window stretched past 500/16 ticks and the buffer hit
+its floor, so a correct 16 FE/tick read as `192 FE over 16 ticks` and failed (`SELFTEST=itemenergy`'s
+first run, 2026-11-22). The window now starts **full** (1,000 FE, ~60 ticks at 16), so the assertion
+measures the rate instead of the margin. No behaviour changed.
+
+### Red proof — the rules as tests, before the implementation
+
+Written against stubs (`cost()` answered 0, `charge_item` answered `Ok(stored)`, and the new refusal's
+`Display` copied the network's wording), then run: **4 failed of 93**
+(`ports/_shared/evidence/refinedstorage/runtime-red-slice9-item-energy.log`):
+
+```
+---- runtime::tests::each_wireless_grid_use_costs_five_fe stdout ----
+
+thread 'runtime::tests::each_wireless_grid_use_costs_five_fe' (3756071) panicked at src/runtime.rs:2847:9:
+assertion `left == right` failed: a full grid pays 5 to open
+  left: Ok(1000)
+ right: Ok(995)
+
+---- runtime::tests::the_item_buffer_pays_exactly_and_refuses_below_the_cost stdout ----
+
+thread 'runtime::tests::the_item_buffer_pays_exactly_and_refuses_below_the_cost' (3756089) panicked at src/runtime.rs:2866:9:
+assertion `left == right` failed: exactly the cost is enough
+  left: Ok(5)
+ right: Ok(0)
+
+---- runtime::tests::the_item_refusal_names_the_items_own_energy_not_the_networks stdout ----
+
+thread 'runtime::tests::the_item_refusal_names_the_items_own_energy_not_the_networks' (3756090) panicked at src/runtime.rs:2893:9:
+assertion `left == right` failed
+  left: "not enough energy: 0 of 5 FE"
+ right: "not enough item energy: 0 of 5 FE"
+
+---- runtime::tests::the_wireless_grids_buffer_is_the_reference_capacity_and_costs stdout ----
+
+thread 'runtime::tests::the_wireless_grids_buffer_is_the_reference_capacity_and_costs' (3756096) panicked at src/runtime.rs:2903:9:
+assertion `left == right` failed: WIRELESS_GRID_OPEN
+  left: 0
+ right: 5
+
+test result: FAILED. 89 passed; 4 failed; 0 ignored; 0 measured; 0 filtered out
+```
+
+Green after the rules: **93 passed, 0 failed** (`sdk-test.log`). The four new tests are
+`each_wireless_grid_use_costs_five_fe`, `the_item_buffer_pays_exactly_and_refuses_below_the_cost`,
+`the_item_refusal_names_the_items_own_energy_not_the_networks` and
+`the_wireless_grids_buffer_is_the_reference_capacity_and_costs`.
+
+`src/runtime.rs` gains this slice's rule and its four tests (its byte-identical copy of the migration's
+file ended at slice 3; slices 4–9 each added a rule with its tests). Everything it already carried —
+the network, the disks, the view, the promise table, the transfer rules, the network energy model —
+is untouched and still green, and the package carries the current file (`verify-sdk-package.py`:
+`runtime byte-identical`).
+
+### Green — the ladder and the in-game leg (one launcher build at `0a875da`)
+
+| Step | Command | Result |
+|---|---|---|
+| runtime + glue tests | `cargo test --offline` | **93 passed**, 0 failed (`sdk-test.log`) |
+| lints | `cargo clippy --all-targets --offline -- -D warnings` | exit 0, **0 warnings** (`sdk-clippy.log`) |
+| formatting | `rustfmt --edition 2024 --check src/{lib,support,runtime}.rs` | clean, `FMT_EXIT:0` (`sdk-fmt.log`) |
+| SDK check | `cargo horizon-mod check` | *"…585 items of the API (5 Part kinds, 1 associated item, **5 capabilitys**, 20 hooks …). Made for 0a875da."* (`sdk-check-fits-0.2.9.log`) |
+| package | `rm -f Cargo.lock && cargo horizon-mod build` ×2 | **byte-identical** (`cmp`), **197,142 B**, SHA-256 `397bb8c0cd23c708b80e0b2b253f85280c89dfbc6a5d991d34d0e98b505d2014`, **244 entries**, no `Cargo.lock` (`sdk-build-0.2.9-{1,2}.log`, `sdk-build-0.2.9-cmp.log`) |
+| package check | `cargo horizon-mod check refinedstorage.hmod` | `0.2.9 (native-mod, format native-1/0a875da…/e59da909…, for 26.3) 197142 bytes` |
+| fits (pin) | `… fits refinedstorage.hmod --build 0a875da` | *"0a875da  made for"*, `FITS_PIN_EXIT:0` |
+| fits (other build) | `… fits refinedstorage.hmod --build 0b14f8a` | *"0b14f8a  fits"*, `FITS_OTHER_EXIT:0` (both after `sha256sum refinedstorage.hmod` printed `397bb8c0…`, `sdk-check-fits-0.2.9.log`) |
+| launcher build | `launcher-game.sh build refinedstorage --rebuild` | exit 0, **`Compiling refinedstorage (1 of 1)`**, `native-0a875da-a3aab5050286` (`launcher-build-0.2.9.log`) |
+| in-game leg | `launcher-game.sh run refinedstorage` | **PASS** + **`EXIT:0`** (`e2e-slice9-green.log`) |
+| control (same Nightly, no package) | `GAME=$CONTROL_GAME …` | **FAIL** + **`EXIT:1`** — *"the block at 41,64,1 is minecraft:air, expected facing=north"* |
+| selftest (flipped item gate) | `SELFTEST=itemenergy …` | **FAIL** + **`EXIT:1`** — *"expected the 0-FE deposit to have moved the stack, it is still in the inventory"* |
+| selftest (the slice-8 network gate) | `SELFTEST=energy …` | **FAIL** + **`EXIT:1`** — *"… got 'Wireless access at 46,64,20: refused (not enough energy: 0 of 16 FE)'"* |
+| selftest (the slice-5 promise rule) | `SELFTEST=networks …` | **FAIL** + **`EXIT:1`** — *"the grid's view is [{count 3 gold}], expected []"* |
+| log gate | `check-e2e-logs.py refinedstorage-e2e --strict` | `logs=41 ok=41 missing-exit=0 bad-exit=0` |
+| package gate | `verify-sdk-package.py refinedstorage` | **1/1** |
+
+The new phase, quoted from `e2e-slice9-green.log` (the slice-4/5 network at 48..50,64,8, the drive at
+49,64,9, the player at 50.5,64,10.5 inside the transmitter's range):
+
+```
+== the wireless grid's own item buffer: 1,000 FE, 5 a use ==
+  /refinedstorage grid -> Wireless grid energy: 995/1000 FE, t=7600
+  /refinedstorage charge 1000 -> Wireless grid energy: 1000/1000 FE (was 995)
+  item energy: 1000/1000 FE at t=7614
+  item energy: 1000/1000 FE at t=7631 (17 ticks later)
+  item energy: 995/1000 FE at t=7660 after the open
+  item energy: 990/1000 FE at t=7689 after the deposit
+  grid view: [{"count":5,"item":"minecraft:diamond","slot":300}]
+  item energy: 985/1000 FE at t=7723 after the withdrawal
+  grid view: []
+  /refinedstorage charge 0 -> Wireless grid energy: 0/1000 FE (was 985)
+  info(49,64,9): Refined Storage network at 49,64,9: online (4 nodes, 1 controller, 1 drive, 0 grid, 1 transmitter); 1 disks, 0 items in 0 resources; energy 844/1000 FE, drawing 30/tick, t=7754
+  deposit at 0 item FE: Wireless grid 50,64,8 in minecraft:the_end: refused (not enough item energy: 0 of 5 FE).
+  info(49,64,9): Refined Storage network at 49,64,9: online (4 nodes, 1 controller, 1 drive, 0 grid, 1 transmitter); 1 disks, 0 items in 0 resources; energy 792/1000 FE, drawing 30/tick, t=7798
+  /refinedstorage charge 0 -> Wireless grid energy: 0/1000 FE (was 0)
+  open at 0 item FE: Wireless grid 50,64,8 in minecraft:the_end: refused (not enough item energy: 0 of 5 FE).
+  /refinedstorage charge 1000 -> Wireless grid energy: 1000/1000 FE (was 0)
+  item energy: 995/1000 FE after the charged open
+```
+
+Every assertion has its differential or counterfactual: the buffer is read twice **17 ticks apart with
+no use and does not move** (the network beside it falls 30 FE a tick over the same window — the
+per-tick charge is the network's, not the item's); the open, the deposit and the withdrawal each cost
+exactly 5; at 0 item FE the *same* deposit is refused for the item's energy while the network's info
+line still answers `online … energy 844/1000 FE, drawing 30/tick` (two buffers, two sentences); the
+same use at 0 FE opens no menu, and the same use after `charge 1000` opens and costs 5;
+`SELFTEST=itemenergy` asserts the 0-FE deposit went through and fails.
+
+### Harness facts learned here
+
+- **A fresh wireless grid is empty.** The component is absent until charged, so any leg that uses the
+  grid must charge it first: `use_held` now does (`charge_grid 1000`), and the phases that use the
+  vendored `refinedstorage wireless` command (the rule without the item) are unaffected.
+- **The network beside a slow assertion drains.** `reply`/`info` each wait ~4 ticks, so a 1,000 FE
+  network loses ~30 FE a tick while a phase reads its readouts. Every action in this phase tops the
+  network up immediately before it (`charge_net`); the first version of the phase let it reach 2 FE and
+  the use was refused *for the network*, which is exactly the confusion the two-word distinction
+  (`not enough energy` vs `not enough item energy`) exists to expose.
+- **`ctl select <item>` while a container menu is open is not a no-op** (the probe's reply lost its
+  `screen` field); a phase that reselects the held grid must close the menu first.
+- `ctl state`'s `held` prints the stack's components as SNBT and is the cheapest way to see that a
+  written component landed on the item in the hand
+  (`{"refinedstorage:energy":1000,"refinedstorage:network_location":{…}}`).
+
+### Coverage (parity rule) — every family this slice ships
+
+| family | state |
+|---|---|
+| the grid's own buffer (1,000 FE) | **tested** — `/refinedstorage charge` fills it through the item capability (readout `1000/1000 FE (was 0)`), `/refinedstorage grid` reads it back with the server tick, and it does not drift over ticks |
+| the open's 5 FE | **tested** — 1000 → 995 on a use, and the same use after a full charge → 995 |
+| the deposit's 5 FE | **tested** — a shift-click on an inventory slot: 995 → 990, the view and `info` showing the 5 diamonds |
+| the withdrawal's 5 FE | **tested** — a shift-click on the view: 990 → 985, the view empty and the inventory back to 5 |
+| the item's gate | **tested** — at 0 FE the same deposit is refused `not enough item energy: 0 of 5 FE` (the stack stays, the network's count unchanged) and a use opens nothing; `SELFTEST=itemenergy` inverts the deposit |
+| the item energy capability | **tested** — every charge, every payment and both commands go through `ITEM_ENERGY`/`EnergyHandler`; the SDK check counts it (`5 capabilitys`) |
+| the `refinedstorage:energy` component | **tested** — written on the hand's stack (read back by `ctl state`), and a stack carrying none reads empty |
+| `/refinedstorage grid`, `/refinedstorage charge` | **tested** — every readout above is their parsed reply (a recorded harness/behaviour addition, twins of `/refinedstorage energy`) |
+| charging the grid in a creative hand | **tested** — the whole leg runs in creative, which is what found the exchange defect |
+| a charger block that fills a grid (upstream's charger) | **not ported** — this package has no charger; the capability is registered, so such a block would fill the same component, but no block of this port fills it |
+| the portable grid, the crafting/pattern grids | **not ported** — the next slices (see the report's `## Next slice`) |
+| the rest of slice-8's list (creative controller, `isEnergyRequired`, the controller's gauge) | **unchanged** — still not ported, §"Slice 8" |
+
+Skills: superpowers/using-superpowers,brainstorming,writing-plans,test-driven-development,systematic-debugging,verification-before-completion; BeautifulRust/rust-best-practices
+
+Evidence: `ports/_shared/evidence/refinedstorage/` — `plan-slice9-item-energy.md`,
+`runtime-red-slice9-item-energy.log`, `sdk-test.log`, `sdk-clippy.log`, `sdk-fmt.log`,
+`sdk-build-0.2.9-{1,2}.log`, `sdk-build-0.2.9-cmp.log`, `sdk-check-fits-0.2.9.log`,
+`refinedstorage.hmod` (the delivered bytes) — and `ports/_shared/evidence/refinedstorage-e2e/` —
+`e2e-slice9-green.log` (green), `e2e-slice9-control.log`, `e2e-slice9-selftest-itemenergy.log`,
+`e2e-slice9-selftest-energy.log`, `e2e-slice9-selftest-networks.log`, and
+`launcher-build-0.2.9.log` (`Compiling refinedstorage (1 of 1)`, `native-0a875da-a3aab5050286` — the
+build every leg ran on).
