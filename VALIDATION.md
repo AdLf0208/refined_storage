@@ -4,8 +4,9 @@ The port's own record is [notes.md](notes.md): the behaviour, the helper→hook
 table of the SDK migration, the deviations, the gap list, and the verification
 tables (the retired `.hnmod` ladder, the SDK-format one, slice 2's red→green
 recipe proof, slice 3's wireless-transmitter red→green and in-game leg, slice
-4's wireless-grid one, slice 5's network-keyed promise table, and slice 6's upgrade
-items and the raised range).
+4's wireless-grid one, slice 5's network-keyed promise table, slice 6's upgrade
+items and the raised range, and slice 7's importer/exporter pair with the speed and stack
+upgrades).
 
 Quick reproduction (a build slot is required; see the campaign's AGENTS.md):
 
@@ -34,9 +35,9 @@ The two `check`/`build`/`fits` steps need `BUILD_LOCAL=1` on the slot runner:
 the second build machine has no `cargo-horizon-mod`.
 
 Pin **`0a875da91dbb0fdcb7ba8c42c11341aa229af51a`** + mixins
-`e59da9094f0c2fdda6c627fe9eff22dec6a906f0`. Delivered package (0.2.6):
-`refinedstorage.hmod`, **158,835 B**, SHA-256
-`5aa7faa89f85979a6347dc23b5982f9b993c895f0e3f8efdda34c8adab729743`, 204 entries, no packed
+`e59da9094f0c2fdda6c627fe9eff22dec6a906f0`. Delivered package (0.2.7):
+`refinedstorage.hmod`, **179,081 B**, SHA-256
+`3223f32ae80773769dd4a5b3ac1dc350477d7608778131223a6ba43e93bb6bb9`, 235 entries, no packed
 `Cargo.lock`; a copy of the delivered bytes is at
 `ports/_shared/evidence/refinedstorage/refinedstorage.hmod`, which is the file both `fits`
 runs used.
@@ -56,12 +57,15 @@ SELFTEST=offline … tools/e2e.sh                                   # flipped of
 SELFTEST=networks … tools/e2e.sh                                  # flipped two-network assertion: EXIT:1
 SELFTEST=range … tools/e2e.sh                                     # flipped raised-range assertion: EXIT:1
 SELFTEST=creative … tools/e2e.sh                                  # flipped creative-range assertion: EXIT:1
+SELFTEST=speed … tools/e2e.sh                                     # flipped importer interval: EXIT:1
+SELFTEST=stack … tools/e2e.sh                                     # flipped importer quota: EXIT:1
 python3 ../tools/check-e2e-logs.py refinedstorage-e2e --strict
 ```
 
 `tools/recipe_check.py` is the recipe family's driver: it reads this package's own
-`data/refinedstorage/recipe/*.json` (24 recipes, including slice 3's `wireless_transmitter`,
-slice 4's `wireless_grid`, and slice 6's `upgrade` and `range_upgrade`) and crafts every one of them in a crafting table or a furnace,
+`data/refinedstorage/recipe/*.json` (29 recipes, including slice 3's `wireless_transmitter`,
+slice 4's `wireless_grid`, slice 6's `upgrade` and `range_upgrade`, and slice 7's `importer`,
+`exporter`, `speed_upgrade` and `stack_upgrade`) and crafts every one of them in a crafting table or a furnace,
 asserting the output id and count, that the ingredients were consumed, and that a
 wrong-ingredient control yields nothing — including one control per shaped tag ingredient
 (slice 4 fixed the driver's tag lookup). Recorded in `notes.md` §"Slice 2", §"Slice 3" and
@@ -91,3 +95,12 @@ is accepted, and the wireless grid opens its view naming 24 blocks), the transmi
 four slots and refuses a diamond, and a creative range upgrade gives unlimited range (70.5 blocks out
 accepted, another dimension still refused). `SELFTEST=range` and `SELFTEST=creative` invert the two
 new assertions and exit 1.
+
+Slice 7's assertions are `notes.md` §"Slice 7": the importer moves 3 items in 20 ticks with no
+upgrade, empties its source in one pass (64) with a stack upgrade, and moves ~20 in 20 ticks with
+four speed upgrades while `/refinedstorage info` names the counts and the interval (9 ticks down to
+1); its filter blocks the one resource it names while an empty filter imports everything; the
+exporter moves exactly the four gold its filter names into the chest it faces and a filterless
+exporter moves nothing; a machine menu shows 13 slots and refuses a diamond in its upgrade row; and
+the exporter block drops itself. `SELFTEST=speed` and `SELFTEST=stack` invert the two new
+differentials and exit 1.

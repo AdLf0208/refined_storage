@@ -59,6 +59,20 @@
 #    is accepted, beyond the 48-block maximum of four range upgrades) and still
 #    refuses another dimension.
 #
+# Slice 7 (the importer and the exporter):
+#  - the importer works on the source block its `facing` names;
+#  - with no upgrade it moves one item per nine ticks (1..5 in a 20-tick
+#    window), a stack upgrade moves 64 in one pass, and four speed upgrades
+#    make the same 20 ticks move a stack (work interval 9, 7, 5, 3, 1);
+#  - /refinedstorage info names each machine, its upgrade counts, that interval
+#    and its filter entries;
+#  - an empty filter imports everything and a filter entry blocks what it names
+#    (upstream's BLOCK mode);
+#  - the exporter pushes only what its filter names into the chest it faces and
+#    an exporter with no filter moves nothing;
+#  - the 13-slot menu opens, an upgrade slot refuses a diamond, and both machines
+#    break and drop themselves.
+#
 # SELFTEST=1 flips the wireless range assertion (a use 17 blocks out must be
 # accepted, so the run FAILS); SELFTEST=offline flips the older "offline lists
 # nothing" assertion the same way; SELFTEST=grid flips the wireless grid's empty
@@ -66,7 +80,9 @@
 # other network's stock, so the run FAILS now that the key is the network);
 # SELFTEST=range asserts the 17-block use is still refused with the range
 # upgrade in; SELFTEST=creative asserts the creative upgrade left the finite
-# range.
+# range; SELFTEST=speed asserts the un-upgraded importer moved a stack in
+# 20 ticks and SELFTEST=stack asserts the stack upgrade left the un-upgraded
+# count, so both fail on the working importer.
 set -euo pipefail
 export LC_ALL=C
 
@@ -129,6 +145,10 @@ inv_slot() { # inv_slot ITEM
     ctl screen | jq -r --arg item "$1" \
         '[.slots[] | select(.slot < 36 and .item == $item)][0].slot // empty'
 }
+# The first empty player-inventory slot (0-35 in a container menu).
+empty_inv_slot() {
+    ctl screen | jq -r '[.slots[] | select(.slot < 36 and .item == null)][0].slot // empty'
+}
 expect_slots() { # expect_slots JSON
     local got want
     got=$(view | jq -S -c .)
@@ -182,6 +202,21 @@ expect_range() { # expect_range X Y Z TEXT
         *"$4"*) ;;
         *) fail "expected the transmitter's range line to say '$4', got '$line'" ;;
     esac
+}
+# A machine's own info line (a second chat line after the network's): its
+# upgrade counts, the work interval they set, and its filter entries.
+expect_machine() { # expect_machine X Y Z TEXT
+    local line
+    line=$(reply "refinedstorage info $1 $2 $3" | grep -m1 -E '^(Importer|Exporter)' || true)
+    echo "  info($1,$2,$3) machine: $line"
+    case "$line" in
+        *"$4"*) ;;
+        *) fail "expected the machine's info line to say '$4', got '$line'" ;;
+    esac
+}
+# How many items `/refinedstorage info` totals for a network.
+net_items() { # net_items X Y Z
+    info "$1" "$2" "$3" | sed -n 's/.*disks, \([0-9]*\) items.*/\1/p'
 }
 # The player's saved advancement progress (`players/advancements/<uuid>.json`),
 # written by `ctl save`. The game's data folder is the launch directory
@@ -350,9 +385,12 @@ ctl wait 6
 expect_reply "refinedstorage wireless 41 64 1 minecraft:overworld" "refused (different dimension)"
 expect_reply "execute in minecraft:overworld run refinedstorage wireless 41 64 1 minecraft:overworld" "accepted (1.6 of 16 blocks"
 
-echo "== the item places with the clicked face and drops itself; the transmitter alone is not the advancement =="
+echo "== the item places against the clicked face and turns to face it =="
 # The advancement before the item is obtained: the player's saved progress has no
 # entry (the pre-check ran right after the arena).
+# Upstream's `DefaultDirectionType.FACE_CLICKED` answers `clickedFace.getOpposite()`
+# (toward the block the machine was placed on), which is what the slice-7 fix
+# applies; the machine below is the same click, read back as `south`.
 ctl command "execute in minecraft:the_end run setblock 55 64 6 minecraft:stone"
 ctl command "execute in minecraft:the_end run tp @s 56.5 64 5.5"
 ctl wait 6
@@ -363,7 +401,7 @@ ctl wait 4
 ctl interact 55 64 6 north
 ctl wait 8
 expect_state 55 64 5 'refinedstorage:wireless_transmitter'
-expect_state 55 64 5 'facing=north'
+expect_state 55 64 5 'facing=south'
 ctl wait 20
 ctl save
 ctl wait 10
@@ -771,9 +809,14 @@ case "$refusal" in
 esac
 ctl screen | jq -e '.screen != "container"' >/dev/null \
     || fail "a refused use opened the grid's menu"
-# The differential: 16 blocks out is inside the range and opens the view.
-ctl tp 34 64 8
-ctl wait 6
+# The differential: inside the range is accepted and opens the view. The spot is
+# 15.5 blocks out rather than exactly 16.0: a `ctl tp` keeps the player's
+# velocity, and a teleport landing on a moving body drifts by up to half a block
+# before the ground friction stops it (measured: 16.4 after `tp 34 64 8`). The
+# exact 16.0 boundary is the command's assertion above, which reads the same
+# player position without a fresh teleport.
+ctl tp 34.5 64 8
+ctl wait 8
 use_held
 ctl wait 10
 ctl screen | jq -e '.screen == "container"' >/dev/null \
@@ -904,6 +947,248 @@ expect_reply "execute in minecraft:overworld run refinedstorage wireless 50 64 8
 ctl command "execute in minecraft:the_end run tp @s 50.5 64 10.5"
 ctl wait 6
 
+echo "== the importer: the work interval, the quota and the filter =="
+# Slice 7. Upstream's importer (`ImporterNetworkNode`) reads the inventory its
+# `direction` points at; the work ticker is `UpgradeContainer`'s (9 ticks, two
+# fewer per speed upgrade), and one pass moves 1 item, or 64 with a stack
+# upgrade (`ItemHandlerImporterTransferStrategyFactory`).
+# The network at z=16: controller 40 - cable 41 - drive 42 - importer 43 -
+# source 44. The source is a hopper: a chest's own use opens the chest's menu
+# instead of placing a block against it, and a hopper's five slots are an
+# ordinary `ITEMS` handler. The importer's `facing` is what makes the transfer
+# work at all, so the legs below prove it (a machine facing the wrong neighbour
+# moves nothing).
+ctl command "execute in minecraft:the_end run setblock 40 64 16 refinedstorage:controller"
+ctl command "execute in minecraft:the_end run setblock 41 64 16 refinedstorage:cable"
+ctl command "execute in minecraft:the_end run setblock 42 64 16 refinedstorage:disk_drive"
+ctl command "execute in minecraft:the_end run setblock 43 64 16 refinedstorage:importer[facing=east]"
+ctl command "execute in minecraft:the_end run setblock 44 64 16 minecraft:hopper[enabled=true,facing=down]"
+ctl wait 10
+expect_state 43 64 16 'facing=east'
+expect_info 42 64 16 "online (4 nodes, 1 controller, 1 drive, 0 grid, 1 importer)"
+expect_machine 43 64 16 "0 speed upgrades, 0 stack upgrades, work interval 9 ticks, 0 filters"
+# The two blocks' items are real items: given, read back, and used below.
+ctl give refinedstorage:importer 1 >/dev/null
+ctl give refinedstorage:exporter 1 >/dev/null
+ctl wait 4
+[ "$(count_of refinedstorage:importer)" = 1 ] || fail "the importer item was not given"
+[ "$(count_of refinedstorage:exporter)" = 1 ] || fail "the exporter item was not given"
+echo "  items given: importer $(count_of refinedstorage:importer), exporter $(count_of refinedstorage:exporter)"
+ctl command "clear @s" >/dev/null
+ctl wait 2
+# A disk, then 64 stone in the source (hopper) the importer faces.
+ctl give refinedstorage:1k_storage_disk 1 >/dev/null
+ctl wait 4
+ctl select refinedstorage:1k_storage_disk >/dev/null
+ctl command "execute in minecraft:the_end run tp @s 41.5 64 16.5" >/dev/null
+ctl wait 4
+ctl interact 42 64 16
+ctl wait 8
+expect_info 42 64 16 "1 disks, 0 items in 0 resources"
+ctl container 44 64 16 minecraft:stone 64 >/dev/null
+ctl wait 4
+echo "  importer source: $(slots 44 64 16)"
+# The un-upgraded machine moves one item per nine ticks: a 20-tick window sees
+# the first pass and one or two more, never a stack.
+ctl wait 20
+slow=$(net_items 42 64 16)
+echo "  after 20 ticks without an upgrade: $slow items on the network, source $(slots 44 64 16)"
+if [ "$SELFTEST" = speed ]; then
+    echo "(selftest: asserting the un-upgraded importer moved more than 15 items in 20 ticks)"
+    slow=64
+fi
+[ "${slow:-0}" -ge 1 ] && [ "${slow:-0}" -le 5 ] \
+    || fail "the un-upgraded importer moved $slow items in 20 ticks, expected 1 to 5"
+# The stack upgrade: one pass moves 64 instead of 1, so the source empties in a
+# single pass and the network holds all 64.
+ctl give refinedstorage:stack_upgrade 1 >/dev/null
+ctl wait 4
+ctl command "execute in minecraft:the_end run tp @s 43.5 64 17.5" >/dev/null
+ctl wait 4
+ctl interact 43 64 16
+ctl wait 8
+ctl screen | jq -e '[.slots[] | select(.slot >= 300)] | length == 13' >/dev/null \
+    || fail "the importer's menu does not have 13 container slots: $(ctl screen | jq -c '[.slots[] | select(.slot >= 300)] | length')"
+up=$(inv_slot refinedstorage:stack_upgrade)
+[ -n "$up" ] || fail "no stack upgrade in the importer menu's inventory"
+ctl click-slot "$up"
+ctl wait 2
+ctl click-slot 309
+ctl wait 8
+ctl close
+ctl wait 4
+upgrade_slots=$(slots 43 64 16)
+echo "  importer slots: $upgrade_slots"
+echo "$upgrade_slots" | jq -e '[.[] | select(.item == "refinedstorage:stack_upgrade")] | length == 1' >/dev/null \
+    || fail "the importer's upgrade slot does not hold the stack upgrade: $upgrade_slots"
+expect_machine 43 64 16 "1 stack upgrade, work interval 9 ticks"
+ctl wait 20
+fast=$(net_items 42 64 16)
+echo "  after the stack upgrade: $fast items on the network, source $(slots 44 64 16)"
+if [ "$SELFTEST" = stack ]; then
+    echo "(selftest: asserting the stack upgrade left the un-upgraded count)"
+    [ "${fast:-0}" = 5 ] || fail "with a stack upgrade the importer moved to $fast items, expected 5"
+fi
+[ "${fast:-0}" = 64 ] || fail "the importer with a stack upgrade moved to $fast items, expected 64"
+echo "$(slots 44 64 16)" | jq -e 'length == 0' >/dev/null \
+    || fail "the importer with a stack upgrade left $(slots 44 64 16) in its source"
+
+echo "== the importer: four speed upgrades shorten the interval to one tick =="
+# Take the stack upgrade back out and put four speed upgrades in: upstream's
+# container is four slots, one item each, and `notifyListener` takes two ticks
+# off the interval per speed upgrade (9, 7, 5, 3, 1).
+ctl command "execute in minecraft:the_end run tp @s 43.5 64 17.5" >/dev/null
+ctl wait 4
+ctl interact 43 64 16
+ctl wait 8
+stack_slot=$(ctl screen | jq -r '[.slots[] | select(.slot >= 309 and .slot <= 312 and .item == "refinedstorage:stack_upgrade")][0].slot // empty')
+[ -n "$stack_slot" ] || fail "the stack upgrade is not in the importer's upgrade row"
+ctl click-slot "$stack_slot"
+ctl wait 2
+free=$(empty_inv_slot)
+[ -n "$free" ] || fail "no empty inventory slot to put the stack upgrade back into"
+ctl click-slot "$free"
+ctl wait 4
+ctl close
+ctl wait 4
+ctl command "clear @s" >/dev/null
+ctl wait 2
+# One speed upgrade at a time, each read back from the machine's own slots.
+for n in 1 2 3 4; do
+    ctl give refinedstorage:speed_upgrade 1 >/dev/null
+    ctl wait 3
+    ctl command "execute in minecraft:the_end run tp @s 43.5 64 17.5" >/dev/null
+    ctl interact 43 64 16
+    ctl wait 8
+    speed_slot=$(inv_slot refinedstorage:speed_upgrade)
+    [ -n "$speed_slot" ] || fail "no speed upgrade in the importer menu's inventory"
+    ctl click-slot "$speed_slot"
+    ctl wait 2
+    ctl click-slot $((308 + n))
+    ctl wait 8
+    ctl close
+    ctl wait 4
+done
+echo "  importer slots: $(slots 43 64 16)"
+[ "$(slots 43 64 16 | jq '[.[] | select(.item == "refinedstorage:speed_upgrade")] | length')" = 4 ] \
+    || fail "the importer does not hold four speed upgrades: $(slots 43 64 16)"
+expect_machine 43 64 16 "4 speed upgrades, 0 stack upgrades, work interval 1 tick"
+# The differential: with four speed upgrades the same 20-tick window moves a
+# stack's worth (one per tick), not one per nine ticks.
+ctl container 44 64 16 minecraft:dirt 64 >/dev/null
+ctl wait 4
+ctl wait 20
+rapid=$(net_items 42 64 16)
+echo "  after 20 ticks with four speed upgrades: $rapid items on the network"
+# One pass per tick: about 20 more items, far past the 1 to 5 the same window
+# moved without them (and the differential is that exact comparison).
+[ "${rapid:-0}" -ge 79 ] || fail "four speed upgrades moved to $rapid items in 20 ticks, expected at least 79"
+ctl wait 60
+expect_info 42 64 16 "128 items in 2 resources"
+
+echo "== the importer's filter blocks the resource it names =="
+# Upstream's `Filter` is in BLOCK mode: an empty filter blocks nothing (which
+# is why the source above was imported whole), and a listed resource is the one
+# that is not imported. Dirt is named, so the stone goes and the dirt stays.
+ctl container 43 64 16 minecraft:dirt 1 >/dev/null
+ctl wait 4
+ctl container 44 64 16 minecraft:stone 5 >/dev/null
+ctl container 44 64 16 minecraft:dirt 5 >/dev/null
+ctl wait 4
+echo "  importer filter: $(slots 43 64 16)"
+expect_machine 43 64 16 "1 filter"
+ctl wait 30
+echo "  source after the filtered pass: $(slots 44 64 16)"
+[ "$(slots 44 64 16 | jq '[.[] | select(.item == "minecraft:stone")] | length')" = 0 ] \
+    || fail "the filtered importer did not import the stone: $(slots 44 64 16)"
+[ "$(slots 44 64 16 | jq '[.[] | select(.item == "minecraft:dirt")][0].count // 0')" = 5 ] \
+    || fail "the filtered importer imported the blocked dirt: $(slots 44 64 16)"
+
+echo "== the exporter: the resources its filter names leave the network =="
+# The exporter at 41,64,17 faces south into the chest at 41,64,18 and joins the
+# network through the cable above it. Upstream's exporter works one filter entry
+# at a time (`ExporterNetworkNode`), so an empty filter exports nothing.
+ctl command "execute in minecraft:the_end run setblock 41 64 17 refinedstorage:exporter[facing=south]" >/dev/null
+ctl command "execute in minecraft:the_end run setblock 41 64 18 minecraft:chest" >/dev/null
+ctl wait 12
+expect_info 41 64 17 "online (5 nodes, 1 controller, 1 drive, 0 grid, 1 importer, 1 exporter)"
+expect_machine 41 64 17 "0 filters"
+before=$(net_items 41 64 17)
+ctl wait 20
+after=$(net_items 41 64 17)
+echo "  exporter with no filter: $before -> $after items"
+[ "$before" = "$after" ] || fail "an exporter without a filter moved items: $before -> $after"
+# One gold ingot in the filter, four gold on the network: only the gold leaves.
+ctl container 41 64 17 minecraft:gold_ingot 1 >/dev/null
+ctl wait 4
+expect_machine 41 64 17 "1 filter"
+# The gold goes on the network the same way everything else did: into the
+# hopper the importer faces (its filter blocks dirt only). The exporter has its
+# filter already, so it drains the gold as fast as the importer brings it: what
+# proves the pass is the *destination* gaining four and the network returning to
+# where it was, not a spike on the network.
+gold_base=$(net_items 41 64 17)
+ctl container 44 64 16 minecraft:gold_ingot 4 >/dev/null
+ctl wait 60
+echo "  exporter destination: $(slots 41 64 18)"
+[ "$(slots 41 64 18 | jq '[.[] | select(.item == "minecraft:gold_ingot")][0].count // 0')" = 4 ] \
+    || fail "the exporter did not move the 4 gold: $(slots 41 64 18)"
+# The filter is what left: the stone and the dirt are still on the network.
+echo "  exporter network after the pass: $(net_items 41 64 17) items (was $gold_base)"
+[ "$(net_items 41 64 17)" = "$gold_base" ] || fail "the exporter moved more than its filter named"
+
+echo "== a machine's upgrade slot refuses what is not an upgrade =="
+ctl command "execute in minecraft:the_end run tp @s 43.5 64 17.5" >/dev/null
+ctl command "clear @s" >/dev/null
+ctl wait 4
+ctl interact 43 64 16
+ctl wait 8
+ctl give minecraft:diamond 1 >/dev/null
+ctl wait 4
+diamond_slot=$(inv_slot minecraft:diamond)
+[ -n "$diamond_slot" ] || fail "no diamond in the machine menu's inventory"
+ctl click-slot "$diamond_slot"
+ctl wait 2
+ctl click-slot 309
+ctl wait 6
+ctl screen | jq -e '[.slots[] | select(.slot >= 300 and .slot <= 312 and .item == "minecraft:diamond")] == []' >/dev/null \
+    || fail "a diamond entered a machine's upgrade slot"
+free=$(empty_inv_slot)
+[ -n "$free" ] || fail "no empty inventory slot to put the refused diamond back into"
+ctl click-slot "$free"
+ctl wait 4
+ctl close
+ctl wait 4
+[ "$(count_of minecraft:diamond)" = 1 ] || fail "the refused diamond left the menu"
+ctl command "clear @s" >/dev/null
+ctl wait 4
+
+echo "== both machine blocks drop themselves =="
+# The exporter's own shape is the cable core plus its three steps on the face
+# it works through; with the destination chest removed the ray from the south
+# reaches the core.
+ctl command "execute in minecraft:the_end run setblock 41 64 18 minecraft:air" >/dev/null
+ctl command "gamemode survival" >/dev/null
+ctl give minecraft:diamond_pickaxe 1 >/dev/null
+ctl wait 4
+ctl select minecraft:diamond_pickaxe >/dev/null
+ctl command "execute in minecraft:the_end run tp @s 41.5 64 19.5" >/dev/null
+ctl wait 6
+broken=$(ctl break 41 64 17) || fail "cannot break the exporter: $broken"
+echo "  exporter drops: $(echo "$broken" | jq -c '.drops')"
+[ "$(echo "$broken" | jq -r '.drops["refinedstorage:exporter"] // 0')" -ge 1 ] \
+    || fail "the exporter did not drop itself: $(echo "$broken" | jq -c '.drops')"
+# The importer: the same core, from the south, inside reach.
+ctl command "execute in minecraft:the_end run tp @s 43.5 64 17.5" >/dev/null
+ctl wait 6
+broken=$(ctl break 43 64 16) || fail "cannot break the importer: $broken"
+echo "  importer drops: $(echo "$broken" | jq -c '.drops')"
+[ "$(echo "$broken" | jq -r '.drops["refinedstorage:importer"] // 0')" -ge 1 ] \
+    || fail "the importer did not drop itself: $(echo "$broken" | jq -c '.drops')"
+ctl command "gamemode creative" >/dev/null
+ctl command "clear @s" >/dev/null
+ctl wait 4
+
 # The advancement needs the grid and a transmitter in one `inventory_changed`
 # criterion (upstream `advancement/wireless.json`): giving both completes it,
 # while the transmitter-only phase above left it unobtained.
@@ -950,5 +1235,5 @@ expect_slots '[{"slot":300,"item":"minecraft:gold_ingot","count":3}]'
 ctl close
 ctl wait 4
 
-echo "PASS: the wireless transmitter joined its network through the facing side only (offline facing away, active facing the cable), /refinedstorage info named it and its range 16 blocks, a use 2.5 blocks away and one exactly 16 blocks away were accepted, 17 blocks away was refused naming the distance, an offline transmitter refused and a position without one answered so, a use from the End against the overworld transmitter was refused as a different dimension while the same command under execute in was accepted, the item placed against the clicked face and the block dropped itself, every carried recipe crafts in game with its declared output and count (24 now, each with its wrong-ingredient control), the machine casing places, reads back and drops itself, the wireless grid is unbound until it is used on a transmitter and then names it (dimension and position in its own component), a use inside the range opens the network's 9x6 view with 54 slots, a shift-click in the player inventory deposits 5 diamonds on the network and a shift-click on the view withdraws them back, 17 blocks out is refused naming the distance while 16 blocks out opens the view, the same item and binding is refused as a different dimension from the overworld and accepted in the End, the refinedstorage:wireless advancement is not granted by a transmitter alone and is granted by the grid and a transmitter together, two networks in one dimension each listed their own 3 gold while the other network held 3 too, two grids on one network never offered the same items twice, the cable follows its neighbours and the grid is active with a controller, the disk went into the drive and the grid listed what was deposited through its menu, the search filtered it, a shift-click withdrew the diamonds, breaking the controller took the network offline and putting it back restored the disk's gold, a network without a drive listed nothing, a stick did not enter the drive, a vanilla barrel is not a network block, a range upgrade in the transmitter's own upgrade slot raised its range to 24 blocks so the same 17.0-block use was accepted and the wireless grid opened its view naming 24 blocks, the transmitter's four-slot menu showed the upgrade and refused a diamond, a creative range upgrade gave unlimited range (70.5 blocks out accepted, another dimension still refused), and the disk kept its 3 gold across a relaunch"
+echo "PASS: the wireless transmitter joined its network through the facing side only (offline facing away, active facing the cable), /refinedstorage info named it and its range 16 blocks, a use 2.5 blocks away and one exactly 16 blocks away were accepted, 17 blocks away was refused naming the distance, an offline transmitter refused and a position without one answered so, a use from the End against the overworld transmitter was refused as a different dimension while the same command under execute in was accepted, the item placed against the clicked face and the block dropped itself, every carried recipe crafts in game with its declared output and count (29 now, each with its wrong-ingredient control), the machine casing places, reads back and drops itself, the wireless grid is unbound until it is used on a transmitter and then names it (dimension and position in its own component), a use inside the range opens the network's 9x6 view with 54 slots, a shift-click in the player inventory deposits 5 diamonds on the network and a shift-click on the view withdraws them back, 17 blocks out is refused naming the distance while 16 blocks out opens the view, the same item and binding is refused as a different dimension from the overworld and accepted in the End, the refinedstorage:wireless advancement is not granted by a transmitter alone and is granted by the grid and a transmitter together, two networks in one dimension each listed their own 3 gold while the other network held 3 too, two grids on one network never offered the same items twice, the cable follows its neighbours and the grid is active with a controller, the disk went into the drive and the grid listed what was deposited through its menu, the search filtered it, a shift-click withdrew the diamonds, breaking the controller took the network offline and putting it back restored the disk's gold, a network without a drive listed nothing, a stick did not enter the drive, a vanilla barrel is not a network block, a range upgrade in the transmitter's own upgrade slot raised its range to 24 blocks so the same 17.0-block use was accepted and the wireless grid opened its view naming 24 blocks, the transmitter's four-slot menu showed the upgrade and refused a diamond, a creative range upgrade gave unlimited range (70.5 blocks out accepted, another dimension still refused), the importer turned on its network moved 3 items in 20 ticks without an upgrade and emptied its source in one pass with a stack upgrade (64 in 20 ticks), four speed upgrades made the same 20 ticks move a stack and /refinedstorage info named the upgrade counts and the work interval (9 ticks down to 1), its filter blocked the resource it names while an empty filter imported everything, the exporter moved exactly the 4 gold its filter names into the chest it faces and an exporter with no filter moved nothing, a machine menu showed its 13 slots and its upgrade row refused a diamond, both machine items were given and read back, both machine blocks dropped themselves, and the disk kept its 3 gold across a relaunch"
 # The cleanup trap prints EXIT:<status> as the last line.

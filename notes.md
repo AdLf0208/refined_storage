@@ -19,11 +19,12 @@ the network; no entities, renderers, dimensions or new vanilla hooks.
 Ported now because it is the **#1 core base** of the core-first queue: 13
 pending ATM10 mods depend on it (`ports/tools/port_queue.py`).
 
-Status: **slice 6 — the upgrade items (0.2.6)** — the network core of slice 1, the crafting
-chain of slice 2, the finite-range, same-dimension transmitter of slice 3, the item that asks
-its admission (slice 4), the promise table keyed by network (slice 5), and now the transmitter's own
-four upgrade slots with the range and creative range upgrades in them. Everything else is the gap
-list below, not a claim.
+Status: **slice 7 — the importer and the exporter (0.2.7)** — the network core of slice 1, the
+crafting chain of slice 2, the finite-range, same-dimension transmitter of slice 3, the item that
+asks its admission (slice 4), the promise table keyed by network (slice 5), the transmitter's four
+upgrade slots with the range and creative range upgrades (slice 6), and now the two transfer
+machines: a filter, four upgrade slots, a work tick and a menu each, with the speed and stack
+upgrades they make real. Everything else is the gap list below, not a claim.
 
 > The sections from `## Behaviour` to `### Verification after the repairs`
 > describe the **retired `.hnmod`** layout. They are kept as history: the
@@ -122,11 +123,15 @@ and in the gaps below.
    64k/creative), storage blocks, ~~the range and creative range upgrades~~
    (**done in slice 6, 0.2.6**: the transmitter's four upgrade slots, the base
    `upgrade` item and its recipe, +8 blocks per range upgrade up to four, the
-   creative one unlimited but never cross-dimension), the **eight inert
-   upgrades** (`speed`, `stack`, `regulator`, `autocrafting`, `silk_touch`,
-   `fortune_1/2/3` — `blocked(no-importer/exporter/destructor/crafting-grid)`:
-   every surface upstream registers them for is an unported block, so shipping
-   them would be inert; `silk_touch`/`fortune_1..3` also need the
+   creative one unlimited but never cross-dimension),
+   ~~exporters/importers~~ (**done in slice 7, 0.2.7**: both blocks, their nine
+   filter entries and four upgrade slots, their menus, the 9-tick work tick and
+   the `speed_upgrade`/`stack_upgrade` items that change it), the **six inert
+   upgrades** (`regulator`, `autocrafting`, `silk_touch`, `fortune_1/2/3` —
+   `blocked(no-regulator-configuration)` / `blocked(no-autocrafting-system)`:
+   shipped with the machines, but each still has no configuration surface or no
+   crafting queue to act on, so shipping them would be inert; `silk_touch`/
+   `fortune_1..3` stay `blocked(no-destructor)` and also need the
    `refinedstorage:upgrade_with_enchanted_book` recipe type, which the pin has no
    content-side recipe-type registry for), the config file, and the coloured
    variants of every block (the slice has the default colour only — the
@@ -1622,3 +1627,270 @@ Evidence: `ports/_shared/evidence/refinedstorage/` — `plan-slice6-upgrades.md`
 `e2e-slice6-green.log` (green), `e2e-slice6-control.log`, `e2e-slice6-selftest.log`,
 `e2e-slice6-selftest-range.log`, `e2e-slice6-selftest-creative.log`, and `launcher-build-0.2.6.log`
 (`Compiling refinedstorage (1 of 1)`, `native-0a875da-3f241726424e` — the build every leg ran on).
+
+## Slice 7 — the importer and the exporter, and the two upgrades they make real (2026-11-22) — version 0.2.7
+
+Gap line this slice answers — §"Gaps / deviations (slice 1)" item 2 as slice 6 left it: *"the
+**eight inert upgrades** (`speed`, `stack`, `regulator`, `autocrafting`, `silk_touch`,
+`fortune_1/2/3` — `blocked(no-importer/exporter/destructor/crafting-grid)`)"*, and slice 2's
+coverage row *"the rest of the jar (crafters, **exporters/importers**, …) → not ported"*. Slice 6's
+report named this pair next, because it is the family that turns two of the eight refusals into
+real items.
+
+Pin **`0a875da91dbb0fdcb7ba8c42c11341aa229af51a`**, mixins
+`e59da9094f0c2fdda6c627fe9eff22dec6a906f0`, SDK `0a875da`, launcher 0.2.92, game 26.3. Class
+`content` / tier **deep**, shape **machines**, unchanged: two block entities, two containers, two
+menus, one work rule and two items are below the tier. No new pin API beyond the block capability
+the thing needs, and no third-party mod: every ingredient is vanilla or a chain item slice 2 carries.
+
+### What the jar says (read, not guessed)
+
+`refinedmods/refinedstorage2` tag `v2.0.9`, commit
+`0dec63affe8147702b020843c22748483ef18c01`. Files read: `common/importer/
+{AbstractImporterBlockEntity,ImporterBlock,ImporterTransferQuotaProvider,ImporterContainerMenu}.java`,
+`common/exporter/{AbstractExporterBlockEntity,ExporterBlock,ExporterTransferQuotaProvider,
+ExporterContainerMenu}.java`, `network/impl/node/importer/{ImporterNetworkNode,
+ImporterTransferStrategyImpl,CompositeImporterTransferStrategy,ImporterSource}.java`,
+`network/impl/node/exporter/{ExporterNetworkNode,ExporterTransferStrategyImpl}.java`,
+`neoforge/importer/{ItemHandlerImporterTransferStrategyFactory,ItemHandlerImporterSource}.java`,
+`neoforge/exporter/ItemHandlerExporterTransferStrategyFactory.java`,
+`common/upgrade/{UpgradeContainer,UpgradeDestinations}.java`, `common/AbstractModInitializer.java`
+(`registerUpgradeMappings`), `common/support/SchedulingModeContainer.java`,
+`resource/filter/{Filter,FilterMode}.java`, `support/direction/DefaultDirectionType.java`,
+`support/{AbstractDirectionalBlock,AbstractDirectionalCableBlock}.java`,
+`support/network/SimpleConnectionStrategy.java`, and the jar's `blockstates/{importer,exporter}.json`,
+`models/{block,item}/{importer,exporter}*.json`, `recipe/{importer,exporter,speed_upgrade,
+stack_upgrade}.json`, `tags/item/{importers,exporters}.json`, `lang/en_us.json` and
+`textures/block/cable/part_border.png`.
+
+| upstream | what this slice carries |
+|---|---|
+| `AbstractDirectionalCableBlock` + `SimpleConnectionStrategy` | a cable-like node that joins on **all six** sides, with a working face from `FACE_CLICKED` |
+| `ImporterNetworkNode.doWork` | per work tick: the neighbour at the working face, the first resource the filter allows, up to the quota |
+| `ImporterTransferQuotaProvider` | quota **1**, or **64** with a stack upgrade |
+| `ExporterNetworkNode` + `DefaultSchedulingMode` | one task per filter entry, the first that moves anything wins |
+| `ExporterTransferQuotaProvider` | quota 1, or 64 with a stack upgrade |
+| `UpgradeContainer` | **4** slots, one item each, work tick rate **9**, `notifyListener` → `9 - 2 × speed`; IMPORTER = speed ×4, stack ×1, regulator ×4; EXPORTER = the same + autocrafting ×1 |
+| `ImporterContainerMenu`/`ExporterContainerMenu` | nine filter slots, then the four upgrade slots (13), the player's 36 after |
+| `Filter` | `BLOCK` by default: an **empty** filter blocks nothing, a listed resource is the one blocked |
+
+### What was implemented
+
+- **runtime.rs** (tests first): `Kind::Importer`/`Kind::Exporter` (+ `machine_name`),
+  `WORK_TICK_RATE` (9), `SPEED_TICK_REDUCTION` (2), `MAX_SPEED_UPGRADES` (4),
+  `MAX_STACK_UPGRADES` (1), `BASE_TRANSFER` (1), `STACK_TRANSFER` (64), `work_interval`,
+  `transfer_quota`, `work_due`, `allows` (the BLOCK filter), `import_plan`, `export_plan` and
+  `machine_readout`.
+- **support.rs**: the two blocks in the one block-entity type; each a 13-slot container
+  (nine filter entries + four upgrades) with its own content menu type (`{"slots": 13}`) and a
+  `Screen` row for the filter entries and the upgrades; a `MachineSlots` menu Part (a filter slot
+  takes any item, one per slot; an upgrade slot only a speed or stack upgrade, one per slot, at most
+  four speed and one stack, scoped to `MenuContainer::Main` and to its own slot range); the work tick
+  (`machine_tick`) with the counter in `Core::work`; `importer_pass`/`exporter_pass` moving items
+  through the neighbour's `ITEMS` capability and the network's disks in **one transaction**
+  (`write_back_in` is the old `write_back` without its own transaction); the `facing` reader; the
+  machine line in `/refinedstorage info` (and the census gained importer/exporter counts).
+- **Content** (from the jar, MIT): the two blocks (barrel template — the block's use opens its
+  menu — with the cathode-ray shapes of their own models, in block units), their multipart
+  blockstates (the cable core plus the machine's three steps, rotated per `facing`), the block and
+  item models (the jar's, including its `item/<name>/base.json`), `part_border.png`, the two items,
+  loot tables, the pickaxe tag, the `importers`/`exporters` item tags, the `speed_upgrade` and
+  `stack_upgrade` items with their models, textures and recipes, the `importer`/`exporter` recipes,
+  the lang keys and the creative tab entries.
+
+### Defects fixed
+
+**The port's directional placement was mirrored (found here, fixed here).** `state_for_placement`
+wrote the *clicked face* into `facing`, while upstream's `DefaultDirectionType.FACE_CLICKED`
+answers `clickedFace.getOpposite()` (`AbstractDirectionalBlock.getStateForPlacement` →
+`getDirection(clickedFace, …)`). The port's `facing` is the side a node joins through and a machine
+works through, so the two conventions meant a transmitter placed on a cable faced **away** from it
+(offline), and the machines this slice adds would have read the block behind them. Provoked by the
+slice's own need, proved from the artefact, fixed with `.opposite()` for all three directional
+blocks; the slice-3 placement assertion now reads `facing=south` for a click on a block's north
+face (the same statement, pointing at the clicked block). A user notices that a wireless
+transmitter placed against a cable now joins it instead of staying dark, and an importer placed
+against a chest now reads the chest.
+
+**The four new recipes were first written in the jar's ingredient shape.** 1.21.1 spells an
+ingredient `{"item": …}` / `{"tag": …}`; the pin spells it `"id"` / `"#tag"` (this file, §"Slice 2").
+As written, the game loaded no result for `importer`, `exporter`, `speed_upgrade` or
+`stack_upgrade` — `recipe_check.py` failed all four *and* their controls. Fixed in the data; the
+run above crafts all four.
+
+### Deviations (recorded, not defects)
+
+1. **Nine real item slots are the filter, not nine ghost resource slots.** Upstream's filter
+   container holds *representations*; the pin's mod menus have item slots only, so a filter entry
+   is one real item held in a slot (and saved with the block entity). One entry per slot, as
+   upstream's `getMaxStackSize` 1.
+2. **No filter mode, fuzzy mode, redstone mode or scheduling mode.** The importer is upstream's
+   default `BLOCK` filter, the exporter is its default scheduling mode (filter order); the toggles
+   are GUI buttons the pin's mod screens have no widget for.
+3. **No exporting indicators.** Upstream's exporter menu shows per-filter results
+   (`ExportingIndicator`); the port's menu shows the slots only.
+4. **No energy.** Parent gap 1: the controller consumes and stores nothing, so the machines' FE/t
+   (and the upgrades' extra usage) is not charged. The transfer rules are energy-independent.
+5. **The machines' upgrade slots drop nothing when the block is broken** — the same gap slice 6
+   recorded for the transmitter (the game's mod block entity drops an empty item;
+   `ARCHITECTURE.md` §3's `block_drops` route is the fix, a later slice). A filter item held in a
+   filter slot is lost the same way.
+6. **The importer/exporter item is one model** (the jar's own `item/<name>/base.json`), not a
+   dyed variant set; no coloured variants exist in this port.
+7. **`regulator` and `autocrafting` are still not shipped.** Their *consumer* now exists, but each
+   needs a surface this port does not have: the regulator reads its amount and resource from the
+   upgrade item's own menu (`RegulatorUpgradeItem.use` opens a `RegulatorUpgradeContainerMenu`;
+   `RegulatorUpgradeState.EMPTY` is amount 1 with **no resource**, so an unconfigured regulator
+   changes nothing), and the autocrafting upgrade needs a crafting-task queue
+   (`MissingResourcesListeningExporterTransferStrategy` + `scheduleAutocrafting`). Shipping either
+   now would be the `mifa` case: an item whose every read is zero. Ledger rows stay
+   `blocked(no-regulator-configuration)` / `blocked(no-autocrafting-system)`.
+
+### Red proof — the rules as tests, before the glue
+
+Written first against stubs (`work_interval` always 9, `transfer_quota` always 1, `work_due`
+always true, `allows` always true, `import_plan` ignoring filter and quota, `export_plan` always
+`None`, a readout without upgrades), then run: **11 failed of 77**
+(`ports/_shared/evidence/refinedstorage/runtime-red-slice7-machines.log`):
+
+```
+---- runtime::tests::each_speed_upgrade_shortens_the_work_interval_by_two stdout ----
+assertion `left == right` failed
+  left: 9
+ right: 7
+---- runtime::tests::an_empty_filter_imports_everything stdout ----
+assertion `left == right` failed: an empty BLOCK filter blocks nothing
+  left: Some((0, "minecraft:stone", 5))
+ right: Some((0, "minecraft:stone", 1))
+---- runtime::tests::an_exporter_exports_only_what_its_filter_names stdout ----
+assertion `left == right` failed
+  left: None
+ right: Some(("minecraft:gold_ingot", 1))
+---- runtime::tests::the_first_filter_entry_with_stock_wins stdout ----
+assertion `left == right` failed: the first entry with stock is the pass's task
+  left: None
+ right: Some(("minecraft:gold_ingot", 1))
+test result: FAILED. 66 passed; 11 failed; 0 ignored; 0 measured; 0 filtered out
+```
+
+Green after the rules: **77 passed, 0 failed** (`sdk-test-0.2.7.log`). The thirteen new tests are
+`kind_maps_the_four_blocks_and_nothing_else` (extended to seven), `a_machine_without_speed_upgrades_works_every_nine_ticks`,
+`each_speed_upgrade_shortens_the_work_interval_by_two`, `a_fifth_speed_upgrade_is_not_counted`,
+`a_work_pass_falls_on_every_interval_th_tick_starting_with_the_first`,
+`a_stack_upgrade_multiplies_one_pass_by_a_stack`, `an_empty_filter_imports_everything`,
+`a_filter_imports_everything_but_what_it_names`,
+`an_import_takes_the_quota_and_no_more_than_the_slot_holds`,
+`an_exporter_exports_only_what_its_filter_names`, `an_exporter_without_a_filter_exports_nothing`,
+`an_export_takes_the_quota_and_no_more_than_the_network_holds`,
+`the_first_filter_entry_with_stock_wins` and `a_machine_readout_names_its_upgrades_and_interval`.
+
+### Green — the ladder and the in-game leg (one launcher build at `0a875da`)
+
+| Step | Command | Result |
+|---|---|---|
+| runtime + glue tests | `cargo test --offline` | **77 passed**, 0 failed (`sdk-test-0.2.7.log`) |
+| lints | `cargo clippy --all-targets --offline -- -D warnings` | exit 0, **0 warnings** (`sdk-clippy-0.2.7.log`) |
+| formatting | `rustfmt --edition 2024 --check src/{lib,support,runtime}.rs` | clean, `FMT_EXIT:0` (`sdk-fmt-0.2.7.log`) |
+| SDK check | `cargo horizon-mod check` | *"…566 items of the API (… 20 hooks …). Made for 0a875da."* (`sdk-check-0.2.7.log`) |
+| package | `rm -f Cargo.lock && cargo horizon-mod build` ×2 | **byte-identical** (`cmp`), **179,081 B**, SHA-256 `3223f32ae80773769dd4a5b3ac1dc350477d7608778131223a6ba43e93bb6bb9`, **235 entries**, no `Cargo.lock` (`sdk-build-0.2.7-{1,2}.log`) |
+| package check | `cargo horizon-mod check refinedstorage.hmod` | `0.2.7 (native-mod, format native-1/0a875da…/e59da909…, for 26.3) 179081 bytes` |
+| fits (pin) | `… fits refinedstorage.hmod --build 0a875da` | *"0a875da made for"*, `FITS_PIN_EXIT:0` |
+| fits (other build) | `… fits refinedstorage.hmod --build 0b14f8a` | *"0b14f8a fits"*, `FITS_OTHER_EXIT:0` (`sdk-check-fits-0.2.7.log`) |
+| launcher build | `launcher-game.sh build refinedstorage --rebuild` | exit 0, **`Compiling refinedstorage (1 of 1)`**, `native-0a875da-3a543f18b508` (`launcher-build-0.2.7.log`) |
+| in-game leg | `build-slot.sh run --step e2e -- bash tools/e2e.sh` | **PASS** + **`EXIT:0`** (`e2e-slice7-green.log`) |
+| control (same Nightly, no package) | `GAME=$CONTROL_GAME …` | **FAIL** + **`EXIT:1`** — *"the block at 41,64,1 is minecraft:air, expected facing=north"* |
+| selftest (flipped interval) | `SELFTEST=speed …` | **FAIL** + **`EXIT:1`** — *"the un-upgraded importer moved 64 items in 20 ticks, expected 1 to 5"* |
+| selftest (flipped quota) | `SELFTEST=stack …` | **FAIL** + **`EXIT:1`** — *"with a stack upgrade the importer moved to 64 items, expected 5"* |
+| log gate | `check-e2e-logs.py refinedstorage-e2e --strict` | `logs=31 ok=31 missing-exit=0 bad-exit=0` |
+| package gate | `verify-sdk-package.py refinedstorage` | **1/1** |
+
+The scenario (quoted from `e2e-slice7-green.log`; the machines sit at z=16, on the arena floor,
+with the source a hopper at 44,64,16 and the exporter's destination a chest at 41,64,18):
+
+```
+  block(43,64,16): refinedstorage:importer[facing=east,open=false]
+  info(42,64,16): … online (4 nodes, 1 controller, 1 drive, 0 grid, 1 importer); 0 disks, …
+  info(43,64,16) machine: Importer at 43,64,16: 0 speed upgrades, 0 stack upgrades, work interval 9 ticks, 0 filters
+  items given: importer 1, exporter 1
+  after 20 ticks without an upgrade: 3 items on the network, source [{"count":61,"item":"minecraft:stone"}]
+  importer slots: [{"count":1,"item":"refinedstorage:stack_upgrade"}]
+  info(43,64,16) machine: Importer at 43,64,16: 0 speed upgrades, 1 stack upgrade, work interval 9 ticks, 0 filters
+  after the stack upgrade: 64 items on the network, source []
+  importer slots: [4 × refinedstorage:speed_upgrade]
+  info(43,64,16) machine: Importer at 43,64,16: 4 speed upgrades, 0 stack upgrades, work interval 1 tick, 0 filters
+  after 20 ticks with four speed upgrades: 88 items on the network
+  info(42,64,16): … 128 items in 2 resources
+  importer filter: [{"count":1,"item":"minecraft:dirt"}, 4 × speed_upgrade]
+  source after the filtered pass: [{"count":5,"item":"minecraft:dirt"}]
+  info(41,64,17) machine: Exporter at 41,64,17: 0 speed upgrades, 0 stack upgrades, work interval 9 ticks, 1 filter
+  exporter with no filter: 133 -> 133 items
+  exporter destination: [{"count":4,"item":"minecraft:gold_ingot"}]
+  exporter network after the pass: 133 items (was 133)
+  exporter drops: {"minecraft:gold_ingot":1,"refinedstorage:exporter":1}
+  importer drops: {"refinedstorage:importer":1}
+```
+
+Every assertion has its differential or counterfactual: the **same** importer and source are read
+after the same 20 ticks with no upgrade (3), with a stack upgrade (64 in one pass, source empty)
+and with four speed upgrades (88, then the whole source); the filter leg has the stone leave and
+the dirt stay in the same chest; the exporter has a no-filter pass move nothing before the gold
+pass moves exactly four; the machine menu shows 13 slots and its upgrade row refuses a diamond
+while a filter slot took the dirt; and `SELFTEST=speed` / `SELFTEST=stack` assert the other side of
+the two rules, so a machine that ignored its upgrades fails the run.
+
+### Harness facts learned here
+
+- **A container block's own use wins over placing a block against it.** Right-clicking a chest or
+  a hopper with a block item in hand opens *its* menu (the reply's `screen: container`), so an
+  importer cannot be placed by clicking one. The machines are placed with `setblock`, and the
+  directional placement rule is proven on a plain stone (the shared `state_for_placement` hook), or
+  by a machine actually working on the neighbour its `facing` names.
+- **Creative placement keeps the block in the hand** (`hotbar[0].count == 1` after placing), so
+  "the item left the hand" is not a placement assertion in creative; a *mod* consumption (a disk
+  into a drive) is a different path.
+- **A `ctl tp` keeps the player's velocity**, so a spot chosen for an exact distance drifts (a
+  16.0-block use was measured at 16.4 after `tp 34 64 8`). The exact boundary is the command's
+  assertion; the item's in-range leg stands 15.5 blocks out.
+- **A block capability is `LevelRef::capability(host, &ITEMS, pos, side)`** — the game's own
+  provider is the hopper-rules container handler, so a vanilla chest or hopper needs no extra
+  registration, and the side passed is the source's face toward the machine
+  (`direction.getOpposite()` upstream).
+- **The exporter drains as fast as the importer fills.** With a filter already set, a spike on the
+  network is not observable: assert the destination's count and the network's return instead.
+
+### Coverage (parity rule) — every family this slice ships
+
+| family | state |
+|---|---|
+| the `importer` block | **tested** — placed, read back with `facing`, its network census line, and **broken for itself** (`drops: {refinedstorage:importer: 1}`) |
+| the `exporter` block | **tested** — placed, read back, and **broken for itself** (`drops: {refinedstorage:exporter: 1}`) |
+| the importer's transfer tick | **tested** — 1 item per 9 ticks (3 in 20), 64 with a stack upgrade (one pass), ~20 in 20 with four speed upgrades |
+| the exporter's transfer tick | **tested** — 1 item per 9 ticks, exactly the four gold its filter names |
+| the work interval (`9 - 2 × speed`) | **tested** — unit tests (9/7/5/3/1, a fifth uncounted) and the in-game counts; `SELFTEST=speed` inverts it |
+| the transfer quota (1 / 64) | **tested** — unit tests and the in-game one-pass 64; `SELFTEST=stack` inverts it |
+| the filter (nine entries, BLOCK mode) | **tested** — an empty filter imports everything, a named resource stays in the source, the exporter exports only what it names, a no-filter exporter does nothing |
+| the 13-slot menu | **tested** — `ctl screen` (13 container slots), the upgrade row visible, an upgrade placed and read back from the block's own slots |
+| the slot rules | **tested** — a diamond refused by the upgrade row (and the filter row accepting a filter item) |
+| `refinedstorage:speed_upgrade` | **tested** — crafted by `recipe_check.py` (output + count, ingredients consumed, wrong-ingredient control), given, placed in a machine's slot, its rule proven |
+| `refinedstorage:stack_upgrade` | **tested** — the same, and its recipe consumes a speed upgrade |
+| the `importer`/`exporter` recipes | **tested** — crafted (output id + count, ingredients consumed) with a wrong-ingredient control on `refinedstorage:destruction_core`/`construction_core` |
+| the `importers`/`exporters` item tags | **carried** — declared with their plain member, ready for the dyed variants |
+| the block models, blockstates, textures and lang | **carried** — the jar's own models (the cable core plus the machine's steps), `part_border.png`, the two item textures |
+| `regulator_upgrade` | **not ported** — `blocked(no-regulator-configuration)`: its amount/resource live in the item's own menu, which the port has no surface for; unconfigured it changes nothing |
+| `autocrafting_upgrade` | **not ported** — `blocked(no-autocrafting-system)`: it starts an autocrafting task for a missing resource |
+| `silk_touch`, `fortune_1/2/3` | **not ported** — `blocked(no-destructor)`, and the enchanted-book recipe type |
+| filter mode / fuzzy / redstone / scheduling mode toggles, exporting indicators | **not ported** — deviation 2 and 3 |
+| the upgrades/filter items dropping when a machine is broken | **not ported** — deviation 5 |
+| network energy (upstream 5 FE/t per machine + per upgrade) | **not ported** — parent gap 1 |
+
+Skills: superpowers/using-superpowers,brainstorming,writing-plans,test-driven-development,systematic-debugging,verification-before-completion; BeautifulRust/rust-best-practices
+
+Evidence: `ports/_shared/evidence/refinedstorage/` — `plan-slice7-importer-exporter.md`,
+`runtime-red-slice7-machines.log`, `sdk-test-0.2.7.log`, `sdk-clippy-0.2.7.log`,
+`sdk-fmt-0.2.7.log`, `sdk-check-0.2.7.log`, `sdk-build-0.2.7-{1,2}.log`,
+`sdk-check-fits-0.2.7.log`, `refinedstorage.hmod` (the delivered bytes) — and
+`ports/_shared/evidence/refinedstorage-e2e/` — `e2e-slice7-green.log` (green),
+`e2e-slice7-control.log`, `e2e-slice7-selftest-speed.log`, `e2e-slice7-selftest-stack.log`,
+`e2e-slice7-selftest-networks.log` (the slice-5 rule's counterfactual, still failing on purpose), and
+`launcher-build-0.2.7.log` (`Compiling refinedstorage (1 of 1)`, `native-0a875da-3a543f18b508` —
+the build every leg ran on).

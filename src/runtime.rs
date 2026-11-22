@@ -40,8 +40,8 @@ pub const MAX_RANGE_UPGRADES: u32 = 4;
 /// `Integer.MAX_VALUE`, which no finite distance exceeds.
 pub const CREATIVE_RANGE: u32 = i32::MAX as u32;
 
-/// The network blocks of the port: the slice's four, plus the wireless
-/// transmitter (slice 3).
+/// The network blocks of the port: the slice's four, the wireless transmitter
+/// (slice 3) and the two transfer machines (slice 7).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Kind {
     Controller,
@@ -49,6 +49,8 @@ pub enum Kind {
     DiskDrive,
     Grid,
     WirelessTransmitter,
+    Importer,
+    Exporter,
 }
 
 impl Kind {
@@ -60,6 +62,8 @@ impl Kind {
             Kind::DiskDrive => "refinedstorage:disk_drive",
             Kind::Grid => "refinedstorage:grid",
             Kind::WirelessTransmitter => "refinedstorage:wireless_transmitter",
+            Kind::Importer => "refinedstorage:importer",
+            Kind::Exporter => "refinedstorage:exporter",
         }
     }
 
@@ -71,9 +75,21 @@ impl Kind {
             Kind::DiskDrive,
             Kind::Grid,
             Kind::WirelessTransmitter,
+            Kind::Importer,
+            Kind::Exporter,
         ]
         .into_iter()
         .find(|kind| kind.block_id() == block)
+    }
+
+    /// The human name a machine's info line leads with, for the two kinds that
+    /// transfer; `None` for every other block.
+    pub fn machine_name(self) -> Option<&'static str> {
+        match self {
+            Kind::Importer => Some("Importer"),
+            Kind::Exporter => Some("Exporter"),
+            _ => None,
+        }
     }
 }
 
@@ -373,6 +389,126 @@ pub fn range_label(range: u32) -> String {
         return "unlimited".to_owned();
     }
     format!("{range} blocks")
+}
+
+// --- the transfer machines (slice 7) --------------------------------------
+
+/// The ticks one work pass takes with no speed upgrade (upstream
+/// `UpgradeContainer.DEFAULT_WORK_TICK_RATE`, 9).
+pub const WORK_TICK_RATE: u32 = 9;
+
+/// The ticks each speed upgrade removes from the work interval (upstream
+/// `UpgradeContainer.notifyListener`: `defaultWorkTickRate - (amount * 2)`).
+pub const SPEED_TICK_REDUCTION: u32 = 2;
+
+/// The most speed upgrades a machine counts (upstream's `IMPORTER`/`EXPORTER`
+/// registration: `speedUpgrade`, `maxAmount` 4).
+pub const MAX_SPEED_UPGRADES: u32 = 4;
+
+/// The most stack upgrades a machine counts (upstream's registration has no
+/// `maxAmount`, so the container's four slots cap it; one is all that changes
+/// the quota, and its recipe is one per machine).
+pub const MAX_STACK_UPGRADES: u32 = 1;
+
+/// The items one work pass moves with no stack upgrade (upstream's
+/// `ItemHandlerImporterTransferStrategyFactory`/`ItemHandlerExporterTransferStrategyFactory`:
+/// a single amount of 1).
+pub const BASE_TRANSFER: u32 = 1;
+
+/// The items one work pass moves with a stack upgrade (the same factories: a
+/// single amount of 64).
+pub const STACK_TRANSFER: u32 = 64;
+
+/// The ticks between two work passes with `speed_upgrades` in the machine:
+/// 9 at none, 7, 5, 3, and 1 from four on (upstream's throttled ticker, which
+/// never counts a fifth).
+pub fn work_interval(speed_upgrades: u32) -> u32 {
+    WORK_TICK_RATE - SPEED_TICK_REDUCTION * speed_upgrades.min(MAX_SPEED_UPGRADES)
+}
+
+/// How many items one work pass may move with `stack_upgrades` in the machine.
+pub fn transfer_quota(stack_upgrades: u32) -> u32 {
+    if stack_upgrades >= MAX_STACK_UPGRADES {
+        STACK_TRANSFER
+    } else {
+        BASE_TRANSFER
+    }
+}
+
+/// Whether a work pass falls on this tick: upstream's ticker works when
+/// `workTicks++ % workTickRate == 0`, so the first tick it sees works and the
+/// rest follow every `interval` ticks.
+pub fn work_due(ticks: u64, interval: u32) -> bool {
+    ticks.is_multiple_of(u64::from(interval))
+}
+
+/// Whether a filter of resource keys lets `key` through (upstream's `Filter`
+/// in its default `BLOCK` mode: an empty filter blocks nothing, so everything
+/// is allowed, and a listed key is the only thing that is not).
+pub fn allows(filter: &[String], key: &str) -> bool {
+    !filter.iter().any(|blocked| blocked == key)
+}
+
+/// What an importer's work pass takes from its source: the first slot whose
+/// resource the filter allows, and up to `quota` of it, capped by the slot's
+/// own count. `None` when nothing is allowed or the source is empty.
+pub fn import_plan(
+    source: &[Option<(String, u32)>],
+    filter: &[String],
+    quota: u32,
+) -> Option<(usize, String, u32)> {
+    for (slot, entry) in source.iter().enumerate() {
+        let Some((key, count)) = entry else {
+            continue;
+        };
+        if *count == 0 || !allows(filter, key) {
+            continue;
+        }
+        return Some((slot, key.clone(), quota.min(*count)));
+    }
+    None
+}
+
+/// What an exporter's work pass pushes: the first filter entry the network
+/// holds, and up to `quota` of it, capped by the network's stock. `None` when
+/// the filter is empty (upstream's exporter has one task per filter entry, so
+/// no entry means no work) or nothing it names is held.
+pub fn export_plan(filter: &[String], held: &[(String, u64)], quota: u32) -> Option<(String, u32)> {
+    for key in filter {
+        let Some((_, amount)) = held.iter().find(|(resource, _)| resource == key) else {
+            continue;
+        };
+        if *amount == 0 {
+            continue;
+        }
+        let capped = u32::try_from(*amount).unwrap_or(u32::MAX);
+        return Some((key.clone(), quota.min(capped)));
+    }
+    None
+}
+
+/// A machine's `/refinedstorage info` line: its name and position, the two
+/// upgrade counts, the work interval the speed upgrades set, and how many
+/// filter entries it holds.
+pub fn machine_readout(
+    name: &str,
+    pos: [i32; 3],
+    speed_upgrades: u32,
+    stack_upgrades: u32,
+    filters: usize,
+) -> String {
+    let interval = work_interval(speed_upgrades);
+    let plural = |count: usize| if count == 1 { "" } else { "s" };
+    format!(
+        "{name} at {},{},{}: {speed_upgrades} speed upgrade{}, {stack_upgrades} stack upgrade{}, work interval {interval} tick{}, {filters} filter{}",
+        pos[0],
+        pos[1],
+        pos[2],
+        plural(speed_upgrades as usize),
+        plural(stack_upgrades as usize),
+        plural(interval as usize),
+        plural(filters),
+    )
 }
 
 /// What a stored entry must answer for the network to treat it as one resource.
@@ -1105,13 +1241,24 @@ mod tests {
             Kind::from_block("refinedstorage:wireless_transmitter"),
             Some(Kind::WirelessTransmitter)
         );
+        assert_eq!(
+            Kind::from_block("refinedstorage:importer"),
+            Some(Kind::Importer)
+        );
+        assert_eq!(
+            Kind::from_block("refinedstorage:exporter"),
+            Some(Kind::Exporter)
+        );
         assert_eq!(Kind::from_block("minecraft:stone"), None);
-        assert_eq!(Kind::from_block("refinedstorage:importer"), None);
+        assert_eq!(Kind::from_block("refinedstorage:destructor"), None);
         assert_eq!(Kind::Controller.block_id(), "refinedstorage:controller");
         assert_eq!(
             Kind::WirelessTransmitter.block_id(),
             "refinedstorage:wireless_transmitter"
         );
+        assert_eq!(Kind::Importer.machine_name(), Some("Importer"));
+        assert_eq!(Kind::Exporter.machine_name(), Some("Exporter"));
+        assert_eq!(Kind::Cable.machine_name(), None);
     }
 
     #[test]
@@ -2111,5 +2258,168 @@ mod tests {
             }
         }
         assert_eq!(amount(&disks, "minecraft:diamond"), 72);
+    }
+
+    // --- the transfer machines (slice 7) ------------------------------------
+
+    fn key(id: &str) -> String {
+        id.to_owned()
+    }
+
+    #[test]
+    fn a_machine_without_speed_upgrades_works_every_nine_ticks() {
+        assert_eq!(work_interval(0), WORK_TICK_RATE);
+        assert_eq!(work_interval(0), 9);
+    }
+
+    #[test]
+    fn each_speed_upgrade_shortens_the_work_interval_by_two() {
+        assert_eq!(work_interval(1), 7);
+        assert_eq!(work_interval(2), 5);
+        assert_eq!(work_interval(3), 3);
+        assert_eq!(work_interval(4), 1);
+    }
+
+    #[test]
+    fn a_fifth_speed_upgrade_is_not_counted() {
+        // Upstream's container refuses a fifth speed upgrade; a stray count
+        // must not make the interval zero (which would divide by zero) or
+        // negative.
+        assert_eq!(work_interval(5), 1);
+        assert_eq!(work_interval(64), 1);
+    }
+
+    #[test]
+    fn a_work_pass_falls_on_every_interval_th_tick_starting_with_the_first() {
+        let interval = work_interval(1); // 7
+        let due: Vec<u64> = (0..15).filter(|tick| work_due(*tick, interval)).collect();
+        assert_eq!(due, vec![0, 7, 14]);
+        let due: Vec<u64> = (0..10)
+            .filter(|tick| work_due(*tick, work_interval(4)))
+            .collect();
+        assert_eq!(due, (0..10).collect::<Vec<u64>>());
+    }
+
+    #[test]
+    fn a_stack_upgrade_multiplies_one_pass_by_a_stack() {
+        assert_eq!(transfer_quota(0), 1);
+        assert_eq!(transfer_quota(1), 64);
+        // One stack upgrade is all upstream's quota reads; a stray second one
+        // does not raise it again.
+        assert_eq!(transfer_quota(2), 64);
+    }
+
+    #[test]
+    fn an_empty_filter_imports_everything() {
+        let source = [Some((key("minecraft:stone"), 5))];
+        assert_eq!(
+            import_plan(&source, &[], 1),
+            Some((0, key("minecraft:stone"), 1)),
+            "an empty BLOCK filter blocks nothing"
+        );
+    }
+
+    #[test]
+    fn a_filter_imports_everything_but_what_it_names() {
+        let source = [
+            Some((key("minecraft:stone"), 5)),
+            Some((key("minecraft:gold_ingot"), 4)),
+        ];
+        assert_eq!(
+            import_plan(&source, &[key("minecraft:stone")], 1),
+            Some((1, key("minecraft:gold_ingot"), 1)),
+            "the named resource is blocked; the next one is taken"
+        );
+        assert_eq!(
+            import_plan(
+                &source,
+                &[key("minecraft:stone"), key("minecraft:gold_ingot")],
+                64
+            ),
+            None,
+            "a filter naming both lets nothing through"
+        );
+    }
+
+    #[test]
+    fn an_import_takes_the_quota_and_no_more_than_the_slot_holds() {
+        let source = [None, Some((key("minecraft:stone"), 5))];
+        assert_eq!(
+            import_plan(&source, &[], 64),
+            Some((1, key("minecraft:stone"), 5))
+        );
+        assert_eq!(
+            import_plan(&source, &[], 1),
+            Some((1, key("minecraft:stone"), 1))
+        );
+        // An empty slot is skipped, and an empty source has nothing to take.
+        assert_eq!(import_plan(&[None], &[], 1), None);
+        assert_eq!(
+            import_plan(&[Some((key("minecraft:stone"), 0))], &[], 1),
+            None
+        );
+    }
+
+    #[test]
+    fn an_exporter_exports_only_what_its_filter_names() {
+        let held = [
+            (key("minecraft:stone"), 5),
+            (key("minecraft:gold_ingot"), 3),
+        ];
+        assert_eq!(
+            export_plan(&[key("minecraft:gold_ingot")], &held, 1),
+            Some((key("minecraft:gold_ingot"), 1))
+        );
+        assert_eq!(
+            export_plan(&[key("minecraft:diamond")], &held, 1),
+            None,
+            "a filter naming what the network does not hold exports nothing"
+        );
+    }
+
+    #[test]
+    fn an_exporter_without_a_filter_exports_nothing() {
+        // Upstream's exporter has one task per filter entry; no entry, no work.
+        let held = [(key("minecraft:gold_ingot"), 3)];
+        assert_eq!(export_plan(&[], &held, 1), None);
+    }
+
+    #[test]
+    fn an_export_takes_the_quota_and_no_more_than_the_network_holds() {
+        let held = [(key("minecraft:gold_ingot"), 3)];
+        assert_eq!(
+            export_plan(&[key("minecraft:gold_ingot")], &held, 64),
+            Some((key("minecraft:gold_ingot"), 3))
+        );
+        assert_eq!(
+            export_plan(&[key("minecraft:gold_ingot")], &held, 1),
+            Some((key("minecraft:gold_ingot"), 1))
+        );
+    }
+
+    #[test]
+    fn the_first_filter_entry_with_stock_wins() {
+        let held = [(key("minecraft:gold_ingot"), 3)];
+        assert_eq!(
+            export_plan(
+                &[key("minecraft:diamond"), key("minecraft:gold_ingot")],
+                &held,
+                1
+            ),
+            Some((key("minecraft:gold_ingot"), 1)),
+            "the first entry with stock is the pass's task"
+        );
+    }
+
+    #[test]
+    fn a_machine_readout_names_its_upgrades_and_interval() {
+        assert_eq!(
+            machine_readout("Importer", [43, 64, 16], 1, 0, 1),
+            "Importer at 43,64,16: 1 speed upgrade, 0 stack upgrades, work interval 7 ticks, 1 filter"
+        );
+        assert_eq!(
+            machine_readout("Exporter", [41, 64, 17], 4, 1, 0),
+            "Exporter at 41,64,17: 4 speed upgrades, 1 stack upgrade, work interval 1 tick, 0 filters"
+        );
     }
 }

@@ -1,0 +1,62 @@
+{
+  "multipart": [
+    {
+      "apply": {
+        "model": "refinedstorage:block/cable/core"
+      }
+    },
+    {
+      "apply": {
+        "model": "refinedstorage:block/importer"
+      },
+      "when": {
+        "facing": "north"
+      }
+    },
+    {
+      "apply": {
+        "model": "refinedstorage:block/importer",
+        "y": 90
+      },
+      "when": {
+        "facing": "east"
+      }
+    },
+    {
+      "apply": {
+        "model": "refinedstorage:block/importer",
+        "x": 180
+      },
+      "when": {
+        "facing": "south"
+      }
+    },
+    {
+      "apply": {
+        "model": "refinedstorage:block/importer",
+        "y": 270
+      },
+      "when": {
+        "facing": "west"
+      }
+    },
+    {
+      "apply": {
+        "model": "refinedstorage:block/importer",
+        "x": 270
+      },
+      "when": {
+        "facing": "up"
+      }
+    },
+    {
+      "apply": {
+        "model": "refinedstorage:block/importer",
+        "x": 90
+      },
+      "when": {
+        "facing": "down"
+      }
+    }
+  ]
+}

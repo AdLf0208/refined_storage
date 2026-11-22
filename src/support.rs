@@ -19,13 +19,13 @@ use mod_api::item::containers::ModBlockEntityFields;
 use mod_api::{
     self, BlockEntityEvent, BlockEntityPart, BlockEntityTickEvent, BlockEntityTicksEvent, BlockKey,
     BlockPart, BlockState, Command, CommandArgumentValue, CommandInvocation, CommandSource,
-    Component, Compound, Flow, Hand, Host, HostSide, HostTransaction, InteractionResult, ItemKey,
-    ItemPart, ItemPlace, ItemResource, ItemStack, LevelHost, LevelRef, LevelSide, MenuClickedEvent,
-    MenuClosedEvent, MenuContainer, MenuPart, MenuRef, MenuReplace, MenuSlotBacking,
-    MenuSlotRulesEvent, ModBlockEntityView, ModContainer, RegisterCommandsEvent, Registrar,
-    RegistrationContext, RightClickBlockEvent, RunModCommandEvent, Screen, ScreenEvent, ServerHost,
-    ServerTickEvent, ServerTickPhase, StateForPlacementEvent, Tag, Text, UseItemEvent, UseOnEvent,
-    WorldPhase,
+    Component, Compound, Flow, Hand, Host, HostSide, HostTransaction, ITEMS, InteractionResult,
+    ItemKey, ItemPart, ItemPlace, ItemResource, ItemStack, LevelHost, LevelRef, LevelSide,
+    MenuClickedEvent, MenuClosedEvent, MenuContainer, MenuPart, MenuRef, MenuReplace,
+    MenuSlotBacking, MenuSlotRulesEvent, ModBlockEntityView, ModContainer, RegisterCommandsEvent,
+    Registrar, RegistrationContext, RightClickBlockEvent, RunModCommandEvent, Screen, ScreenEvent,
+    ServerHost, ServerTickEvent, ServerTickPhase, StateForPlacementEvent, Tag, Text, UseItemEvent,
+    UseOnEvent, WorldPhase,
 };
 
 use crate::runtime::{
@@ -46,12 +46,22 @@ const TRANSMITTER: &str = "refinedstorage:wireless_transmitter";
 /// The wireless grid (slice 4): a network-bound item that opens its network's
 /// 9×6 grid view from anywhere inside a transmitter's range.
 const WIRELESS_GRID: &str = "refinedstorage:wireless_grid";
+/// The importer and exporter (slice 7): the network's two transfer blocks,
+/// each working on the neighbour its `facing` points at.
+const IMPORTER: &str = "refinedstorage:importer";
+const EXPORTER: &str = "refinedstorage:exporter";
 /// The range upgrade (slice 6): +8 blocks each, at most four per transmitter
 /// (upstream `RangeUpgradeItem`, registered for `WIRELESS_TRANSMITTER`).
 const RANGE_UPGRADE: &str = "refinedstorage:range_upgrade";
 /// The creative range upgrade (slice 6): unlimited range, creative-only, at
 /// most one per transmitter (upstream `RangeUpgradeItem`, creative).
 const CREATIVE_RANGE_UPGRADE: &str = "refinedstorage:creative_range_upgrade";
+/// The speed upgrade (slice 7): two ticks off a machine's work interval, at
+/// most four (upstream `SimpleUpgradeItem::speedUpgrade`).
+const SPEED_UPGRADE: &str = "refinedstorage:speed_upgrade";
+/// The stack upgrade (slice 7): one work pass moves 64 instead of 1, at most
+/// one (upstream `SimpleUpgradeItem::stackUpgrade`).
+const STACK_UPGRADE: &str = "refinedstorage:stack_upgrade";
 /// The block-entity type this mod declares for the four network blocks.
 const BE_TYPE: &str = "refinedstorage:network";
 /// The item component that carries a disk's contents.
@@ -77,6 +87,18 @@ const TRANSMITTER_SLOTS: usize = 4;
 /// the four upgrade slots beside the player's inventory. The pin's vanilla
 /// menus have no four-slot type, so the package declares its own (API 85).
 const TRANSMITTER_MENU: &str = "refinedstorage:wireless_transmitter";
+/// A machine's filter entries: upstream's `ResourceContainerImpl.createForFilter`
+/// makes a nine-slot container (`AbstractSimpleFilterContainerMenu.addSlots`
+/// puts them first).
+const FILTER_SLOTS: usize = 9;
+/// A machine's upgrade slots: upstream's `UpgradeContainer` default size (4).
+const MACHINE_UPGRADES: usize = 4;
+/// A machine's menu slots: the nine filter entries, then the four upgrades
+/// (upstream's `ImporterContainerMenu`/`ExporterContainerMenu` order).
+const MACHINE_SLOTS: usize = FILTER_SLOTS + MACHINE_UPGRADES;
+/// The importer's and exporter's menus (the package's own content menu types).
+const IMPORTER_MENU: &str = "refinedstorage:importer";
+const EXPORTER_MENU: &str = "refinedstorage:exporter";
 
 /// The saved compound key the grid's view marks live under.
 const VIEW_KEY: &str = "RefinedStorageView";
@@ -94,15 +116,19 @@ struct Keys {
     disk_drive: BlockKey,
     grid: BlockKey,
     transmitter: BlockKey,
+    importer: BlockKey,
+    exporter: BlockKey,
     disk: ItemKey,
     wireless_grid: ItemKey,
     range_upgrade: ItemKey,
     creative_range_upgrade: ItemKey,
+    speed_upgrade: ItemKey,
+    stack_upgrade: ItemKey,
 }
 
 impl Keys {
     /// The network kind of a loaded block, none when it is not one of the
-    /// five.
+    /// seven.
     fn kind_of(self, block: BlockKey) -> Option<Kind> {
         [
             (self.controller, Kind::Controller),
@@ -110,6 +136,8 @@ impl Keys {
             (self.disk_drive, Kind::DiskDrive),
             (self.grid, Kind::Grid),
             (self.transmitter, Kind::WirelessTransmitter),
+            (self.importer, Kind::Importer),
+            (self.exporter, Kind::Exporter),
         ]
         .into_iter()
         .find_map(|(key, kind)| (key == block).then_some(kind))
@@ -133,17 +161,31 @@ pub(crate) fn register(registrar: &mut dyn Registrar, _cx: &RegistrationContext)
         disk_drive: registrar.block_key(DISK_DRIVE),
         grid: registrar.block_key(GRID),
         transmitter: registrar.block_key(TRANSMITTER),
+        importer: registrar.block_key(IMPORTER),
+        exporter: registrar.block_key(EXPORTER),
         disk: registrar.item_key(DISK),
         wireless_grid: registrar.item_key(WIRELESS_GRID),
         range_upgrade: registrar.item_key(RANGE_UPGRADE),
         creative_range_upgrade: registrar.item_key(CREATIVE_RANGE_UPGRADE),
+        speed_upgrade: registrar.item_key(SPEED_UPGRADE),
+        stack_upgrade: registrar.item_key(STACK_UPGRADE),
     };
     let _ = KEYS.set(keys);
     registrar.item_part(keys.wireless_grid, WirelessGrid);
     registrar.menu_part(TRANSMITTER_MENU, Upgrades);
+    registrar.menu_part(IMPORTER_MENU, MachineSlots);
+    registrar.menu_part(EXPORTER_MENU, MachineSlots);
     let kind = registrar
         .block_entity_type(BE_TYPE)
-        .blocks(&[CONTROLLER, CABLE, DISK_DRIVE, GRID, TRANSMITTER])
+        .blocks(&[
+            CONTROLLER,
+            CABLE,
+            DISK_DRIVE,
+            GRID,
+            TRANSMITTER,
+            IMPORTER,
+            EXPORTER,
+        ])
         .build();
     registrar
         .block_entity_part(&kind, Network)
@@ -175,6 +217,36 @@ pub(crate) fn register(registrar: &mut dyn Registrar, _cx: &RegistrationContext)
             // the grid, a disk into the drive) and take them out.
             inputs: all.clone(),
             outputs: all,
+            menu: Some(menu.to_owned()),
+            ..ModContainer::default()
+        };
+        registrar.block_container(&block, container);
+    }
+    // The machines' filter entries and upgrade slots (upstream's nine-slot
+    // filter container then its four-slot upgrade container).
+    let machine_slots: Vec<usize> = (0..MACHINE_SLOTS).collect();
+    for (block, menu) in [
+        (keys.importer, IMPORTER_MENU),
+        (keys.exporter, EXPORTER_MENU),
+    ] {
+        #[expect(
+            clippy::needless_update,
+            reason = "the update is for a field a later game build may add"
+        )]
+        let container = ModContainer {
+            slots: MACHINE_SLOTS,
+            // No hopper reaches a machine's filter or upgrade slots upstream:
+            // they are the menu's, and the machine's own work is its tick.
+            faces: [
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+            ],
+            inputs: machine_slots.clone(),
+            outputs: machine_slots.clone(),
             menu: Some(menu.to_owned()),
             ..ModContainer::default()
         };
@@ -247,6 +319,62 @@ impl MenuPart for Upgrades {
             event.may_place = false;
         }
         if creative && held(keys.creative_range_upgrade) >= 1 {
+            event.may_place = false;
+        }
+    }
+}
+
+/// An importer's or exporter's menu slots: the nine filter entries (any item,
+/// one per slot) and the four upgrade slots (a speed or stack upgrade, one per
+/// slot, at most four speed and one stack — upstream's
+/// `UpgradeContainer.canPlaceItem` and its `IMPORTER`/`EXPORTER`
+/// registrations).
+///
+/// Scoped to the menu's own container (`MenuContainer::Main`) and to the two
+/// slot ranges, so a refusal on one slot cannot cancel a click on another: the
+/// player inventory keeps vanilla's rules, and a diamond the upgrade slots
+/// refuse still lands in a filter slot if that is where the click went.
+struct MachineSlots;
+
+#[mod_api::horizon_part]
+impl MenuPart for MachineSlots {
+    fn menu_slot_rules(&self, _host: &dyn Host, event: &mut MenuSlotRulesEvent<'_>) {
+        if event.container != MenuContainer::Main {
+            return;
+        }
+        if event.slot < FILTER_SLOTS {
+            // A filter entry names one resource with one item.
+            event.max_stack = 1;
+            return;
+        }
+        if event.slot >= MACHINE_SLOTS {
+            event.may_place = false;
+            return;
+        }
+        let keys = keys();
+        let item = event.stack.item();
+        let speed = item == keys.speed_upgrade;
+        let stack = item == keys.stack_upgrade;
+        if !speed && !stack {
+            event.may_place = false;
+            return;
+        }
+        // One upgrade per slot, as `UpgradeContainer.getMaxStackSize` answers 1.
+        event.max_stack = 1;
+        let held = |what: ItemKey| {
+            (FILTER_SLOTS..MACHINE_SLOTS)
+                .filter(|slot| {
+                    event
+                        .context
+                        .slot(MenuContainer::Main, *slot)
+                        .is_some_and(|held| held.item() == what)
+                })
+                .count() as u32
+        };
+        if speed && held(keys.speed_upgrade) >= runtime::MAX_SPEED_UPGRADES {
+            event.may_place = false;
+        }
+        if stack && held(keys.stack_upgrade) >= runtime::MAX_STACK_UPGRADES {
             event.may_place = false;
         }
     }
@@ -709,27 +837,33 @@ fn disks_of(live: &[LiveDisk]) -> Vec<Disk<Net>> {
 /// into the drive's slot, in one transaction. The drive's own tick then re-reads
 /// the item (its cache is not dirty), so the block grid and this item agree.
 fn write_back(host: &mut dyn ServerHost, level: LevelRef, live: &[LiveDisk], disks: &[Disk<Net>]) {
-    let mut writes = Vec::new();
+    let _ = host.transaction(|host, tx| {
+        write_back_in(host, tx, level, live, disks);
+        Ok::<(), mod_api::BlockEntityItemError>(())
+    });
+}
+
+/// [`write_back`] inside a transaction the caller already opened: a machine's
+/// work pass moves items out of a neighbour and puts the disks back in one go,
+/// so a failure between the two cannot lose them.
+fn write_back_in(
+    host: &mut dyn ServerHost,
+    tx: &mod_api::Transaction,
+    level: LevelRef,
+    live: &[LiveDisk],
+    disks: &[Disk<Net>],
+) {
     for (disk, entries) in live.iter().zip(disks.iter()) {
         if &disk.disk == entries {
             continue;
         }
         let mut item = disk.item.clone();
         write_disk(host, &mut item, entries);
-        writes.push((disk.drive, disk.slot, item));
+        let Some(entity) = host.block_entity(level, disk.drive) else {
+            continue;
+        };
+        let _ = entity.set_item_slot(host, tx, disk.slot as u32, Some(item));
     }
-    if writes.is_empty() {
-        return;
-    }
-    let _ = host.transaction(|host, tx| {
-        for (drive, slot, item) in &writes {
-            let Some(entity) = host.block_entity(level, *drive) else {
-                continue;
-            };
-            entity.set_item_slot(host, tx, *slot as u32, Some(item.clone()))?;
-        }
-        Ok::<(), mod_api::BlockEntityItemError>(())
-    });
 }
 
 /// The promises every other view of `net` makes, so this view never shows what
@@ -1269,18 +1403,23 @@ struct Network;
 
 #[mod_api::horizon_part]
 impl BlockPart for Network {
-    /// The transmitter faces the face it was placed against (upstream's
-    /// `DefaultDirectionType.FACE_CLICKED`).
+    /// A directional block faces the block it was placed on (upstream's
+    /// `DefaultDirectionType.FACE_CLICKED`: `clickedFace.getOpposite()`), so
+    /// the transmitter joins through that side and a machine's source is the
+    /// block it was clicked onto.
     fn state_for_placement(
         &self,
         level: &dyn LevelHost,
         event: &mut StateForPlacementEvent<'_>,
     ) -> Option<Option<BlockState>> {
         let block = level.state_block(event.state)?;
-        if Kind::from_block(block) != Some(Kind::WirelessTransmitter) {
+        if !matches!(
+            Kind::from_block(block),
+            Some(Kind::WirelessTransmitter | Kind::Importer | Kind::Exporter)
+        ) {
             return None;
         }
-        let face = Face::from_offset(event.context.face.normal())?;
+        let face = Face::from_offset(event.context.face.normal())?.opposite();
         Some(Some(level.block_state_id(&format!(
             "{block}[facing={}]",
             face.property()
@@ -1300,12 +1439,19 @@ impl BlockEntityPart for Network {
     }
 
     /// The cable (its connections), the drive (its disks), the grid (its
-    /// view) and the transmitter (its `active` state) tick; the controller
-    /// holds no state.
+    /// view), the transmitter (its `active` state) and the two machines (their
+    /// work tick) tick; the controller holds no state.
     fn block_entity_ticks(&self, _host: &dyn Host, event: &mut BlockEntityTicksEvent<'_>) {
         event.ticks = matches!(
             Kind::from_block(event.block),
-            Some(Kind::Cable | Kind::DiskDrive | Kind::Grid | Kind::WirelessTransmitter)
+            Some(
+                Kind::Cable
+                    | Kind::DiskDrive
+                    | Kind::Grid
+                    | Kind::WirelessTransmitter
+                    | Kind::Importer
+                    | Kind::Exporter
+            )
         );
     }
 
@@ -1317,6 +1463,9 @@ impl BlockEntityPart for Network {
             Some(Kind::DiskDrive) => drive_tick(host, pos, &mut event.entity),
             Some(Kind::Grid) => grid_tick(host, pos, &mut event.entity),
             Some(Kind::WirelessTransmitter) => transmitter_tick(host, pos),
+            Some(kind @ (Kind::Importer | Kind::Exporter)) => {
+                machine_tick(host, pos, kind, &mut event.entity);
+            }
             Some(Kind::Controller) | None => {}
         }
     }
@@ -1364,6 +1513,28 @@ impl BlockEntityPart for Network {
                 let slots = (0..TRANSMITTER_SLOTS)
                     .map(|index| Some([8.0 + 18.0 * index as f32, 16.0]))
                     .collect();
+                Some(Screen {
+                    width: 176.0,
+                    height: 133.0,
+                    slots,
+                    inventory_y: 84.0,
+                    inventory_x: 8.0,
+                    own_labels: false,
+                    own_background: false,
+                    ..Screen::default()
+                })
+            }
+            Kind::Importer | Kind::Exporter => {
+                // Upstream's `ImporterScreen`/`ExporterScreen`: the nine filter
+                // entries in a row, the four upgrade slots under them (upstream
+                // puts the upgrades in a right-hand column; the pin's 176-wide
+                // panel keeps them on their own row), the inventory below.
+                let mut slots: Vec<Option<[f32; 2]>> = (0..FILTER_SLOTS)
+                    .map(|index| Some([8.0 + 18.0 * index as f32, 16.0]))
+                    .collect();
+                slots.extend(
+                    (0..MACHINE_UPGRADES).map(|index| Some([8.0 + 18.0 * index as f32, 40.0])),
+                );
                 Some(Screen {
                     width: 176.0,
                     height: 133.0,
@@ -1683,6 +1854,214 @@ fn transmitter_tick(host: &mut dyn ServerHost, pos: [i32; 3]) {
     with_core(|core| core.active.insert(key, online));
 }
 
+// --- the two transfer machines (slice 7) -----------------------------------
+
+/// The working face of a machine: its `facing` state (upstream's `direction`),
+/// the side whose neighbour it reads or writes.
+fn facing_at(host: &dyn Host, pos: [i32; 3]) -> Option<Face> {
+    let level = host.level(host.dimension())?;
+    level
+        .block_property(host, pos, "facing")
+        .as_deref()
+        .and_then(Face::from_property)
+}
+
+/// The block one step out of `pos` through `face`.
+fn neighbour(pos: [i32; 3], face: Face) -> [i32; 3] {
+    let step = face.offset();
+    [pos[0] + step[0], pos[1] + step[1], pos[2] + step[2]]
+}
+
+/// The pin's direction for one of the port's faces (the side a machine asks a
+/// neighbour's capability through).
+fn direction(face: Face) -> mod_api::Direction {
+    match face {
+        Face::North => mod_api::Direction::North,
+        Face::East => mod_api::Direction::East,
+        Face::South => mod_api::Direction::South,
+        Face::West => mod_api::Direction::West,
+        Face::Up => mod_api::Direction::Up,
+        Face::Down => mod_api::Direction::Down,
+    }
+}
+
+/// What a machine's own slots hold: how many speed and stack upgrades, and the
+/// resource keys its filter entries name (an empty list is upstream's empty
+/// `BLOCK` filter, which blocks nothing).
+fn machine_slots(host: &dyn Host, items: &[Option<ItemStack>]) -> (u32, u32, Vec<String>) {
+    let keys = keys();
+    let mut speed = 0;
+    let mut stacks = 0;
+    for held in items
+        .iter()
+        .skip(FILTER_SLOTS)
+        .take(MACHINE_UPGRADES)
+        .flatten()
+    {
+        if held.item() == keys.speed_upgrade {
+            speed += 1;
+        }
+        if held.item() == keys.stack_upgrade {
+            stacks += 1;
+        }
+    }
+    let filter = items
+        .iter()
+        .take(FILTER_SLOTS)
+        .flatten()
+        .map(|held| resource_key(host, held))
+        .collect();
+    (speed, stacks, filter)
+}
+
+/// An importer's or exporter's tick: every [`runtime::work_interval`] server
+/// ticks one work pass moves items between the neighbour the machine faces and
+/// the network's disks, all in one transaction.
+fn machine_tick(
+    host: &mut dyn ServerHost,
+    pos: [i32; 3],
+    kind: Kind,
+    entity: &mut ModBlockEntityView<'_>,
+) {
+    let Some(face) = facing_at(host, pos) else {
+        return;
+    };
+    let (speed, stacks, filter) = machine_slots(host, &entity.items);
+    let interval = runtime::work_interval(speed);
+    // Upstream's throttled ticker counts every tick, online or not.
+    let key = (host.dimension().to_owned(), pos);
+    let due = with_core(|core| {
+        let ticks = core.work.entry(key).or_insert(0);
+        let due = runtime::work_due(*ticks, interval);
+        *ticks = ticks.wrapping_add(1);
+        due
+    });
+    if !due {
+        return;
+    }
+    let net = network_at(host, pos);
+    if !net.online() {
+        return;
+    }
+    let Some(level) = host.level(host.dimension()) else {
+        return;
+    };
+    let target = neighbour(pos, face);
+    let live = live_disks(host, level, &net);
+    let mut disks = disks_of(&live);
+    let work = Work {
+        level,
+        target,
+        side: face.opposite(),
+        filter: &filter,
+        quota: runtime::transfer_quota(stacks),
+    };
+    let _ = host.transaction(|host, tx| {
+        match kind {
+            Kind::Importer => importer_pass(host, tx, &work, &mut disks),
+            Kind::Exporter => exporter_pass(host, tx, &work, &mut disks),
+            _ => 0,
+        };
+        write_back_in(host, tx, level, &live, &disks);
+        Ok::<(), mod_api::PlayerDataRefusal>(())
+    });
+}
+
+/// One machine work pass's inputs: the neighbour it works on (its position and
+/// the side of that block the machine reaches it through), the filter entries
+/// and how much one pass may move.
+struct Work<'a> {
+    level: LevelRef,
+    target: [i32; 3],
+    side: Face,
+    filter: &'a [String],
+    quota: u32,
+}
+
+/// One importer work pass: take up to `quota` of the first resource the filter
+/// allows out of the neighbour's container and put it on the network
+/// (`ImporterTransferStrategyImpl`); what the network cannot take stays in the
+/// source.
+fn importer_pass(
+    host: &mut dyn ServerHost,
+    tx: &mod_api::Transaction,
+    work: &Work<'_>,
+    disks: &mut [Disk<Net>],
+) -> u32 {
+    let Some(handler) =
+        work.level
+            .capability(host, &ITEMS, work.target, Some(direction(work.side)))
+    else {
+        return 0;
+    };
+    let mut source: Vec<Option<(String, u32)>> = Vec::new();
+    for slot in 0..handler.size(host) {
+        let entry = handler.resource(host, slot).map(|resource| {
+            let key = resource
+                .to_stack(1)
+                .map_or_else(String::new, |stack| resource_key(host, &stack));
+            (key, handler.amount(host, slot))
+        });
+        source.push(entry);
+    }
+    let Some((slot, _, amount)) = runtime::import_plan(&source, work.filter, work.quota) else {
+        return 0;
+    };
+    let Some(resource) = handler.resource(host, slot) else {
+        return 0;
+    };
+    let taken = handler.extract(host, tx, slot, &resource, amount);
+    if taken == 0 {
+        return 0;
+    }
+    let Some(stack) = resource.to_stack(taken) else {
+        let _ = handler.insert(host, tx, slot, &resource, taken);
+        return 0;
+    };
+    let Some(left) = insert(disks, Net::of(host, &stack)) else {
+        return taken;
+    };
+    let left_count = left.count();
+    if left_count > 0 {
+        let _ = handler.insert(host, tx, slot, &resource, left_count);
+    }
+    taken - left_count
+}
+
+/// One exporter work pass: push the first filter entry the network holds into
+/// the neighbour's container (`ExporterTransferStrategyImpl`), telling each
+/// filter entry in turn; what the destination refuses goes back on the
+/// network.
+fn exporter_pass(
+    host: &mut dyn ServerHost,
+    tx: &mod_api::Transaction,
+    work: &Work<'_>,
+    disks: &mut [Disk<Net>],
+) -> u32 {
+    let Some(handler) =
+        work.level
+            .capability(host, &ITEMS, work.target, Some(direction(work.side)))
+    else {
+        return 0;
+    };
+    let held: Vec<(String, u64)> = runtime::aggregate(disks)
+        .iter()
+        .map(|entry| (entry.key(), u64::from(entry.count())))
+        .collect();
+    let Some((key, amount)) = runtime::export_plan(work.filter, &held, work.quota) else {
+        return 0;
+    };
+    let Some(taken) = extract(disks, &key, amount) else {
+        return 0;
+    };
+    let resource = ItemResource::of(taken.stack());
+    let went = handler.insert_any(host, tx, &resource, taken.count());
+    if went < taken.count() {
+        let _ = insert(disks, taken.with_count(taken.count() - went));
+    }
+    went
+}
+
 /// Every cache key a set of drives can hold.
 fn drive_keys(dimension: &str, drives: &[[i32; 3]]) -> Vec<DiskKey> {
     drives
@@ -1709,6 +2088,9 @@ struct Core {
     connections: HashMap<(String, [i32; 3]), u8>,
     /// The `active` state each grid was last written with.
     active: HashMap<(String, [i32; 3]), bool>,
+    /// The server ticks each machine has seen, so its work falls every
+    /// `work_interval` of them (upstream's throttled ticker).
+    work: HashMap<(String, [i32; 3]), u64>,
     /// What each open view currently shows: the network stock it has already
     /// promised its players (`view_with`). Two views of one network never show
     /// the same items, so neither can hand them out twice, whether they are a
@@ -1971,9 +2353,15 @@ fn info(host: &mut dyn ServerHost, pos: [i32; 3]) {
         drives.len(),
         net.count(Kind::Grid),
     );
-    let transmitters = net.count(Kind::WirelessTransmitter);
-    if transmitters > 0 {
-        census.push_str(&format!(", {transmitters} transmitter"));
+    for (kind, name) in [
+        (Kind::WirelessTransmitter, "transmitter"),
+        (Kind::Importer, "importer"),
+        (Kind::Exporter, "exporter"),
+    ] {
+        let count = net.count(kind);
+        if count > 0 {
+            census.push_str(&format!(", {count} {name}"));
+        }
     }
     feedback(
         host,
@@ -2000,6 +2388,25 @@ fn info(host: &mut dyn ServerHost, pos: [i32; 3]) {
                 runtime::range_label(range),
                 if online { "active" } else { "inactive" },
             ),
+        );
+    }
+    if let Some(Kind::Importer | Kind::Exporter) = kind_at(host, pos) {
+        let Some(level) = host.level(host.dimension()) else {
+            return;
+        };
+        let Some(entity) = host.block_entity(level, pos) else {
+            return;
+        };
+        let items: Vec<Option<ItemStack>> = (0..MACHINE_SLOTS as u32)
+            .map(|slot| entity.item_slot(host, slot).ok().flatten())
+            .collect();
+        let (speed, stacks, filter) = machine_slots(host, &items);
+        let name = kind_at(host, pos)
+            .and_then(Kind::machine_name)
+            .unwrap_or("Machine");
+        feedback(
+            host,
+            &runtime::machine_readout(name, pos, speed, stacks, filter.len()),
         );
     }
 }

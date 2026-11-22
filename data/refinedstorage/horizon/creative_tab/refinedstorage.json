@@ -26,6 +26,10 @@
     "refinedstorage:machine_casing",
     "refinedstorage:upgrade",
     "refinedstorage:range_upgrade",
-    "refinedstorage:creative_range_upgrade"
+    "refinedstorage:creative_range_upgrade",
+    "refinedstorage:importer",
+    "refinedstorage:exporter",
+    "refinedstorage:speed_upgrade",
+    "refinedstorage:stack_upgrade"
   ]
 }

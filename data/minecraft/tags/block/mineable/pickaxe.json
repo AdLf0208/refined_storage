@@ -4,6 +4,8 @@
     "refinedstorage:disk_drive",
     "refinedstorage:grid",
     "refinedstorage:machine_casing",
-    "refinedstorage:wireless_transmitter"
+    "refinedstorage:wireless_transmitter",
+    "refinedstorage:importer",
+    "refinedstorage:exporter"
   ]
 }
