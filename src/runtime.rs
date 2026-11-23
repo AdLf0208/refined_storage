@@ -1712,6 +1712,98 @@ pub fn restore<T: Clone>(carried: &[(u32, T)], capacity: usize) -> Vec<(u32, T)>
     out
 }
 
+/// What a placement does to the stack in the hand that placed the machine
+/// (slice 13). A carried payload belongs to the **unit** it rides on, and a
+/// placement spends exactly one unit's payload:
+///
+/// - in survival the engine takes the placed unit off the stack after the
+///   placement hook, so the units it did not place keep their own payload and
+///   the hand is not the port's to rewrite;
+/// - in creative the engine keeps the stack, so a payload that has been spent
+///   comes off — but only when the placed unit was the whole stack. A stack of
+///   two is two machines' worth of contents, and stripping the whole stack
+///   because one of them was placed destroys the other's.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PlacedHand {
+    /// The engine takes the placed unit: leave the rest, payload included.
+    EngineConsumes,
+    /// The engine keeps the stack and the placed unit was all of it: strip it.
+    StripPlaced,
+    /// The engine keeps the stack and the other units still carry their own.
+    UnplacedKeep,
+}
+
+/// What a placement of `count` units does to the hand, `creative` or not.
+pub fn placed_hand(creative: bool, count: u32) -> PlacedHand {
+    match (creative, count) {
+        (false, _) => PlacedHand::EngineConsumes,
+        (true, 0 | 1) => PlacedHand::StripPlaced,
+        (true, _) => PlacedHand::UnplacedKeep,
+    }
+}
+
+/// The count a hand keeps after one item leaves it — a disk into a drive — or
+/// `None` when that was the last one. The insertion and this decrement are one
+/// transaction: a disk that went in without the hand losing one is a duplicate,
+/// and a hand that lost one without the disk going in is a loss.
+pub fn after_taking_one(count: u32) -> Option<u32> {
+    count.checked_sub(1).filter(|left| *left > 0)
+}
+
+/// What a break does with a machine's own slots (slice 13). Only a break that
+/// hands an item over can carry them; every other break — creative, a tool the
+/// block refuses, a destroyed block whose loot is never built — must leave the
+/// container alone, because the engine's own spill is then the only copy.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BreakPlan {
+    /// Take the slots before the removal and put them on the dropped item.
+    Carry,
+    /// Leave them: the engine spills the container as vanilla does.
+    Spill,
+}
+
+/// The break plan for a break that will (`true`) or will not drop loot.
+pub fn break_plan(drops_loot: bool) -> BreakPlan {
+    if drops_loot {
+        BreakPlan::Carry
+    } else {
+        BreakPlan::Spill
+    }
+}
+
+/// What `block_drops` does with the slots a `BreakPlan::Carry` took: they ride
+/// the machine item when the break emitted one, and fall back to the ground as
+/// the items they were when it did not. Neither answer loses them, and both
+/// together cannot duplicate them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CarryPlan {
+    /// The machine item is in the drop list: the payload goes on it.
+    OnTheItem,
+    /// It is not: drop the slots themselves, as the engine's spill would.
+    BackOnTheGround,
+}
+
+/// The carry plan for a drop list that does (`true`) or does not hold the item.
+pub fn carry_plan(item_in_drops: bool) -> CarryPlan {
+    if item_in_drops {
+        CarryPlan::OnTheItem
+    } else {
+        CarryPlan::BackOnTheGround
+    }
+}
+
+/// The operator level both energy writes need: charging a network's buffer or
+/// a held item's buffer is an operator action (it stands in for the FE cable
+/// and charger this pin's harness has none of).
+pub const ENERGY_LEVEL: u8 = 2;
+
+/// Whether a command source at `level` may write energy. Checked in the two
+/// commands' bodies as well as declared on them, so the gate does not rest on
+/// the dispatcher alone.
+pub fn may_write_energy(level: u8) -> bool {
+    level >= ENERGY_LEVEL
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3600,5 +3692,79 @@ mod tests {
             "a slot named twice keeps its first entry"
         );
         assert_eq!(restore::<&str>(&[(0, "x")], 0), vec![], "no slots, nothing");
+    }
+
+    #[test]
+    fn a_placement_keeps_the_payload_on_the_units_it_did_not_place() {
+        assert_eq!(
+            placed_hand(false, 2),
+            PlacedHand::EngineConsumes,
+            "survival takes the placed unit; the second unit keeps its own payload"
+        );
+        assert_eq!(
+            placed_hand(false, 1),
+            PlacedHand::EngineConsumes,
+            "survival takes the last unit too, and nothing is left to strip"
+        );
+        assert_eq!(
+            placed_hand(true, 1),
+            PlacedHand::StripPlaced,
+            "creative keeps the stack: the one unit's spent payload comes off"
+        );
+        assert_eq!(
+            placed_hand(true, 2),
+            PlacedHand::UnplacedKeep,
+            "creative keeps the stack: the unit that was not placed keeps its payload"
+        );
+        assert_eq!(placed_hand(true, 3), PlacedHand::UnplacedKeep);
+    }
+
+    #[test]
+    fn one_disk_costs_one_item_from_the_hand_that_held_it() {
+        assert_eq!(
+            after_taking_one(1),
+            None,
+            "the last disk leaves an empty hand"
+        );
+        assert_eq!(after_taking_one(2), Some(1), "a stack of two keeps one");
+        assert_eq!(after_taking_one(9), Some(8));
+        assert_eq!(
+            after_taking_one(0),
+            None,
+            "nothing held, nothing taken: the insertion must not commit"
+        );
+    }
+
+    #[test]
+    fn a_break_carries_its_slots_only_when_it_hands_over_an_item() {
+        assert_eq!(
+            break_plan(true),
+            BreakPlan::Carry,
+            "a break that drops loot carries them on the item"
+        );
+        assert_eq!(
+            break_plan(false),
+            BreakPlan::Spill,
+            "a break that drops nothing leaves the engine's spill alone"
+        );
+    }
+
+    #[test]
+    fn a_carry_with_no_item_to_ride_falls_back_to_the_ground() {
+        assert_eq!(carry_plan(true), CarryPlan::OnTheItem);
+        assert_eq!(
+            carry_plan(false),
+            CarryPlan::BackOnTheGround,
+            "no machine item to carry them: they drop, they are not discarded"
+        );
+    }
+
+    #[test]
+    fn only_an_operator_may_write_energy() {
+        assert_eq!(ENERGY_LEVEL, 2, "the game master level, as Command::op");
+        assert!(!may_write_energy(0), "every player may not charge");
+        assert!(!may_write_energy(1), "a moderator may not charge");
+        assert!(may_write_energy(2), "a game master may");
+        assert!(may_write_energy(4), "an owner may");
     }
 }

@@ -7,7 +7,10 @@ recipe proof, slice 3's wireless-transmitter red→green and in-game leg, slice
 4's wireless-grid one, slice 5's network-keyed promise table, slice 6's upgrade
 items and the raised range, slice 7's importer/exporter pair with the speed and stack
 upgrades, slice 9's wireless-grid item buffer, slice 10's block drops that carry
-the broken machine's own slots, slice 11's five disk sizes, and slice 12's in-place disk upgrade).
+the broken machine's own slots, slice 11's five disk sizes, slice 12's in-place disk upgrade, and
+slice 13's review-round-two repairs: the placing hand and the payload on unplaced units, the
+insertion and its consumption in one transaction, the break's completion gate, and the two
+operator-only energy writes).
 
 Quick reproduction (a build slot is required; see the campaign's AGENTS.md):
 
@@ -37,8 +40,8 @@ the second build machine has no `cargo-horizon-mod`.
 
 Pin **`0a875da91dbb0fdcb7ba8c42c11341aa229af51a`** + mixins
 `e59da9094f0c2fdda6c627fe9eff22dec6a906f0`. Delivered package (0.2.12):
-`refinedstorage.hmod`, **216,906 B**, SHA-256
-`2e46885e9759bfa7f88dc6344b99f107cafb9686f25ed8c7696ad6e69599b080`, 260 entries, no packed
+`refinedstorage.hmod`, **221,841 B**, SHA-256
+`92858557af7dcf5bd4c88ce4f43a62fc666605c099bc373cfa8a4baa390cc21f`, 260 entries, no packed
 `Cargo.lock`; a copy of the delivered bytes is at
 `ports/_shared/evidence/refinedstorage/refinedstorage.hmod`, which is the file both `fits`
 runs used.
@@ -64,6 +67,8 @@ SELFTEST=itemenergy … tools/e2e.sh                                # flipped it
 SELFTEST=drops … tools/e2e.sh                                     # flipped block-drop carry: EXIT:1
 SELFTEST=diskcap … tools/e2e.sh                                   # flipped 4k capacity (accepted the 4,097th): EXIT:1
 SELFTEST=upgrade … tools/e2e.sh                                   # flipped: the source part was NOT returned: EXIT:1
+SELFTEST=payload … tools/e2e.sh                                   # flipped: the unplaced unit lost its payload: EXIT:1
+SELFTEST=break … tools/e2e.sh                                     # flipped: a creative break spilled nothing: EXIT:1
 python3 ../tools/check-e2e-logs.py refinedstorage-e2e --strict
 ```
 

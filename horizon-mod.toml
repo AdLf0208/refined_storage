@@ -1,6 +1,6 @@
 id = "refinedstorage"
 name = "Refined Storage"
-version = "0.2.12"
+version = "0.2.13"
 description = """A port of Refined Storage 2.0.9 for Horizon, scoped to the item network core: a
 controller (a network is online when its connected component holds one), a cable with its six
 connection states, a disk drive with nine slots of storage disks, the 1k storage disk (1,024 items,
@@ -27,7 +27,11 @@ a buffer of its own: 1,000 FE, charged 5 per open, per deposit and per withdrawa
 moves nothing (and says so) while its network stays online. An importer, an exporter or a wireless
 transmitter broken in survival carries its own slots on the dropped item — a machine's nine filter
 entries and four upgrades, a transmitter's four upgrades — and gives every one back when the item is
-placed again, with nothing spilled beside it. A storage disk is one of five sizes — 1k, 4k, 16k,
+placed again, with nothing spilled beside it: one unit's payload per placed machine, so placing one
+of a stack of two leaves the other unit's payload on it, while a break that hands no item over
+(creative, a cancelled break) leaves the container to the engine's own spill. The two energy
+commands are operator commands, and a charge names the item it fills: the wireless grid, or nothing.
+A storage disk is one of five sizes — 1k, 4k, 16k,
 64k and the creative disk — and its capacity travels in the disk item's own storage component beside
 its contents (a 0 there is the creative disk's unlimited marker, which never refuses an item); a drive
 adds up whatever its disks say, and the 4k, 16k and 64k disks and the storage parts they are built

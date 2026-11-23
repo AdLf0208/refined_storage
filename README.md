@@ -1,4 +1,4 @@
-# Refined Storage for Horizon (slice 12)
+# Refined Storage for Horizon (slice 13)
 
 A clean-room Rust port of **Refined Storage 2.0.9**
 (`refinedmods/refinedstorage2`, MIT), scoped to the **item network core**:
@@ -31,7 +31,12 @@ processors, the machine casing, cores, the storage parts and housing) is carried
 too, with a recipe for every block and item, the item tags, and the
 `refinedstorage:root` / `refinedstorage:wireless` advancements. A broken importer,
 exporter or transmitter carries its own slots on its dropped item and restores them
-when placed again.
+when placed again — one unit's payload per placed machine, so placing one of a
+stack of two leaves the other unit's payload intact, and a break that hands no
+item over (creative, a cancelled break) leaves the container to the engine's own
+spill instead of emptying it. The two energy commands (`/refinedstorage energy`,
+`/refinedstorage charge`) are operator commands, and a charge names the item it
+fills: the wireless grid, or nothing.
 
 The rest of the mod (crafters, external storage, interfaces, relays, fluids, the
 portable grid, security, autocrafting, the coloured variants and the upgrades whose

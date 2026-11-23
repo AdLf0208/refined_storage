@@ -18,16 +18,16 @@ use std::sync::{Mutex, OnceLock};
 use mod_api::item::containers::ModBlockEntityFields;
 use mod_api::{
     self, BlockDropsEvent, BlockEntityEvent, BlockEntityItemError, BlockEntityPart,
-    BlockEntityTickEvent, BlockEntityTicksEvent, BlockKey, BlockPart, BlockState, BreakBlockEvent,
-    Command, CommandArgumentValue, CommandInvocation, CommandSource, Component, Compound,
-    CraftingGrid, CraftingRecipeCodec, CraftingRecipeKind, ENERGY, Flow, GameMode, Hand, Host,
-    HostSide, HostTransaction, ITEM_ENERGY, ITEMS, InteractionResult, ItemKey, ItemPart, ItemPlace,
+    BlockEntityTickEvent, BlockEntityTicksEvent, BlockKey, BlockPart, BlockState, Command,
+    CommandArgumentValue, CommandInvocation, CommandSource, Component, Compound, CraftingGrid,
+    CraftingRecipeCodec, CraftingRecipeKind, ENERGY, Flow, GameMode, Hand, Host, HostSide,
+    HostTransaction, ITEM_ENERGY, ITEMS, InteractionResult, ItemDrop, ItemKey, ItemPart, ItemPlace,
     ItemResource, ItemStack, LevelHost, LevelRef, LevelSide, MenuClickedEvent, MenuClosedEvent,
     MenuContainer, MenuPart, MenuRef, MenuReplace, MenuSlotBacking, MenuSlotRulesEvent,
-    ModBlockEntityView, ModContainer, ModEnergyBuffer, OnBlockPlacedByEvent, PlayerRef,
-    RegisterCommandsEvent, Registrar, RegistrationContext, RightClickBlockEvent,
-    RunModCommandEvent, Screen, ScreenEvent, ServerHost, ServerTickEvent, ServerTickPhase,
-    StateForPlacementEvent, Tag, Text, UseItemEvent, UseOnEvent, WorldPhase,
+    ModBlockEntityView, ModContainer, ModEnergyBuffer, OnBlockPlacedByEvent,
+    OnDestroyedByPlayerEvent, PlayerRef, RegisterCommandsEvent, Registrar, RegistrationContext,
+    RightClickBlockEvent, RunModCommandEvent, Screen, ScreenEvent, ServerHost, ServerTickEvent,
+    ServerTickPhase, StateForPlacementEvent, Tag, Text, UseItemEvent, UseOnEvent, WorldPhase,
 };
 
 use crate::runtime::{
@@ -2080,6 +2080,30 @@ impl BlockPart for Network {
             face.property()
         ))?))
     }
+
+    /// A player removes one of this mod's machines: the completion gate before
+    /// anything of the break changes the world (slice 13). `will_harvest` is the
+    /// platform's own answer to "will this break hand an item over" — never in
+    /// creative, false for a tool the block refuses — so the slots are taken
+    /// only when there will be an item to carry them. Every other break leaves
+    /// the container untouched, and the engine's ordinary spill is then the
+    /// only copy: the port neither clears slots it cannot hand back nor puts a
+    /// payload beside a spill.
+    fn on_destroyed_by_player(
+        &self,
+        host: &mut dyn ServerHost,
+        event: &mut OnDestroyedByPlayerEvent<'_>,
+    ) -> Option<bool> {
+        let pos = event.pos;
+        let kind = kind_at(host, pos)?;
+        if !kind.carries_contents() {
+            return None;
+        }
+        if runtime::break_plan(event.will_harvest) == runtime::BreakPlan::Carry {
+            take_contents(host, pos, kind);
+        }
+        None
+    }
 }
 
 #[mod_api::horizon_part]
@@ -2818,30 +2842,11 @@ fn drive_keys(dimension: &str, drives: &[[i32; 3]]) -> Vec<DiskKey> {
 /// The clear is verified: if any slot still holds something afterwards (a
 /// refused write), nothing is recorded and the engine's spill is the fallback —
 /// a machine's items are never both carried and spilled.
-pub(crate) fn on_break_block(host: &mut dyn ServerHost, event: &mut BreakBlockEvent<'_>) -> Flow {
-    let pos = event.pos;
-    let Some(kind) = kind_at(host, pos) else {
-        return Flow::Continue;
-    };
-    if !kind.carries_contents() {
-        return Flow::Continue;
-    }
-    // A creative break drops no loot at all (`playerDestroy` is skipped), so
-    // clearing here would destroy the contents instead of carrying them.
-    let creative = host
-        .players()
-        .acting_player()
-        .and_then(|player| player.game_mode(&*host))
-        == Some(GameMode::Creative);
-    if creative {
-        return Flow::Continue;
-    }
-    take_contents(host, pos, kind);
-    Flow::Continue
-}
-
 /// Empty the machine's own slots into the pending carry, in one transaction,
-/// and record them only when the read-back says they are gone.
+/// and record them only when the read-back says they are gone. Called from
+/// `on_destroyed_by_player`, once the break is known to hand an item over
+/// (`runtime::break_plan`), so a break that hands nothing over keeps its
+/// container and the engine's own spill carries it.
 fn take_contents(host: &mut dyn ServerHost, pos: [i32; 3], kind: Kind) {
     let Some(level) = host.level(host.dimension()) else {
         return;
@@ -2857,6 +2862,7 @@ fn take_contents(host: &mut dyn ServerHost, pos: [i32; 3], kind: Kind) {
         return;
     };
     let mut slots = Vec::with_capacity(carried.len());
+    let mut stacks = Vec::with_capacity(carried.len());
     for (slot, stack) in carried {
         let Some(mut entry) = stack.to_nbt(&*host) else {
             return;
@@ -2866,6 +2872,7 @@ fn take_contents(host: &mut dyn ServerHost, pos: [i32; 3], kind: Kind) {
         };
         entry.insert("Slot".into(), Tag::Byte(byte));
         slots.push((slot, entry));
+        stacks.push((slot, stack));
     }
     let cleared = host
         .transaction(|host, tx| {
@@ -2887,15 +2894,22 @@ fn take_contents(host: &mut dyn ServerHost, pos: [i32; 3], kind: Kind) {
             pos,
             tick: core.ticks,
             slots,
+            stacks,
         });
     });
 }
 
 /// The block's own drop: put the pending carry on it as a **fresh** payload —
 /// this port's `RefinedStorageContents` under vanilla's `block_entity_data` —
-/// when the break was one of this mod's machines. The pre-removal snapshot is
-/// not copied: its `Items` list is what the engine has already spilled, and
-/// carrying vanilla's `Items` would hand the player both.
+/// when the item is there. The pre-removal snapshot is not copied: its `Items`
+/// list is what the engine has already spilled, and carrying vanilla's `Items`
+/// would hand the player both.
+///
+/// The slots were taken at a break the platform said would hand an item over
+/// (`on_destroyed_by_player`'s `will_harvest`). Should that item still not be in
+/// the list — another mod emptied the loot, a table lost its pool — the taken
+/// slots go back on the ground as the items they were: a break either transfers
+/// them or drops them, never neither.
 pub(crate) fn on_block_drops(level: &dyn LevelHost, event: &mut BlockDropsEvent<'_>) -> Flow {
     let Some(block) = level.state_block(event.state) else {
         return Flow::Continue;
@@ -2910,31 +2924,52 @@ pub(crate) fn on_block_drops(level: &dyn LevelHost, event: &mut BlockDropsEvent<
     let pos = [event.pos.x, event.pos.y, event.pos.z];
     let Some(carried) = with_core(|core| {
         core.carried
-            .take()
+            .as_ref()
             .filter(|carried| carried.dimension == dimension && carried.pos == pos)
+            .map(|carried| (carried.slots.clone(), carried.stacks.clone()))
     }) else {
         return Flow::Continue;
     };
     let Some(item) = keys().item_of(kind) else {
         return Flow::Continue;
     };
-    let restored = runtime::restore(&carried.slots, kind.own_slots());
+    let (slots, stacks) = carried;
+    with_core(|core| core.carried = None);
+    let restored = runtime::restore(&slots, kind.own_slots());
     if restored.is_empty() {
         return Flow::Continue;
     }
-    let list = restored
-        .into_iter()
-        .map(|(_, entry)| Tag::Compound(entry))
-        .collect();
-    let data = Tag::Compound(Compound::from([
-        ("id".into(), Tag::String(BE_TYPE.into())),
-        (CONTENTS_KEY.into(), Tag::List(list)),
-    ]));
-    let mut patch = Compound::new();
-    patch.insert(BLOCK_ENTITY_DATA.into(), data);
-    for drop in event.drops.iter_mut() {
-        if drop.stack.item() == item {
-            let _ = drop.stack.apply_components(&patch);
+    let present = event.drops.iter().any(|drop| drop.stack.item() == item);
+    match runtime::carry_plan(present) {
+        runtime::CarryPlan::OnTheItem => {
+            let list = restored
+                .into_iter()
+                .map(|(_, entry)| Tag::Compound(entry))
+                .collect();
+            let data = Tag::Compound(Compound::from([
+                ("id".into(), Tag::String(BE_TYPE.into())),
+                (CONTENTS_KEY.into(), Tag::List(list)),
+            ]));
+            let mut patch = Compound::new();
+            patch.insert(BLOCK_ENTITY_DATA.into(), data);
+            for drop in event.drops.iter_mut() {
+                if drop.stack.item() == item {
+                    let _ = drop.stack.apply_components(&patch);
+                }
+            }
+        }
+        runtime::CarryPlan::BackOnTheGround => {
+            // The engine's own spill position and delay (`Block.popResource`:
+            // the block's centre, ten ticks before pickup), so a player who
+            // breaks the machine finds what it held where vanilla would put it.
+            let at = [
+                f64::from(pos[0]) + 0.5,
+                f64::from(pos[1]) + 0.5,
+                f64::from(pos[2]) + 0.5,
+            ];
+            for (_, stack) in runtime::restore(&stacks, kind.own_slots()) {
+                event.drops.push(ItemDrop::new(stack, at, [0.0; 3], 10));
+            }
         }
     }
     Flow::Continue
@@ -2986,10 +3021,19 @@ impl ItemPart for CarriedContents {
         if !wrote {
             return;
         }
-        // The item must not carry them twice: a creative placement keeps the
-        // stack, and placing it again would restore the same slots into a
-        // second machine.
-        strip_contents(host, event.placer, event.stack);
+        // The payload is the *placed unit's*, and `event.stack` is the stack
+        // before the engine takes that unit off (`onBlockPlacedBy` runs before
+        // stack consumption). Survival therefore needs no write at all: the
+        // engine takes the one unit and every unit it did not place keeps its
+        // own payload. Creative keeps the stack, so a payload that has now been
+        // delivered comes off — but only when the placed unit was the whole
+        // stack: with two units in hand the second is a machine of its own, and
+        // stripping it would destroy its contents.
+        let creative =
+            event.placer.and_then(|player| player.game_mode(&*host)) == Some(GameMode::Creative);
+        if runtime::placed_hand(creative, event.stack.count()) == runtime::PlacedHand::StripPlaced {
+            strip_contents(host, event.placer, event.stack);
+        }
     }
 }
 
@@ -3024,14 +3068,19 @@ fn contents_of(stack: &ItemStack) -> Option<Vec<(u32, Compound)>> {
     )
 }
 
-/// Take the contents off the held stack, so a creative placement cannot restore
-/// them again. The whole `minecraft:block_entity_data` goes when this port's
-/// list is all it held.
+/// Take the contents off the stack that was placed, so a creative placement
+/// cannot restore them again. The whole `minecraft:block_entity_data` goes when
+/// this port's list is all it held.
+///
+/// The hand is **found**, never assumed: `on_block_placed_by` does not name it,
+/// and a write into the main hand for a placement from the off hand would
+/// destroy that hand's item and duplicate this one. Only called for a placement
+/// whose payload is spent (`runtime::PlacedHand::StripPlaced`).
 fn strip_contents(host: &mut dyn ServerHost, placer: Option<PlayerRef>, stack: &ItemStack) {
     let Some(player) = placer else {
         return;
     };
-    let Some(slot) = held_slot(&*host, &player, Hand::Main) else {
+    let Some(slot) = hand_holding(host, &player, stack) else {
         return;
     };
     let Some(patch) = stack.components() else {
@@ -3056,6 +3105,21 @@ fn strip_contents(host: &mut dyn ServerHost, placer: Option<PlayerRef>, stack: &
     }
     let _ =
         host.transaction(|host, _tx| player.set_inventory_slot(host, slot, Some(stripped.clone())));
+}
+
+/// The inventory slot of the hand holding `stack`: the hotbar slot the player
+/// holds, else the off-hand slot (40). `None` when neither hand holds it — a
+/// dispenser's placement, or a copy that no longer matches.
+fn hand_holding(host: &mut dyn ServerHost, player: &PlayerRef, stack: &ItemStack) -> Option<u32> {
+    Hand::BOTH.into_iter().find_map(|hand| {
+        let slot = held_slot(&*host, player, hand)?;
+        let here = ItemPlace::PlayerHand {
+            player: player.uuid(),
+            hand,
+        }
+        .stack(host)?;
+        (here == *stack).then_some(slot)
+    })
 }
 
 /// A compound without `name`, in the order it had.
@@ -3109,13 +3173,15 @@ struct Core {
 }
 
 /// What a broken machine's drop carries: where it broke, which tick, and the
-/// slots it held — already in the item NBT `block_drops` puts on the drop,
-/// because that hook has no game host to convert a stack with.
+/// slots it held — as the item NBT `block_drops` puts on the drop, and as the
+/// stacks its fallback spawns (that hook has no game host to convert one into
+/// the other).
 struct Carried {
     dimension: String,
     pos: [i32; 3],
     tick: u64,
     slots: Vec<(u32, Compound)>,
+    stacks: Vec<(u32, ItemStack)>,
 }
 
 static CORE: Mutex<Option<Core>> = Mutex::new(None);
@@ -3182,46 +3248,95 @@ pub(crate) fn on_right_click_block(
     }
     let mut one = held.clone();
     let _ = one.set_count(1);
-    let inserted = insert_disk(host, pos, one);
-    if inserted {
-        consume_held(host, event.click.player, held);
-        tell(host, event.click.player, "Storage disk inserted.");
-    } else {
-        tell(host, event.click.player, "The disk drive is full.");
+    match insert_disk(host, pos, one, event.click.player, event.click.hand, held) {
+        DiskInsertion::Inserted => tell(host, event.click.player, "Storage disk inserted."),
+        DiskInsertion::Full => tell(host, event.click.player, "The disk drive is full."),
+        DiskInsertion::Refused => tell(
+            host,
+            event.click.player,
+            "The disk did not go in: the drive and the hand could not be written together.",
+        ),
     }
     // Either way the click is the drive's: the menu must not open behind a
     // disk that was placed.
     Flow::Cancel
 }
 
-/// Put `one` in the drive's first free slot, in one transaction.
-fn insert_disk(host: &mut dyn ServerHost, pos: [i32; 3], one: ItemStack) -> bool {
-    let Some(level) = host.level(host.dimension()) else {
-        return false;
-    };
-    let Some(entity) = host.block_entity(level, pos) else {
-        return false;
-    };
-    let slot =
-        (0..DRIVE_SLOTS).find(|slot| matches!(entity.item_slot(host, *slot as u32), Ok(None)));
-    let Some(slot) = slot else {
-        return false;
-    };
-    host.transaction(|host, tx| entity.set_item_slot(host, tx, slot as u32, Some(one)))
-        .unwrap_or(false)
+/// What a disk click did; the insertion either commits both writes or neither.
+enum DiskInsertion {
+    Inserted,
+    /// Every drive slot held a disk.
+    Full,
+    /// A write was refused (a stale drive, a dead player, a slot the hand no
+    /// longer has): the transaction aborted, so neither side moved.
+    Refused,
 }
 
-/// Take one item from the acting player's held stack. A disk is moved into
-/// the drive, not used, so creative mode does not keep a free copy.
-fn consume_held(host: &mut dyn ServerHost, uuid: u128, held: &ItemStack) {
-    let Some(player) = host.player(uuid) else {
-        return;
+/// Why a disk insertion wrote nothing. The transaction rolls back on either,
+/// which is the point: a disk in the drive with nothing taken from the hand
+/// duplicates the disk, and a decremented hand with no disk in the drive
+/// destroys one.
+#[derive(Debug)]
+enum DiskRefusal {
+    /// Every drive slot held a disk.
+    NoSlot,
+    /// A write was refused (a stale drive, a dead player, a hand that no longer
+    /// has the slot): the transaction aborted, so neither side moved.
+    WriteRefused,
+}
+
+/// Put `one` in the drive's first free slot **and** take it from the hand that
+/// clicked, in one transaction (slice 13): both writes commit or neither does.
+/// The hand is the click's own — a disk in the off hand is taken from the off
+/// hand, not from whatever the main hand happens to hold.
+fn insert_disk(
+    host: &mut dyn ServerHost,
+    pos: [i32; 3],
+    one: ItemStack,
+    player: u128,
+    hand: Hand,
+    held: &ItemStack,
+) -> DiskInsertion {
+    let Some(level) = host.level(host.dimension()) else {
+        return DiskInsertion::Refused;
     };
-    let Some(slot) = player.selected_slot(host) else {
-        return;
+    let Some(entity) = host.block_entity(level, pos) else {
+        return DiskInsertion::Refused;
     };
-    let remaining = held.clone().split(1).remainder;
-    let _ = player.set_inventory_slot(host, slot as u32, remaining);
+    let Some(actor) = host.player(player) else {
+        return DiskInsertion::Refused;
+    };
+    let Some(hand_slot) = held_slot(&*host, &actor, hand) else {
+        return DiskInsertion::Refused;
+    };
+    // The stack the hand keeps: one disk fewer, or an empty hand.
+    let left = match runtime::after_taking_one(held.count()) {
+        Some(count) => {
+            let mut rest = held.clone();
+            let _ = rest.set_count(count);
+            Some(rest)
+        }
+        // Nothing held: nothing to take, so nothing is inserted either.
+        None if held.count() == 0 => return DiskInsertion::Refused,
+        None => None,
+    };
+    let wrote = host.transaction(|host, tx| {
+        let slot = (0..DRIVE_SLOTS)
+            .find(|slot| matches!(entity.item_slot(&*host, *slot as u32), Ok(None)))
+            .ok_or(DiskRefusal::NoSlot)?;
+        entity
+            .set_item_slot(host, tx, slot as u32, Some(one.clone()))
+            .map_err(|_| DiskRefusal::WriteRefused)?;
+        actor
+            .set_inventory_slot(host, hand_slot, left.clone())
+            .map_err(|_| DiskRefusal::WriteRefused)?;
+        Ok(())
+    });
+    match wrote {
+        Ok(()) => DiskInsertion::Inserted,
+        Err(DiskRefusal::NoSlot) => DiskInsertion::Full,
+        Err(_) => DiskInsertion::Refused,
+    }
 }
 
 fn tell(host: &mut dyn ServerHost, uuid: u128, line: &str) {
@@ -3255,19 +3370,24 @@ pub(crate) fn on_register_commands(event: &mut RegisterCommandsEvent<'_>) {
     // The network's buffer, filled through the capability an FE cable uses.
     // Upstream's controller is filled by its neighbours; the harness has no FE
     // generator, so this command is the source, as `/refinedstorage info` is
-    // the screen (a recorded harness/behaviour addition).
-    event.commands.push(Command::new(
+    // the screen (a recorded harness/behaviour addition). It writes a buffer,
+    // so it is an operator command (slice 13): the level is declared here and
+    // re-checked in the body (`runtime::may_write_energy`).
+    event.commands.push(Command::op(
         "refinedstorage energy <pos:block_pos> <amount:integer>",
+        runtime::ENERGY_LEVEL,
     ));
     // The wireless grid's own buffer, read back from the item's component, and
     // filled through the item's energy capability the way an FE charger would
     // (upstream's grid item is an `ItemEnergyStorage`; the harness has no
     // charger at this pin). Two recorded harness/behaviour additions, twins of
-    // `/refinedstorage energy` for the network's buffer.
+    // `/refinedstorage energy` for the network's buffer — and the same operator
+    // gate, because it writes the item's buffer.
     event.commands.push(Command::new("refinedstorage grid"));
-    event
-        .commands
-        .push(Command::new("refinedstorage charge <amount:integer>"));
+    event.commands.push(Command::op(
+        "refinedstorage charge <amount:integer>",
+        runtime::ENERGY_LEVEL,
+    ));
 }
 
 /// The `/refinedstorage` commands' bodies (`run_mod_command`).
@@ -3290,6 +3410,16 @@ pub(crate) fn on_run_mod_command(
         return Flow::Cancel;
     }
     if sub == "charge" {
+        // Both energy writes are operator actions: declared on the command
+        // (`Command::op`) and asked again here, so neither the gate nor its
+        // refusal rests on the dispatcher alone.
+        if !runtime::may_write_energy(event.source.permission().level()) {
+            feedback(
+                host,
+                "Only an operator may charge a wireless grid (permission level 2).",
+            );
+            return Flow::Cancel;
+        }
         let Some(CommandArgumentValue::Integer(amount)) = event.command.argument("amount") else {
             feedback(host, "Usage: /refinedstorage charge <amount>");
             return Flow::Cancel;
@@ -3298,6 +3428,13 @@ pub(crate) fn on_run_mod_command(
         return Flow::Cancel;
     }
     if sub == "energy" {
+        if !runtime::may_write_energy(event.source.permission().level()) {
+            feedback(
+                host,
+                "Only an operator may charge a network (permission level 2).",
+            );
+            return Flow::Cancel;
+        }
         let Some(CommandArgumentValue::BlockPos(pos)) = event.command.argument("pos") else {
             feedback(host, "Usage: /refinedstorage energy <x> <y> <z> <amount>");
             return Flow::Cancel;
@@ -3416,6 +3553,10 @@ fn grid_buffer(host: &mut dyn ServerHost, source: &CommandSource) {
 /// The body of `/refinedstorage charge <amount>`: bring the held wireless
 /// grid's own buffer to `amount` FE through the item energy capability — an
 /// insert the way a charger fills it, an extract the way a use drains it.
+///
+/// The held item must **be** the wireless grid before anything is written
+/// (slice 13): a charge asked of another item answers so instead of filling
+/// whatever buffer another mod's item happens to answer with.
 fn charge_grid(host: &mut dyn ServerHost, source: &CommandSource, amount: u32) {
     let Some(uuid) = player_of(host, source, "Only a player holds a wireless grid.") else {
         return;
@@ -3424,6 +3565,14 @@ fn charge_grid(host: &mut dyn ServerHost, source: &CommandSource, amount: u32) {
         player: uuid,
         hand: Hand::Main,
     };
+    let Some(stack) = place.stack(host) else {
+        feedback(host, "No item in the main hand.");
+        return;
+    };
+    if stack.item() != keys().wireless_grid {
+        feedback(host, "The item in the main hand is not a wireless grid.");
+        return;
+    }
     let Some(handler) = place.capability(host, &ITEM_ENERGY) else {
         feedback(host, "The item in the main hand is not a wireless grid.");
         return;

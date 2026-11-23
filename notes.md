@@ -19,7 +19,7 @@ the network; no entities, renderers, dimensions or new vanilla hooks.
 Ported now because it is the **#1 core base** of the core-first queue: 13
 pending ATM10 mods depend on it (`ports/tools/port_queue.py`).
 
-Status: **slice 12 — the in-place disk upgrade (0.2.12)** — the network core of slice 1, the
+Status: **slice 13 — the review round two repairs (0.2.13)** — the network core of slice 1, the
 crafting chain of slice 2, the finite-range, same-dimension transmitter of slice 3, the item that
 asks its admission (slice 4), the promise table keyed by network (slice 5), the transmitter's four
 upgrade slots with the range and creative range upgrades (slice 6), the two transfer machines with
@@ -27,10 +27,14 @@ the speed and stack upgrades (slice 7), the network's energy model (slice 8), th
 own 1,000 FE buffer (slice 9), the block drops that carry a broken machine's slots (slice 10), the
 other disk sizes — 4k (4,096), 16k (16,384), 64k (65,536) and the creative disk, whose capacity
 lives in the disk item's own component beside its contents (the creative one has none, upstream's
-`null`, so it never refuses an item) (slice 11) — and now the in-place upgrade: a smaller disk plus
-the bigger tier's storage part become that disk in one crafting-table step, the contents come across
-with the destination's room, and the source disk's own part comes back. Everything else is the gap
-list below, not a claim.
+`null`, so it never refuses an item) (slice 11) — the in-place upgrade: a smaller disk plus the
+bigger tier's storage part become that disk in one crafting-table step, the contents come across
+with the destination's room, and the source disk's own part comes back (slice 12) — and now the
+review's three blockers: one unit's payload per placed machine (the other units of a stack keep
+theirs), one transaction for a disk's insertion *and* its consumption from the clicking hand, the
+slots taken only at the break's completion gate (so a break that hands no item over leaves the
+engine's spill alone), and both energy commands operator-only with a charge that names the wireless
+grid (slice 13). Everything else is the gap list below, not a claim.
 
 > The sections from `## Behaviour` to `### Verification after the repairs`
 > describe the **retired `.hnmod`** layout. They are kept as history: the
@@ -3049,3 +3053,253 @@ Evidence: `ports/_shared/evidence/refinedstorage/` — `plan-slice12-upgrade.md`
 `e2e-slice12-selftest-{networks,energy,itemenergy,drops,diskcap}.log`, and
 `launcher-build-0.2.12.log` (`Compiling refinedstorage (1 of 1)`, `native-0a875da-e2f5ccd8f3ce` —
 the build every leg ran on).
+
+## Slice 13 — review round two: the hand, the completion gate and the operator (2026-11-23) — version 0.2.13
+
+### The three blockers this slice answers (verbatim from the review)
+
+1. *"**Placement and insertion can lose or duplicate items.** Update the hand that placed the
+   machine and preserve the payload on unplaced units in a stack. For drive insertion, commit the
+   disk insertion and the consumption from the acting hand together."*
+2. *"**An interrupted break can discard upgrades or filters.** Leave the normal container spill in
+   place unless the completed break transfers those contents to an emitted machine item."*
+3. *"**Energy writes need authorization.** Require operator permission for both mutating commands,
+   and verify the held item is the Refined Storage wireless grid before applying a charge."*
+
+### What 0.2.12 did, measured rather than assumed
+
+- **Placement.** `CarriedContents::on_block_placed_by` ran `strip_contents`, which wrote the
+  **pre-shrink** stack (`on_block_placed_by` runs *before stack consumption*, so `event.stack` is
+  the stack the engine is about to take one from) with its payload removed into the **main hand**
+  (`Hand::Main`) whatever hand placed the block. A survival placement of one unit of a stack of two
+  therefore left the other unit with no payload — its contents destroyed — and a placement from the
+  off hand rewrote the main hand's item instead of the off hand's (that item destroyed, the
+  off-hand machine duplicated).
+- **Insertion.** `on_right_click_block` inserted the disk in one transaction and took it from the
+  hand in a *second* write, from `player.selected_slot` rather than the click's own `hand`. A refused
+  hand write left the disk in the drive **and** in the hand; a click from the off hand decremented
+  the main hand's stack instead.
+- **Break.** `Hooks::break_block` cleared the machine's slots *before the break was known to
+  complete*. A break that then did not hand an item over — cancelled by another listener, a loot
+  list that lost the machine item, a creative break with a loot path — had already emptied the
+  container: the carry was pruned after `CARRY_TTL` and nothing spilled, so both mechanisms skipped.
+- **Energy.** `/refinedstorage energy` and `/refinedstorage charge` were level-0 commands, and
+  `charge_grid` asked the item energy capability without naming the item it was filling.
+
+### What was implemented
+
+- **`runtime::placed_hand(creative, count)`** — the placement rule: survival leaves the hand alone
+  (the engine takes the placed unit; the units it did not place keep their own payload); creative,
+  which keeps the stack, strips the spent payload only when the placed unit was the whole stack
+  (`StripPlaced`), and leaves it when other units still carry theirs (`UnplacedKeep`).
+- **`CarriedContents::on_block_placed_by`** reads that rule; **`strip_contents`** finds the hand
+  whose stack **is** the placed stack (`hand_holding`: hotbar slot, then the off hand at 40) instead
+  of assuming the main hand.
+- **`runtime::after_taking_one(count)`** — the count a hand keeps after one item leaves it, or
+  `None` for the last one. `insert_disk` now does the drive slot write **and** the hand's decrement
+  in **one transaction** (`DiskRefusal` aborts both), consuming from `event.click.hand`; the click
+  says which of "inserted / full / did not go in" it was.
+- **`runtime::break_plan(drops_loot)`** — the block's own slots are taken only at the *completion
+  gate*, `BlockPart::on_destroyed_by_player`, whose `will_harvest` is the platform's "will this break
+  hand an item over" (never in creative, false for a tool the block refuses). `Hooks::break_block`
+  is gone from the port: every other break leaves the container untouched and the engine's ordinary
+  spill (`PreRemove::Contents`) is the only copy.
+- **`runtime::carry_plan(item_in_drops)`** — `block_drops` puts the payload on the machine item when
+  it is in the list, and otherwise pushes the taken slots back as their own drops (`ItemDrop` at the
+  block's centre, vanilla's ten-tick pickup delay), so a break either transfers the contents or drops
+  them, never neither and never both.
+- **`runtime::may_write_energy(level)`** with `ENERGY_LEVEL = 2`: both mutating commands are
+  `Command::op(…, 2)` **and** re-check `event.source.permission()` in their bodies. `charge_grid`
+  requires `stack.item() == keys().wireless_grid` before it asks for the capability.
+
+### The rules as tests (red first)
+
+`runtime.rs`: `a_placement_keeps_the_payload_on_the_units_it_did_not_place`,
+`one_disk_costs_one_item_from_the_hand_that_held_it`,
+`a_break_carries_its_slots_only_when_it_hands_over_an_item`,
+`a_carry_with_no_item_to_ride_falls_back_to_the_ground`, `only_an_operator_may_write_energy`.
+
+### Red proof — verbatim, before the glue
+
+`ports/_shared/evidence/refinedstorage/runtime-red-slice13-review2.log`, against stubs that kept the
+0.2.12 answers (`StripPlaced` always, `Some(count)` for the hand, `Carry` always, `OnTheItem` always,
+`may_write_energy` always true):
+
+```
+---- runtime::tests::a_break_carries_its_slots_only_when_it_hands_over_an_item stdout ----
+thread 'runtime::tests::a_break_carries_its_slots_only_when_it_hands_over_an_item' (374049) panicked at src/runtime.rs:3735:9:
+assertion `left == right` failed: a break that drops nothing leaves the engine's spill alone
+  left: Carry
+ right: Spill
+---- runtime::tests::a_carry_with_no_item_to_ride_falls_back_to_the_ground stdout ----
+thread 'runtime::tests::a_carry_with_no_item_to_ride_falls_back_to_the_ground' (374052) panicked at src/runtime.rs:3745:9:
+assertion `left == right` failed: no machine item to carry them: they drop, they are not discarded
+  left: OnTheItem
+ right: BackOnTheGround
+---- runtime::tests::a_placement_keeps_the_payload_on_the_units_it_did_not_place stdout ----
+thread 'runtime::tests::a_placement_keeps_the_payload_on_the_units_it_did_not_place' (374083) panicked at src/runtime.rs:3689:9:
+assertion `left == right` failed: survival takes the placed unit; the second unit keeps its own payload
+  left: StripPlaced
+ right: EngineConsumes
+---- runtime::tests::one_disk_costs_one_item_from_the_hand_that_held_it stdout ----
+thread 'runtime::tests::one_disk_costs_one_item_from_the_hand_that_held_it' (374136) panicked at src/runtime.rs:3714:9:
+assertion `left == right` failed: the last disk leaves an empty hand
+  left: Some(1)
+ right: None
+---- runtime::tests::only_an_operator_may_write_energy stdout ----
+thread 'runtime::tests::only_an_operator_may_write_energy' (374138) panicked at src/runtime.rs:3755:9:
+every player may not charge
+
+test result: FAILED. 110 passed; 5 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+```
+
+### Green — the ladder and the in-game leg (one launcher build at `0a875da`)
+
+| Step | Command | Result |
+|---|---|---|
+| runtime + glue tests | `rm -f Cargo.lock && cargo test` | **115 passed**, 0 failed (`sdk-test.log`) |
+| lints | `cargo clippy --all-targets --offline -- -D warnings` | exit 0, **0 warnings** (`sdk-clippy.log`) |
+| formatting | `rustfmt --edition 2024 --check src/{lib,support,runtime}.rs` | clean, exit 0 (`sdk-fmt.log`) |
+| SDK check | `cargo horizon-mod check` | *"Refined Storage uses 680 items of the API (…). Made for 0a875da."* (`sdk-check-0.2.13.log`) |
+| package | `rm -f Cargo.lock && cargo horizon-mod build` ×2 | **byte-identical** (`cmp`, `CMP_EXIT:0`), **221,841 B**, SHA-256 `92858557af7dcf5bd4c88ce4f43a62fc666605c099bc373cfa8a4baa390cc21f`, **260 entries**, no `Cargo.lock` (`sdk-build-0.2.13-{1,2}.log`) |
+| package check | `cargo horizon-mod check refinedstorage.hmod` | `0.2.13 (native-mod, format native-1/0a875da…/e59da909…, for 26.3) 221841 bytes`, `CHECK_FILE_EXIT:0` |
+| fits (pin) | `… fits refinedstorage.hmod --build 0a875da` | `0a875da  made for`, `FITS_PIN_EXIT:0` |
+| fits (other build) | `… fits refinedstorage.hmod --build 0b14f8a` | `0b14f8a  fits`, `FITS_OTHER_EXIT:0` (both in `sdk-check-fits-0.2.13.log`) |
+| launcher build | `launcher-game.sh build refinedstorage --rebuild` | exit 0, **`Compiling refinedstorage (1 of 1)`**, `native-0a875da-7befb00f6e88` (`launcher-build-0.2.13.log`) |
+| in-game leg | `build-slot.sh run … --step e2e -- tools/e2e.sh` | **PASS** + **`EXIT:0`** (`e2e-slice13-green.log`) |
+| control (same Nightly, no package) | `GAME=$CONTROL_GAME …` | **FAIL** + **`EXIT:1`** — *"the block at 41,64,1 is minecraft:air, expected facing=north"* (`e2e-slice13-control.log`) |
+| counterfactual (this slice's placement) | `SELFTEST=payload …` | **FAIL** + **`EXIT:1`** — *"the second machine came back with […6 slots…]: the hand kept the unplaced unit's payload, so 0.2.12's strip would have destroyed it"* (`e2e-slice13-selftest-payload.log`) |
+| counterfactual (this slice's break) | `SELFTEST=break …` | **FAIL** + **`EXIT:1`** — *"the creative break spilled its four speed upgrades ({"refinedstorage:speed_upgrade":6,"refinedstorage:stack_upgrade":1}): the engine's spill is intact, so this inverted assertion fails as it must"* (`e2e-slice13-selftest-break.log`) |
+| selftest (slice-7 stack upgrade, re-run) | `SELFTEST=stack …` | **FAIL** + **`EXIT:1`** — *"with a stack upgrade the importer moved to 64 items, expected 5"* (`e2e-slice13-selftest-stack-upgrade.log`) |
+| selftest (slice-10 carry) | `SELFTEST=drops …` | **FAIL** + **`EXIT:1`** — *"the re-placed importer carried its slots back ([…6…]); the empty drop it used to have is gone"* (`e2e-slice13-selftest-drops.log`) |
+| log gate | `check-e2e-logs.py refinedstorage-e2e --strict` | `logs=68 ok=68 missing-exit=0 bad-exit=0` |
+| package gate | `verify-sdk-package.py refinedstorage` | **1/1** |
+
+### The new phases, quoted from `e2e-slice13-green.log`
+
+```
+== placing one of a stack of two keeps the second unit's payload ==
+  the machine that will ride a stack of two: [{"slot":0,"count":1,"item":"refinedstorage:speed_upgrade"},…,{"slot":5,"count":1,"item":"minecraft:dirt"}]
+  the hand before the placement: {"count":2,"item":"refinedstorage:importer"}
+  the hand after placing one of the two: {"count":1,"item":"refinedstorage:importer"}
+  the machine placed from the stack: [{"slot":0,…speed_upgrade},…,{"slot":5,…dirt}]
+  the second machine, from the same payload: [{"slot":0,…speed_upgrade},…,{"slot":5,…dirt}]
+== a creative break spills its slots and carries nothing ==
+  the machine before the creative break: [{"slot":0,…speed_upgrade},{"slot":4,…stack_upgrade}]
+  creative break drops: {"refinedstorage:speed_upgrade":4,"refinedstorage:stack_upgrade":1}
+  creative break on the ground: [{"count":1,…speed_upgrade},{"count":1,…speed_upgrade},{"count":1,…speed_upgrade},{"count":1,…speed_upgrade},{"count":1,…stack_upgrade}]
+== the energy writes need an operator, and the charge names the grid ==
+  the owner's item buffer: 1000/1000 FE
+  LAN port 46339 (guest commands off: a guest joins at level 0)
+  guest connect: {"ok":true}
+  the level-0 guest runs /refinedstorage info: No Refined Storage network block there.
+  the level-0 guest runs /refinedstorage charge 1000 -> Incorrect argument for command
+  the level-0 guest runs /refinedstorage energy 48 64 8 1000 -> Incorrect argument for command
+  the owner's item buffer after the guest leg: 1000/1000 FE
+  /refinedstorage charge 1000 -> The item in the main hand is not a wireless grid.
+  the hand after charging a stick: {"count":1,"item":"minecraft:stick"}
+```
+
+(`…` abbreviates `"count":1,"item":`; the log has the full objects. The two machines' slot lists are
+identical and index-exact, from `slots_indexed`.)
+
+### The assertions and their differentials
+
+- **The stack of two is the reviewer's own case.** Two identically filled importers are broken in
+  survival; their items merge into one stack of two; placing **one** leaves **one** item, and that
+  item is proven to still carry its payload by the *second* machine listing all six slots at their
+  own indices. On 0.2.12 the second machine comes back empty (that is what `SELFTEST=payload`
+  asserts, and it fails).
+- **The client's inventory mirror does not show this item's components** (measured: a payload item
+  reads as a bare `refinedstorage:importer` while its re-placement restores every slot), so the
+  proof is behavioural — a placement that restores the six slots could not have come from a unit
+  without them — rather than a string match on the components.
+- **The creative break is the "does not complete" half.** The same machine, the same five slot
+  items, in creative: the engine's spill puts all five on the ground, no machine item is emitted
+  (creative drops no loot) and the player holds none. `SELFTEST=break` asserts the opposite
+  (spilled nothing) and fails.
+- **The two mechanisms cannot both skip or both fire**: a survival break reports
+  `drops: {"refinedstorage:importer":1}` with `items_left_on_ground: 0` (payload only, checked by
+  six `drops[<slot item>] == 0` assertions in the slice-10 phase, still green), while the creative
+  break reports the five items and no machine.
+- **The operator gate has its own differential.** The non-operator this harness can actually produce
+  is a **LAN guest at level 0** (`ctl lan open 0` + a second game instance on `$GSOCK`): the same
+  guest runs this mod's level-0 `/refinedstorage info` first, and only then are its refusals of
+  `/refinedstorage charge` and `/refinedstorage energy` evidence. Both are refused
+  (`Incorrect argument for command`, the level-2 nodes are not in a level-0 tree) and the owner's
+  item buffer is unchanged (1000/1000) across the guest leg. The owner's own charge works in the
+  same phase, and a stick in the main hand is refused by name (`The item in the main hand is not a
+  wireless grid.`) with no `refinedstorage:energy` component written.
+- **`/deop` is not the lever** in this harness: a single-player world's owner keeps permission 4
+  (`owner_permission(allow_commands)`), so a de-opped owner still charged — measured on this build
+  (`Wireless grid energy: 1000/1000 FE (was 995)` after the deop), which is exactly the false
+  positive another port's notes warn about (the refusal they once matched was the failed `/deop`'s
+  own). The LAN guest is the route that works.
+
+### Deviations and limits (recorded, not hidden)
+
+1. **A creative placement of a multi-unit stack keeps the payload.** With two units in the hand the
+   engine consumes none, and only one of them has spent its payload; stripping the stack would
+   destroy the other's. The single-unit creative placement is still stripped (the slice-10
+   anti-duplication rule), which is the case the harness can place.
+2. **The fallback drop is not reachable in game.** A player's break of this block always emits its
+   own item (the loot table is unconditional and `requires_tool` is false), so `block_drops`'s
+   "no machine item in the list" branch is a guard for a loot list another listener empties; it is
+   covered by the unit test `a_carry_with_no_item_to_ride_falls_back_to_the_ground`, not by a leg.
+3. **`/refinedstorage energy` and `/refinedstorage charge` are operator commands** (level 2). They
+   are the harness's stand-ins for an FE cable and a charger, as recorded since slice 8/9; the
+   trade-off is that a world without cheats cannot refill a buffer at all, which is the same
+   situation as before (the commands existed and any player could run them).
+4. **The drive still shows nine slots** (slice 1's deviation), and the insertion still requires the
+   click's hand to hold the disk: a click with an empty hand is the block's own.
+
+### Coverage (parity rule) — every family this slice ships
+
+| family | state |
+|---|---|
+| placement from a stack of two (survival) | **tested** — one item placed, one left; both machines list the six slots where they were |
+| placement from a single unit (survival and creative) | **tested** — slice 10's phase: survival re-place restores, creative re-place restores once and strips |
+| the hand that placed (off hand) | **not reachable by the harness** — `ctl` places from the hotbar only; the code finds the hand (`hand_holding`) instead of assuming the main one, and the rule it feeds is unit-tested |
+| a disk into the drive (one transaction) | **tested** — the slice-1 and slice-7 phases insert disks and read them back from the drive; a refused click leaves both sides alone (the retry prints the refusal) |
+| the disk consumer's hand (off hand) | **not reachable by the harness** — `ctl interact` clicks with the main hand; the code consumes from `event.click.hand` |
+| a survival break carrying its slots | **tested** — slice 10's phase (four speed, a stack, a dirt entry on the item; nothing spilled) |
+| a break that hands no item over (creative) | **tested** — the five slot items spill, no machine item is emitted, the player holds none |
+| a break that hands no item over (cancelled / no loot) | `blocked(harness:no-cancelled-break)` — the completion gate is `on_destroyed_by_player`'s `will_harvest`, unit-tested; no ctl step can cancel a break |
+| a carry with no item to ride | **not reachable in game** (deviation 2) — unit-tested |
+| operator-only energy writes (charge) | **tested** — a level-0 LAN guest is refused, the owner's charge works |
+| operator-only energy writes (network) | **tested** — the same guest is refused `/refinedstorage energy` and the network buffer never reaches 1000 |
+| the charge names the item | **tested** — a stick is refused by name and gains no energy component |
+| every earlier family (slices 1–12) | **tested** — the same leg, unchanged, all green |
+
+### Harness facts learned here
+
+- **A single-player world's owner cannot be de-opped into a lower permission**: `registries.permission`
+  is the owner's level from Allow Commands, so `/deop` succeeds and level-2 commands still run. The
+  LAN guest (`ctl lan open 0`, a second game on `$GSOCK`, `gctl connect`) is the only level-0 source,
+  and it needs its own level-0 differential before its refusals mean anything.
+- **A level-0 guest's refusal of a level-2 mod command reads `Incorrect argument for command`** (the
+  node is not in its tree), not "unknown command" — grep for both.
+- **`ctl state` carries no player name** (`ctl status` does: `.server.name`), and its reply is
+  shorter while a screen is up.
+- **The client's inventory mirror does not show a mod item's components** for this port's payload
+  items; assert the behaviour (a re-placement) instead.
+- **`ctl look-at block X Y Z FACE` can fail** ("no face is visible") where `ctl break`'s own aiming
+  succeeds; it is a hint, so it is called with `|| true`.
+- **A machine that neighbours a full block is a coin flip to aim from one side** (the importer's west
+  face is coplanar with the drive at 42,64,16 — `ctl break` reported "disk_drive is in the way"); aim
+  a visible face first, or break from the other side.
+- **The break's `.drops` window covers three blocks**, so a stray item entity from an earlier phase
+  joins the count (a creative break once reported five speed upgrades for four). Kill item entities
+  before a phase whose drop *sums* are asserted, and assert `>=` on a per-item count.
+- **Two payload items with identical contents merge into one stack** on pickup, which is what makes
+  the stack-of-two case reachable at all.
+
+Skills: superpowers/using-superpowers,brainstorming,writing-plans,test-driven-development,systematic-debugging,verification-before-completion; BeautifulRust/rust-best-practices
+
+Evidence: `ports/_shared/evidence/refinedstorage/` — `plan-slice13-review2.md`,
+`runtime-red-slice13-review2.log`, `sdk-test.log` (115), `sdk-clippy.log`, `sdk-fmt.log`,
+`sdk-build-0.2.13-{1,2}.log` (two builds + `cmp`), `sdk-check-0.2.13.log`,
+`sdk-check-fits-0.2.13.log`, `refinedstorage.hmod` (the delivered bytes) — and
+`ports/_shared/evidence/refinedstorage-e2e/` — `e2e-slice13-green.log`, `e2e-slice13-control.log`,
+`e2e-slice13-selftest-{payload,break,stack-upgrade,drops}.log`, and `launcher-build-0.2.13.log`
+(`Compiling refinedstorage (1 of 1)`, `native-0a875da-7befb00f6e88` — the build every leg ran on).
