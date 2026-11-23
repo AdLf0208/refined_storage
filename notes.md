@@ -19,15 +19,18 @@ the network; no entities, renderers, dimensions or new vanilla hooks.
 Ported now because it is the **#1 core base** of the core-first queue: 13
 pending ATM10 mods depend on it (`ports/tools/port_queue.py`).
 
-Status: **slice 11 — the other storage disks (0.2.11)** — the network core of slice 1, the
+Status: **slice 12 — the in-place disk upgrade (0.2.12)** — the network core of slice 1, the
 crafting chain of slice 2, the finite-range, same-dimension transmitter of slice 3, the item that
 asks its admission (slice 4), the promise table keyed by network (slice 5), the transmitter's four
 upgrade slots with the range and creative range upgrades (slice 6), the two transfer machines with
 the speed and stack upgrades (slice 7), the network's energy model (slice 8), the grid item's
-own 1,000 FE buffer (slice 9), the block drops that carry a broken machine's slots (slice 10), and
-now the other disk sizes: 4k (4,096), 16k (16,384), 64k (65,536) and the creative disk, whose
-capacity lives in the disk item's own component beside its contents — the creative one has none
-(upstream's `null`), so it never refuses an item. Everything else is the gap list below, not a claim.
+own 1,000 FE buffer (slice 9), the block drops that carry a broken machine's slots (slice 10), the
+other disk sizes — 4k (4,096), 16k (16,384), 64k (65,536) and the creative disk, whose capacity
+lives in the disk item's own component beside its contents (the creative one has none, upstream's
+`null`, so it never refuses an item) (slice 11) — and now the in-place upgrade: a smaller disk plus
+the bigger tier's storage part become that disk in one crafting-table step, the contents come across
+with the destination's room, and the source disk's own part comes back. Everything else is the gap
+list below, not a claim.
 
 > The sections from `## Behaviour` to `### Verification after the repairs`
 > describe the **retired `.hnmod`** layout. They are kept as history: the
@@ -2762,7 +2765,7 @@ carried recipe cannot be dead data.
 | the three storage parts and six recipes | **tested** — `tools/recipe_check.py` crafts all six with their declared output and count, consumes them, and its controls yield nothing |
 | the creative disk's recipe | **not ported** — upstream ships none (creative-tab only) |
 | the `*_from_storage_housing` duplicates | **not ported** — deviation 1 |
-| the in-place disk upgrade | **not ported** — deviation 2, `blocked(recipe-serializer)` for this slice |
+| the in-place disk upgrade | **not ported** this slice — deviation 2, `blocked(recipe-serializer)`; **closed in slice 12 (0.2.12)** |
 | fluid disks | **not ported** — the fluid storage system is still a gap (slice 1 item 2) |
 
 ### Harness facts learned here
@@ -2787,3 +2790,262 @@ Evidence: `ports/_shared/evidence/refinedstorage/` — `plan-slice11-disks.md`,
 `e2e-slice11-green.log`, `e2e-slice11-control.log`, `e2e-slice11-selftest-diskcap.log`,
 `e2e-slice11-selftest-{networks,energy,itemenergy,drops}.log`, and `launcher-build-0.2.11.log`
 (`Compiling refinedstorage (1 of 1)`, `native-0a875da-25454b066fed` — the build every leg ran on).
+
+## Slice 12 — the in-place disk upgrade (2026-11-23) — version 0.2.12
+
+### The gap line this slice answers (verbatim)
+
+§"Slice 11" deviation 2, which is also the coverage row it left
+(`the in-place disk upgrade | not ported — deviation 2, blocked(recipe-serializer) for this slice`):
+
+> **The in-place upgrade is not carried.** Upstream's `refinedstorage:storage_disk_upgrade` is a
+> custom recipe type (`CraftingRecipeKind` here) that upgrades a smaller disk with the bigger part
+> and **returns the smaller disk's own part** while transferring the contents; it is `not ported` —
+> the pin can express it (`remaining_items`), but it needs its own decode/match/assemble code and
+> its own in-game proof, so it is the next slice rather than half of this one.
+
+### The route, verified at this pin (not assumed)
+
+`HANDOVER.md` carries the warning *"the grid-kind pair (`CraftingRecipeKind`) crashes at load"*.
+At **`0a875da`** that note is about the **machine** case (a recipe type read by a machine needs API
+36's `register_recipe_type` + `register_raw_recipe_serializer`); a crafting-table kind is
+`minecraft:crafting` and loads normally:
+
+| evidence | what it measures |
+|---|---|
+| `ports/_shared/sdk/0a875da/crates/horizon-mod-vocab/src/parts/crafting_recipes.rs:162-169` | `register_crafting_recipe_serializer(name, kind)` → `add_recipe_serializer(name, "minecraft:crafting", handler)` — a **3×3 crafting-grid** kind, which is what an in-place disk upgrade is |
+| the same file, `:79-105` | the trait: `decode`/`write`/`matches`/`assemble`/`remaining_items`, the last documented as *"One remainder per input cell … Asked once per server take, with the grid before consumption"* |
+| `HANDOVER.md` §17b (2026-11-21) | *"A mod CAN register a custom recipe kind at `0a875da`"*; `pocketstorage` 0.2.5 authored its three recipes this way and crafted them in game |
+| `HANDOVER.md` §"A machine's own recipe type is API 36" | the load crash is the *machine* registrar (`unregistered recipe serializer`), not this pair |
+| **this slice's own in-game run** | `Compiling refinedstorage (1 of 1)`, the three `storage_disk_upgrade` files crafted in a real table, and the take's remainders applied (quotes below) — so the pair is safe here, and the survey's crash claim does not apply |
+
+### The reference (read, not guessed)
+
+Upstream `refinedmods/refinedstorage2` v2.0.9, MIT, commit
+`0dec63affe8147702b020843c22748483ef18c01` (`ports/_shared/upstream/refinedstorage/`):
+
+| file | what it says |
+|---|---|
+| `common/storage/StorageContainerUpgradeRecipeSerializer.java` | the recipe file is `{"type": "refinedstorage:storage_disk_upgrade", "to": "<variant>"}` — the pattern is **derived**, not written |
+| `common/storage/StorageContainerUpgradeRecipe.java` | a **shapeless** pair derived from `to`: any *smaller* finite disk (`capacity < to.capacity`, and `Set.of()` when `to` has no capacity), plus `to.getStoragePart()`. `matches` accepts one of each; `assemble` builds `to`'s stack and `transferTo(fromDisk, toDisk)`; `getRemainingItems` puts `from.getVariant().getStoragePart()` in the **source disk's cell** |
+| `common/storage/storagedisk/ItemStorageDiskItem.java` | `transferTo` = `helper.markAsToTransfer(from, to)`: the destination **item** decides the new capacity (the tooltip prints `transferring ? capacity : …`), the storage's contents are reused |
+| `resources/…/recipe/{4k,16k,64k}_storage_disk_upgrade.json` | three files, each only `to`; there is no creative one |
+| `common/storage/ItemStorageVariant.java` | the five variants and their parts (`1k`…`64k`, `creative` with `null` capacity) |
+
+### What was implemented
+
+- **`runtime::StorageVariant` / `STORAGE_VARIANTS`** — the four finite variants (name, disk id, part
+  id, capacity); `disk_capacity` now reads the same table, so the capacity has one spelling.
+- **`runtime::disk_variant` / `disk_of_variant` / `storage_part_of_disk`** — the id ↔ variant ↔ part
+  mapping (the creative disk has no part; a recipe's `to` may still name it, it just never matches).
+- **`runtime::upgrade_sources(to_disk)`** — the disks a destination accepts: the finite ones with
+  less room; **empty** for the creative disk, mirroring upstream's `Set.of()` for a `null` capacity.
+- **`runtime::upgrade_cells(cells, to_disk)`** — the grid rule: exactly one source disk and exactly
+  one destination part, every other cell empty.
+- **`runtime::upgraded_disk(source, to_disk)`** — the destination disk with **its own item's** room
+  and the source's contents; `None` unless the destination is bigger (so the creative disk is never
+  a source or a destination by construction).
+- **`support::UpgradeKind`** (`impl CraftingRecipeKind`): `decode`/`write` the `{to}` object,
+  `matches` through the item keys resolved once at registration (a craft-time match takes no host),
+  `assemble` = the destination stack carrying `refinedstorage:storage` with the destination's
+  capacity and the source's saved stacks, `remaining_items` = the source disk's own part in its cell.
+- **Three recipe files** — upstream's own `{"type":"refinedstorage:storage_disk_upgrade","to":…}`.
+- **`tools/recipe_check.py`** knows the kind: each of the three files is crafted in a real table, its
+  output and count asserted, the source disk's own part asserted in the disk's cell after the take,
+  and each file gets two controls (its own tier's disk — not smaller — and the source tier's own part
+  — no recipe names it as a destination).
+- **`tools/e2e.sh`** — the in-place upgrade with *contents*: a 4k disk holding 4,096 cobblestone
+  taken out of a chest, crafted with a `16k_storage_part` in a table, the result shift-clicked, the
+  crafted disk read (id, count, its component) before it goes into the drive that then reports
+  `4096/16384 items` and a network total of 4,096; `SELFTEST=upgrade` asserts the source part was
+  **not** returned and exits 1.
+
+### The rules as tests (red first)
+
+`runtime.rs`: `every_storage_disk_names_its_own_part`, `an_upgrade_takes_only_the_smaller_disks`,
+`an_upgrade_grid_is_exactly_one_disk_and_its_part`,
+`an_upgraded_disk_keeps_its_contents_with_the_new_room`,
+`an_upgrade_refuses_a_disk_that_is_not_bigger`.
+
+### Red proof — verbatim, before the glue
+
+`ports/_shared/evidence/refinedstorage/runtime-red-slice12-upgrade.log`, against the new API's stubs
+(the functions existed and answered "no rule": `None`/empty, so the tests failed on the missing
+behaviour rather than on a missing symbol):
+
+```
+---- runtime::tests::every_storage_disk_names_its_own_part stdout ----
+thread 'runtime::tests::every_storage_disk_names_its_own_part' (288290) panicked at src/runtime.rs:2417:9:
+assertion `left == right` failed
+  left: None
+ right: Some("refinedstorage:1k_storage_part")
+---- runtime::tests::an_upgrade_takes_only_the_smaller_disks stdout ----
+thread 'runtime::tests::an_upgrade_takes_only_the_smaller_disks' (288282) panicked at src/runtime.rs:2453:9:
+assertion `left == right` failed
+  left: []
+ right: ["refinedstorage:1k_storage_disk"]
+---- runtime::tests::an_upgrade_grid_is_exactly_one_disk_and_its_part stdout ----
+thread 'runtime::tests::an_upgrade_grid_is_exactly_one_disk_and_its_part' (288280) panicked at src/runtime.rs:2485:9:
+assertion `left == right` failed
+  left: None
+ right: Some(UpgradeGrid { disk: 3, part: 4 })
+---- runtime::tests::an_upgraded_disk_keeps_its_contents_with_the_new_room stdout ----
+thread 'runtime::tests::an_upgraded_disk_keeps_its_contents_with_the_new_room' (288283) panicked at src/runtime.rs:2533:14:
+a 4k disk upgrades into a 16k one
+
+failures:
+    runtime::tests::an_upgrade_grid_is_exactly_one_disk_and_its_part
+    runtime::tests::an_upgrade_takes_only_the_smaller_disks
+    runtime::tests::an_upgraded_disk_keeps_its_contents_with_the_new_room
+    runtime::tests::every_storage_disk_names_its_own_part
+
+test result: FAILED. 106 passed; 4 failed; 0 ignored; 0 measured; 0 filtered out
+```
+
+Honest note: the fifth test (`an_upgrade_refuses_a_disk_that_is_not_bigger`) was **already green**
+against the stubs, which answered `None` to everything. It stays as the regression guard for the
+"only a bigger disk" rule.
+
+### A tool defect the first leg found (recorded, fixed)
+
+The recipe driver crashed on the new files with `KeyError: 'result'` — it read `recipe["result"]`
+before looking at the kind, and a mod kind's file has no `result` (the destination *is* the recipe).
+The result is now derived from `to` for that kind. The first version of the second control was also
+wrong: "a 1k disk with a 16k part" **is** the 16k recipe's own pair, and the driver reported a real
+16k disk for a control that was meant to prove nothing crafts (the 16k and 4k files both caught it).
+The control is now the *source* tier's own part (a 1k disk + a 1k part), which no file names as a
+destination. Both were tool bugs, not mod bugs; the two superseded legs' logs were not kept (their
+`FAIL:` lines are quoted here and the driver's branch carries the fix), and every kept log is from
+the corrected package.
+
+### Green — the ladder and the in-game leg (one launcher build at `0a875da`)
+
+| Step | Command | Result |
+|---|---|---|
+| runtime + glue tests | `rm -f Cargo.lock && cargo test` | **110 passed**, 0 failed (`sdk-test.log`) |
+| lints | `cargo clippy --all-targets --offline -- -D warnings` | exit 0, **0 warnings** (`sdk-clippy.log`) |
+| formatting | `rustfmt --edition 2024 --check src/{lib,support,runtime}.rs` | clean, exit 0 (`sdk-fmt.log`) |
+| SDK check | `cargo horizon-mod check` | *"Refined Storage uses 677 items of the API (…). Made for 0a875da."* (`sdk-check-0.2.12.log`) |
+| package | `rm -f Cargo.lock && cargo horizon-mod build` ×2 | **byte-identical** (`cmp`, `CMP_EXIT:0`), **216,906 B**, SHA-256 `2e46885e9759bfa7f88dc6344b99f107cafb9686f25ed8c7696ad6e69599b080`, **260 entries**, no `Cargo.lock` (`sdk-build-0.2.12.log`) |
+| package check | `cargo horizon-mod check refinedstorage.hmod` | `0.2.12 (native-mod, format native-1/0a875da…/e59da909…, for 26.3) 216906 bytes`, `CHECK_FILE_EXIT:0` |
+| fits (pin) | `… fits refinedstorage.hmod --build 0a875da` | `0a875da  made for`, `FITS_PIN_EXIT:0` |
+| fits (other build) | `… fits refinedstorage.hmod --build 0b14f8a` | `0b14f8a  fits`, `FITS_OTHER_EXIT:0` (both in `sdk-check-fits-0.2.12.log`) |
+| recipe types | `python3 ports/tools/check-recipe-types.py refinedstorage` | `refinedstorage: ok` (`recipe-types.log`) |
+| launcher build | `launcher-game.sh build refinedstorage --rebuild` | exit 0, **`Compiling refinedstorage (1 of 1)`**, `native-0a875da-e2f5ccd8f3ce` (`launcher-build-0.2.12.log`) |
+| in-game leg | `build-slot.sh run … --step e2e -- tools/e2e.sh` | **PASS** + **`EXIT:0`** (`e2e-slice12-green.log`) — `38 of 38 carried recipes`, `36` controls |
+| control (same Nightly, no package) | `GAME=$CONTROL_GAME …` | **FAIL** + **`EXIT:1`** — *"the block at 41,64,1 is minecraft:air, expected facing=north"* (`e2e-slice12-control.log`) |
+| counterfactual (this slice) | `SELFTEST=upgrade …` | **FAIL** + **`EXIT:1`** — *"expected the source 4k part not to be returned; this build returns it"* (`e2e-slice12-selftest-upgrade.log`) |
+| selftest (slice-5 promise rule) | `SELFTEST=networks …` | **FAIL** + **`EXIT:1`** — *"the grid's view is [{"count":3,"item":"minecraft:gold_ingot","slot":300}], expected []"* |
+| selftest (slice-8 network gate) | `SELFTEST=energy …` | **FAIL** + **`EXIT:1`** — *"Wireless access at 46,64,20: refused (not enough energy: 0 of 16 FE)"* |
+| selftest (slice-9 item gate) | `SELFTEST=itemenergy …` | **FAIL** + **`EXIT:1`** — *"expected the 0-FE deposit to have moved the stack, it is still in the inventory"* |
+| selftest (slice-10 carry) | `SELFTEST=drops …` | **FAIL** + **`EXIT:1`** — *"the re-placed importer carried its slots back ([…]); the empty drop it used to have is gone"* |
+| selftest (slice-11 capacity) | `SELFTEST=diskcap …` | **FAIL** + **`EXIT:1`** — *"expected the 4k disk to have accepted the 4,097th item (net_items 4096)"* |
+| log gate | `check-e2e-logs.py refinedstorage-e2e --strict` | `logs=62 ok=62 missing-exit=0 bad-exit=0` |
+| package gate | `verify-sdk-package.py refinedstorage` | **1/1** |
+
+### The new phase, quoted from `e2e-slice12-green.log`
+
+```
+== the in-place disk upgrade: a smaller disk and the bigger part make the bigger disk ==
+  info(42,64,12): … 0 disks, 0 items in 0 resources; energy 900/1000 FE, drawing 20/tick, t=11906
+  the filled 4k disk taken out of the chest: [{"components":"{\"refinedstorage:storage\":{capacity:4096,stacks:[{count:4096,id:\"minecraft:cobblestone\"}]}}","count":1,"item":"refinedstorage:4k_storage_disk","slot":0}]
+  the upgrade recipe's result: {"components":"{\"refinedstorage:storage\":{capacity:16384L,stacks:[{count:4096,id:\"minecraft:cobblestone\"}]}}","count":1,"item":"refinedstorage:16k_storage_disk","slot":200}
+  the crafting grid after the take: [{"count":1,"item":"refinedstorage:4k_storage_part","slot":100}]
+  the crafted 16k disk in the inventory: [{"components":"{\"refinedstorage:storage\":{capacity:16384L,stacks:[{count:4096,id:\"minecraft:cobblestone\"}]}}","count":1,"item":"refinedstorage:16k_storage_disk","slot":8}]
+  info(42,64,12): … 1 disks, 4096 items in 1 resources; energy 800/1000 FE, drawing 24/tick, t=12134
+  info(42,64,12) drive: Disk drive at 42,64,12: 1 disk, capacity slot 0: refinedstorage:16k_storage_disk 4096/16384 items
+```
+
+### The three upgrade files, quoted from the recipe driver (same log)
+
+```
+recipe 4k_storage_disk_upgrade (refinedstorage:storage_disk_upgrade)
+  4k_storage_disk_upgrade -> refinedstorage:4k_storage_disk x1 (from refinedstorage:1k_storage_disk + refinedstorage:4k_storage_part)
+  4k_storage_disk_upgrade grid after the take: [('refinedstorage:1k_storage_part', 1)]
+  4k_storage_disk_upgrade with its own tier's disk (control) -> None x0
+  4k_storage_disk_upgrade with the source tier's own part (control) -> None x0
+recipe 16k_storage_disk_upgrade (refinedstorage:storage_disk_upgrade)
+  16k_storage_disk_upgrade -> refinedstorage:16k_storage_disk x1 (from refinedstorage:4k_storage_disk + refinedstorage:16k_storage_part)
+  16k_storage_disk_upgrade grid after the take: [('refinedstorage:4k_storage_part', 1)]
+  … both controls -> None x0
+recipe 64k_storage_disk_upgrade (refinedstorage:storage_disk_upgrade)
+  64k_storage_disk_upgrade -> refinedstorage:64k_storage_disk x1 (from refinedstorage:16k_storage_disk + refinedstorage:64k_storage_part)
+  64k_storage_disk_upgrade grid after the take: [('refinedstorage:16k_storage_part', 1)]
+  … both controls -> None x0
+```
+
+### The assertions and their differentials
+
+- **The crafted disk is the destination, with the destination's room.** The result slot's own
+  component reads `capacity:16384` while the source said 4,096 — a build that kept the source's
+  capacity would read 4096/4096, and the drive's line is the second witness.
+- **The contents came across.** The same component carries `count:4096` cobblestone, which the source
+  disk's component held.
+- **The source part comes back.** After the take the *crafting grid* holds
+  `refinedstorage:4k_storage_part` in slot 100 — the cell the disk left — and no disk; the
+  counterfactual (`SELFTEST=upgrade`) asserts the opposite and fails.
+- **Only a bigger disk upgrades.** Each of the three files has two controls that craft nothing (its
+  own tier's disk; the source tier's own part), so the match rule is exercised in both directions.
+- **The drive reads the disk's own capacity**: `4096/16384 items`, and the network totals 4,096 —
+  the upgraded disk is a real 16k disk, not a 4k disk with a bigger label.
+
+### Deviations and gaps (recorded, not hidden)
+
+1. **The match is strict where upstream's is lenient.** `StorageContainerUpgradeRecipe.matches`
+   returns true as soon as it has seen one valid disk and one part, ignoring other grid cells; this
+   port requires every other cell to be empty. A shapeless recipe of two ingredients accepts no
+   third item, and upstream's leniency would let a player park a stack in the grid while upgrading.
+   A user notices nothing legitimate: the same pair in the same table crafts the same disk.
+2. **The creative disk is never a destination or a source** — upstream's `Set.of()` for a `null`
+   capacity; there is no `creative_storage_disk_upgrade` file, and the unit test pins the empty
+   source list.
+3. **The from-housing duplicate route** for the three larger disks is still not carried (slice 11,
+   deviation 1). Unchanged.
+4. **The recipe book does not show the upgrade** (a mod crafting kind has no placement info in this
+   package) — the same `blocked(PlacementInfo)` state `pocketstorage` records for its kind. The
+   recipe crafts regardless.
+5. The upgraded disk's **component records the destination's capacity** rather than upstream's
+   storage-object reuse: upstream's disk contents live behind a UUID in a world-level repository,
+   this port's live in the item. The behaviour a player sees is the same (contents kept, new room).
+
+### Coverage (parity rule) — every family this slice ships
+
+| family | state |
+|---|---|
+| the three `*_storage_disk_upgrade` files | **tested** — each crafts in a real table with its destination's own pair, output and count asserted, ingredients consumed |
+| the source disk's part returned | **tested** — the returned part is asserted in the disk's own cell after the take; `SELFTEST=upgrade` fails on a build that does not return it |
+| the contents transfer | **tested** — the phase's 4k disk (4,096 cobblestone) makes a 16k disk whose component carries the stacks |
+| the destination's capacity | **tested** — `capacity:16384` in the crafted component and `4096/16384 items` from the drive, then 4,096 as the network total |
+| a same-tier disk | **tested** — driver control crafts nothing (all three files) |
+| a smaller disk with its own part | **tested** — driver control crafts nothing (all three files) |
+| only a bigger disk is accepted | **tested** — unit test `an_upgrade_refuses_a_disk_that_is_not_bigger` |
+| the creative disk as a destination | **tested** — unit test `an_upgrade_takes_only_the_smaller_disks` (empty) and `upgrade_cells` returns `None` |
+| the recipe book entry | `blocked(PlacementInfo)` — a mod kind has no placement info; the recipe crafts |
+| fluid disks' upgrades | **not ported** — the fluid storage system is still a gap (slice 1 item 2) |
+
+### Harness facts learned here
+
+- **A crafting table's menu is not a container's**: its grid is `100-108` with the result at `200`,
+  so `open_menu X Y Z N` (which counts `300+`) never opens one; the phase waits for the result slot
+  instead, as `recipe_check.py` does.
+- **A chest hands a component-carrying stack to a player**: `/data merge block … {Items:[…]}`
+  decodes `components`, and clicking the chest's slot into the inventory works with the components
+  intact (the disk's 4,096 cobblestone survived the trip).
+- **A mod `generic_9xN` menu accepts a click on `300+`**: the crafted disk clicked into the drive's
+  own menu slot 300 landed in the drive and the drive read it — the first time this port has clicked
+  a *mod* container's slot rather than only reading it.
+- **The engine applies a mod kind's `remaining_items` on the take**: the returned part appeared in
+  the cell the disk left, which is the platform fact the pin's docs describe and this port now has
+  evidence for.
+
+Skills: superpowers/using-superpowers,brainstorming,writing-plans,test-driven-development,systematic-debugging,verification-before-completion; BeautifulRust/rust-best-practices
+
+Evidence: `ports/_shared/evidence/refinedstorage/` — `plan-slice12-upgrade.md`,
+`runtime-red-slice12-upgrade.log`, `sdk-test.log` (110), `sdk-clippy.log`, `sdk-fmt.log`,
+`sdk-build-0.2.12.log` (two builds + `cmp`), `sdk-check-0.2.12.log`, `sdk-check-fits-0.2.12.log`,
+`recipe-types.log`, `refinedstorage.hmod` (the delivered bytes) — and
+`ports/_shared/evidence/refinedstorage-e2e/` — `e2e-slice12-green.log`, `e2e-slice12-control.log`,
+`e2e-slice12-selftest-upgrade.log`,
+`e2e-slice12-selftest-{networks,energy,itemenergy,drops,diskcap}.log`, and
+`launcher-build-0.2.12.log` (`Compiling refinedstorage (1 of 1)`, `native-0a875da-e2f5ccd8f3ce` —
+the build every leg ran on).

@@ -22,6 +22,15 @@ Assertions, per recipe:
      yields no result (shaped, shapeless), and a furnace with a non-ingredient
      smelts nothing — so the assertions can fail.
 
+`refinedstorage:storage_disk_upgrade` (slice 12) is a **mod crafting kind**, not a
+vanilla one: its file names only the destination variant (`to`), and the two
+ingredients are derived from it — a *smaller* disk and that tier's storage part.
+Its branch crafts the previous tier's disk with this tier's part, asserts the
+output, asserts that the source disk's **own** part comes back in the disk's cell
+after the take (upstream's `getRemainingItems`), and runs two controls: the same
+tier's disk (not smaller) and the source tier's own part (no recipe names it as a
+destination).
+
 Exits 1 on the first mismatch, printing `FAIL: …` (the e2e's trap prints EXIT:1).
 """
 import json
@@ -259,8 +268,13 @@ def main():
         recipe = json.loads(path.read_text())
         kind = recipe["type"]
         name = path.stem
-        out = recipe["result"]["id"]
-        out_count = recipe["result"].get("count", 1)
+        if kind == "refinedstorage:storage_disk_upgrade":
+            # A mod kind's file names only `to`; its result is that disk.
+            out = f"refinedstorage:{recipe['to']}_storage_disk"
+            out_count = 1
+        else:
+            out = recipe["result"]["id"]
+            out_count = recipe["result"].get("count", 1)
         print(f"recipe {name} ({kind})")
         if kind == "minecraft:crafting_shaped":
             cells_per_item = {}
@@ -314,6 +328,68 @@ def main():
                     place(first, [GRID[0]])
                     place(impostor, [GRID[1]])
                     expect_empty(f"{name} with {impostor} for {second}")
+        elif kind == "refinedstorage:storage_disk_upgrade":
+            # A mod crafting kind: the file names only `to`, and upstream derives
+            # the pair from it — a smaller disk (any finite variant below `to`,
+            # the previous tier being one member) and `to`'s storage part.
+            tiers = ["1k", "4k", "16k", "64k"]
+            index = tiers.index(recipe["to"])
+            source = f"refinedstorage:{tiers[index - 1]}_storage_disk"
+            source_part = f"refinedstorage:{tiers[index - 1]}_storage_part"
+            part = f"refinedstorage:{recipe['to']}_storage_part"
+            reset_table()
+            give(source, 1)
+            ctl.wait(2)
+            place(source, [GRID[0]])
+            give(part, 1)
+            ctl.wait(2)
+            place(part, [GRID[1]])
+            got_item, got_count = result()
+            print(f"  {name} -> {got_item} x{got_count} (from {source} + {part})")
+            if (got_item, got_count) != (out, out_count):
+                fail(f"{name}: expected {out} x{out_count}, got {got_item} x{got_count}")
+                continue
+            made = next(s for s in ctl.slots() if s["slot"] == RESULT)
+            print(f"  {name} result components: {made.get('components')}")
+            ctl("click-slot", RESULT, "shift")
+            ctl.wait(3)
+            # The take consumes both ingredients and returns the *source* disk's own
+            # part into the cell it left: that is the rule this kind exists for.
+            carried = [(s["item"], s["count"]) for s in grid() if s.get("item")]
+            print(f"  {name} grid after the take: {carried}")
+            if carried != [(source_part, 1)]:
+                fail(
+                    f"{name}: the grid after the craft holds {carried}, expected only "
+                    f"{source_part} x1 (the source disk's own part)"
+                )
+            if count(out) < out_count:
+                fail(f"{name}: the crafted {out} is not in the inventory ({count(out)} of {out_count})")
+            crafted += 1
+            # Controls: the destination's own size is not smaller, and the source
+            # tier's own part names no recipe for that disk (a smaller disk plus a
+            # smaller part is not an upgrade — and the other tiers' parts would be
+            # their own recipes, so they are not counterfactuals).
+            controls_here = [
+                (
+                    f"{name} with its own tier's disk",
+                    f"refinedstorage:{recipe['to']}_storage_disk",
+                    part,
+                ),
+                (
+                    f"{name} with the source tier's own part",
+                    source,
+                    source_part,
+                ),
+            ]
+            for label, control_disk, control_part in controls_here:
+                reset_table()
+                give(control_disk, 1)
+                ctl.wait(2)
+                place(control_disk, [GRID[0]])
+                give(control_part, 1)
+                ctl.wait(2)
+                place(control_part, [GRID[1]])
+                expect_empty(label)
         elif kind == "minecraft:smelting":
             item, tag = ingredient_id(recipe["ingredient"], tags)
             # A fresh furnace: input in slot 0, fuel in slot 1, 210 ticks to cook.

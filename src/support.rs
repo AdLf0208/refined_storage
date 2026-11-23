@@ -19,14 +19,15 @@ use mod_api::item::containers::ModBlockEntityFields;
 use mod_api::{
     self, BlockDropsEvent, BlockEntityEvent, BlockEntityItemError, BlockEntityPart,
     BlockEntityTickEvent, BlockEntityTicksEvent, BlockKey, BlockPart, BlockState, BreakBlockEvent,
-    Command, CommandArgumentValue, CommandInvocation, CommandSource, Component, Compound, ENERGY,
-    Flow, GameMode, Hand, Host, HostSide, HostTransaction, ITEM_ENERGY, ITEMS, InteractionResult,
-    ItemKey, ItemPart, ItemPlace, ItemResource, ItemStack, LevelHost, LevelRef, LevelSide,
-    MenuClickedEvent, MenuClosedEvent, MenuContainer, MenuPart, MenuRef, MenuReplace,
-    MenuSlotBacking, MenuSlotRulesEvent, ModBlockEntityView, ModContainer, ModEnergyBuffer,
-    OnBlockPlacedByEvent, PlayerRef, RegisterCommandsEvent, Registrar, RegistrationContext,
-    RightClickBlockEvent, RunModCommandEvent, Screen, ScreenEvent, ServerHost, ServerTickEvent,
-    ServerTickPhase, StateForPlacementEvent, Tag, Text, UseItemEvent, UseOnEvent, WorldPhase,
+    Command, CommandArgumentValue, CommandInvocation, CommandSource, Component, Compound,
+    CraftingGrid, CraftingRecipeCodec, CraftingRecipeKind, ENERGY, Flow, GameMode, Hand, Host,
+    HostSide, HostTransaction, ITEM_ENERGY, ITEMS, InteractionResult, ItemKey, ItemPart, ItemPlace,
+    ItemResource, ItemStack, LevelHost, LevelRef, LevelSide, MenuClickedEvent, MenuClosedEvent,
+    MenuContainer, MenuPart, MenuRef, MenuReplace, MenuSlotBacking, MenuSlotRulesEvent,
+    ModBlockEntityView, ModContainer, ModEnergyBuffer, OnBlockPlacedByEvent, PlayerRef,
+    RegisterCommandsEvent, Registrar, RegistrationContext, RightClickBlockEvent,
+    RunModCommandEvent, Screen, ScreenEvent, ServerHost, ServerTickEvent, ServerTickPhase,
+    StateForPlacementEvent, Tag, Text, UseItemEvent, UseOnEvent, WorldPhase,
 };
 
 use crate::runtime::{
@@ -263,6 +264,17 @@ pub(crate) fn register(registrar: &mut dyn Registrar, _cx: &RegistrationContext)
     registrar.menu_part(TRANSMITTER_MENU, Upgrades);
     registrar.menu_part(IMPORTER_MENU, MachineSlots);
     registrar.menu_part(EXPORTER_MENU, MachineSlots);
+    // The in-place disk upgrade's crafting kind (slice 12): a smaller disk plus
+    // the bigger tier's storage part. Registering it here reads the three
+    // `refinedstorage:storage_disk_upgrade` files as this mod's recipes instead
+    // of refusing them as an unknown type — the ids a grid may name are
+    // resolved once, because a craft-time match takes no host.
+    let mut upgrade_keys = Vec::with_capacity(runtime::STORAGE_VARIANTS.len() * 2);
+    for variant in runtime::STORAGE_VARIANTS {
+        upgrade_keys.push((variant.disk, registrar.item_key(variant.disk)));
+        upgrade_keys.push((variant.part, registrar.item_key(variant.part)));
+    }
+    registrar.register_crafting_recipe_serializer(UPGRADE_KIND, UpgradeKind { keys: upgrade_keys });
     let kind = registrar
         .block_entity_type(BE_TYPE)
         .blocks(&[
@@ -687,6 +699,160 @@ fn write_disk(host: &dyn Host, stack: &mut ItemStack, disk: &Disk<Net>) {
         SavedDisk {
             capacity: Some(disk.capacity()),
             stacks: entries,
+        },
+    );
+}
+
+// --- the in-place disk upgrade (slice 12) ----------------------------------
+
+/// The `refinedstorage:storage_disk_upgrade` crafting kind: upstream's
+/// `StorageContainerUpgradeRecipe` — a smaller disk plus the bigger tier's
+/// storage part becomes the bigger disk, the contents come across, and the
+/// source disk's own storage part is returned.
+const UPGRADE_KIND: &str = "storage_disk_upgrade";
+
+/// The upgrade recipe as it crosses the API boundary: only the destination
+/// variant, which is all upstream's serializer keeps (`{"type": …, "to": …}`).
+#[derive(Clone, Debug, PartialEq, Eq, mod_api::Wire)]
+struct UpgradeValue {
+    /// The variant name the file's `to` field carries (`"4k"`, `"16k"`, `"64k"`).
+    to: String,
+}
+
+/// The registered `storage_disk_upgrade` kind, with the item keys a matching
+/// grid may name: a craft-time match takes no host, so the ids are resolved once
+/// at registration and compared afterwards.
+struct UpgradeKind {
+    /// Every disk and storage part an upgrade may name, in variant order.
+    keys: Vec<(&'static str, ItemKey)>,
+}
+
+impl UpgradeKind {
+    /// The key of one of the ids an upgrade may name.
+    fn key(&self, id: &str) -> Option<ItemKey> {
+        self.keys
+            .iter()
+            .find(|(name, _)| *name == id)
+            .map(|(_, key)| *key)
+    }
+
+    /// The id of the item a grid cell holds, `None` when it is not one of the
+    /// kind's own items.
+    fn id_of(&self, key: ItemKey) -> Option<&'static str> {
+        self.keys
+            .iter()
+            .find(|(_, known)| *known == key)
+            .map(|(name, _)| *name)
+    }
+
+    /// The grid's cells as ids. An empty cell stays `None`; a cell holding an
+    /// item the kind does not name ends the whole answer, so a third item can
+    /// never look like an empty cell to the rule.
+    fn grid_ids(&self, grid: &CraftingGrid) -> Option<Vec<Option<&'static str>>> {
+        let mut ids = Vec::with_capacity(grid.cells.len());
+        for cell in &grid.cells {
+            match cell {
+                None => ids.push(None),
+                Some(stack) => ids.push(Some(self.id_of(stack.item())?)),
+            }
+        }
+        Some(ids)
+    }
+}
+
+impl CraftingRecipeKind for UpgradeKind {
+    type Value = UpgradeValue;
+
+    fn codec(&self) -> Option<CraftingRecipeCodec<Self::Value>> {
+        Some(CraftingRecipeCodec::wire())
+    }
+
+    /// The file is the serializer's own shape: a `to` variant and nothing else
+    /// (the ingredients are derived from it, as upstream derives them).
+    fn decode(&self, json: &str) -> Result<Self::Value, String> {
+        use mod_api::serde_json::Value;
+
+        let value: Value =
+            mod_api::serde_json::from_str(json).map_err(|error| error.to_string())?;
+        if let Some(kind) = value.get("type").and_then(Value::as_str)
+            && kind != format!("refinedstorage:{UPGRADE_KIND}")
+        {
+            return Err(format!("{kind} is not a storage disk upgrade"));
+        }
+        let to = value
+            .get("to")
+            .and_then(Value::as_str)
+            .ok_or("a storage disk upgrade needs a \"to\" variant")?;
+        if runtime::disk_of_variant(to).is_none() {
+            return Err(format!("{to} is not a storage variant"));
+        }
+        Ok(UpgradeValue { to: to.to_owned() })
+    }
+
+    /// The client reads the same object back; the variant is one of five known
+    /// bare names, so the literal needs no escaping.
+    fn write(&self, value: &Self::Value) -> Result<String, String> {
+        if runtime::disk_of_variant(&value.to).is_none() {
+            return Err(format!("{} is not a storage variant", value.to));
+        }
+        Ok(format!("{{\"to\":\"{}\"}}", value.to))
+    }
+
+    fn matches(&self, value: &Self::Value, grid: CraftingGrid) -> bool {
+        let Some(to_disk) = runtime::disk_of_variant(&value.to) else {
+            return false;
+        };
+        let Some(ids) = self.grid_ids(&grid) else {
+            return false;
+        };
+        runtime::upgrade_cells(&ids, to_disk).is_some()
+    }
+
+    fn assemble(&self, value: &Self::Value, grid: CraftingGrid) -> Option<ItemStack> {
+        let to_disk = runtime::disk_of_variant(&value.to)?;
+        let ids = self.grid_ids(&grid)?;
+        let cells = runtime::upgrade_cells(&ids, to_disk)?;
+        let source = grid.cells.get(cells.disk)?.as_ref()?;
+        let mut out = ItemStack::new(self.key(to_disk)?, 1)?;
+        carry_storage(source, &mut out, runtime::disk_capacity(to_disk)?);
+        Some(out)
+    }
+
+    /// The source disk's own part goes back into the cell the disk left; every
+    /// other cell is empty (the destination part is consumed by the craft).
+    fn remaining_items(
+        &self,
+        value: &Self::Value,
+        grid: CraftingGrid,
+    ) -> Option<Vec<Option<ItemStack>>> {
+        let to_disk = runtime::disk_of_variant(&value.to)?;
+        let ids = self.grid_ids(&grid)?;
+        let cells = runtime::upgrade_cells(&ids, to_disk)?;
+        let source = ids.get(cells.disk).copied().flatten()?;
+        let key = self.key(runtime::storage_part_of_disk(source)?)?;
+        let mut remaining = vec![None; grid.cells.len()];
+        remaining[cells.disk] = Some(ItemStack::new(key, 1)?);
+        Some(remaining)
+    }
+}
+
+/// Carry a source disk's saved contents onto the upgraded disk, recording the
+/// destination's room: upstream's `transferTo` reuses the storage and the
+/// destination item decides the capacity (its tooltip prints
+/// `transferring ? capacity : …`). The saved stacks are compounds, so they move
+/// verbatim instead of being decoded and re-created.
+fn carry_storage(source: &ItemStack, to: &mut ItemStack, capacity: DiskCapacity) {
+    let Some(saved) = source.get(&StorageComponent) else {
+        return;
+    };
+    if saved.stacks.is_empty() {
+        return;
+    }
+    let _ = to.set(
+        &StorageComponent,
+        SavedDisk {
+            capacity: Some(capacity),
+            stacks: saved.stacks,
         },
     );
 }

@@ -88,7 +88,9 @@
 # fails on the grid's own gate; SELFTEST=drops asserts the re-placed importer
 # came back empty, so the run fails once the slots travel on the item;
 # SELFTEST=diskcap asserts a 4k disk accepted the 4,097th item, so the run fails
-# now that a disk enforces the capacity its item names.
+# now that a disk enforces the capacity its item names; SELFTEST=upgrade asserts
+# the source disk's own part was not returned by the in-place upgrade, so the run
+# fails now that it is.
 #
 # Slice 8 (the controller's energy model):
 #  - the controller's buffer is 1,000 FE, its `energy_type` is upstream's four
@@ -129,6 +131,15 @@
 #    past 65,536, its readout saying `unlimited`;
 #  - a 4k disk keeps its 4,096 items across `save` + relaunch, beside the 1k
 #    disk's 3 gold on one network.
+#
+# Slice 12 (the in-place disk upgrade):
+#  - a 4k disk holding 4,096 cobblestone plus a 16k storage part make a 16k disk
+#    in a crafting table (the package's own `refinedstorage:storage_disk_upgrade`
+#    kind): the result carries the 4k disk's contents and the destination's
+#    16,384-item capacity, the 4k disk is consumed, and the source disk's **own**
+#    4k part is returned into the cell the disk left;
+#  - the crafted disk inserted into the drive reads `4096/16384 items` and the
+#    network totals 4,096.
 set -euo pipefail
 export LC_ALL=C
 
@@ -155,6 +166,38 @@ WORLD=RefinedStorageE2E
 [ -x "$CTL" ] || { echo "missing horizon-ctl: $CTL" >&2; exit 1; }
 [ -x "$GAME" ] || { echo "missing horizon-client: $GAME" >&2; exit 1; }
 [ -d "$RES/assets" ] || { echo "missing prepared resources: $RES" >&2; exit 1; }
+
+# The package this leg belongs to. The leg runs a game the launcher compiled from
+# this same tree, so the line names the *delivered* bytes, and the archive is
+# checked against the tree's sources first: a package built before a doc or source
+# edit must fail here rather than pass as "the delivery" (`verify-sdk-package.py`
+# asks the same question of the archive).
+package_line() {
+    local hmod=$PORT/refinedstorage.hmod sha bytes drift
+    if [ ! -f "$hmod" ]; then
+        echo "package: absent ($hmod)"
+        return 1
+    fi
+    sha=$(sha256sum "$hmod" | cut -d' ' -f1)
+    bytes=$(stat -c %s "$hmod")
+    drift=$(python3 - "$hmod" "$PORT" <<'PY'
+import pathlib
+import sys
+import zipfile
+hmod, port = pathlib.Path(sys.argv[1]), pathlib.Path(sys.argv[2])
+with zipfile.ZipFile(hmod) as archive:
+    for name in ("horizon-mod.toml", "src/lib.rs", "src/support.rs", "src/runtime.rs"):
+        if archive.read(name) != (port / name).read_bytes():
+            print(name)
+PY
+)
+    echo "package: $sha $bytes refinedstorage.hmod"
+    if [ -n "$drift" ]; then
+        echo "package: the archive's $drift differs from the tree — rebuild before this leg"
+        return 1
+    fi
+}
+package_line || { echo "FAIL: the delivered package is not the tree's bytes" >&2; exit 1; }
 
 mkdir -p "$TMP"
 SCRATCH=$(mktemp -d "$TMP/refinedstorage-home.XXXXXX")
@@ -2110,6 +2153,138 @@ ctl wait 4
 ctl command "clear @s" >/dev/null
 ctl wait 2
 
+echo "== the in-place disk upgrade: a smaller disk and the bigger part make the bigger disk =="
+# Slice 12, from the port's own gap list ("the in-place upgrade is not carried",
+# upstream's `StorageContainerUpgradeRecipe`, a mod crafting kind). A 4k disk
+# holding 4,096 cobblestone plus a 16k storage part become a 16k disk: the
+# contents come across, the source disk's own 4k part comes back in the cell it
+# left, and the drive then reads 4096/16384 — the *destination item's* room, not
+# the source's.
+net minecraft:the_end 40 64 12
+# The drive starts empty, so the network total below is the upgraded disk alone.
+ctl command "data merge block 42 64 12 {Items:[]}"
+ctl wait 8
+charge_net
+expect_info 42 64 12 "0 disks, 0 items in 0 resources"
+# The filled disk waits in a vanilla chest: a block's `Items` decode a component
+# carrying stack, and the chest's menu is how a player takes it out.
+ctl command "execute in minecraft:the_end run tp @s 46.5 64 15.5"
+ctl command "execute in minecraft:the_end run setblock 46 64 14 minecraft:chest"
+ctl wait 6
+ctl command "data merge block 46 64 14 {Items:[{Slot:0b,id:\"refinedstorage:4k_storage_disk\",count:1,components:{\"refinedstorage:storage\":{capacity:4096,stacks:[{id:\"minecraft:cobblestone\",count:4096}]}}}]}"
+ctl wait 6
+charge_net
+open_menu 46 64 14 27
+disk_slot=$(ctl screen | jq -r '[.slots[] | select(.slot >= 300 and .item == "refinedstorage:4k_storage_disk")][0].slot // empty')
+[ -n "$disk_slot" ] || fail "the chest does not hold the filled 4k disk: $(ctl screen | jq -c '[.slots[] | select(.item != null)]')"
+ctl click-slot "$disk_slot"
+ctl wait 2
+free_slot=$(empty_inv_slot)
+[ -n "$free_slot" ] || fail "no empty inventory slot for the filled disk"
+ctl click-slot "$free_slot"
+ctl wait 4
+held=$(ctl screen | jq -c '[.slots[] | select(.slot < 36 and .item == "refinedstorage:4k_storage_disk")]')
+echo "  the filled 4k disk taken out of the chest: $held"
+[ "$(echo "$held" | jq 'length')" = 1 ] \
+    || fail "the filled 4k disk is not in the inventory: $held"
+ctl close
+ctl wait 4
+# The crafting table: the 4k disk in one cell, a 16k storage part in another.
+ctl command "execute in minecraft:the_end run setblock 44 64 14 minecraft:crafting_table"
+ctl wait 6
+# A crafting table's grid is 100-108 with the result at 200 (not a container's
+# 300+), so it opens with recipe_check's own ask: wait for the result slot.
+for _ in 1 2 3; do
+    ctl interact 44 64 14 >/dev/null
+    ctl wait 8
+    if ctl screen 2>/dev/null | jq -e '[.slots[] | select(.slot == 200)] | length > 0' >/dev/null 2>&1; then
+        break
+    fi
+    ctl close >/dev/null 2>&1 || true
+    ctl wait 4
+done
+ctl screen | jq -e '[.slots[] | select(.slot == 200)] | length > 0' >/dev/null \
+    || fail "the crafting table at 44,64,14 did not open (no result slot): $(ctl screen | jq -c '{screen,slots:((.slots // [])|length)}')"
+disk_slot=$(inv_slot refinedstorage:4k_storage_disk)
+[ -n "$disk_slot" ] || fail "the 4k disk is not in the crafting table's menu: $(ctl screen | jq -c '[.slots[] | select(.item != null)]')"
+ctl click-slot "$disk_slot"
+ctl wait 2
+ctl click-slot 100
+ctl wait 2
+ctl give refinedstorage:16k_storage_part 1
+ctl wait 4
+part_slot=$(inv_slot refinedstorage:16k_storage_part)
+[ -n "$part_slot" ] || fail "no 16k storage part in the menu's player inventory"
+ctl click-slot "$part_slot"
+ctl wait 2
+ctl click-slot 101
+ctl wait 4
+made=$(ctl screen | jq -c '.slots[] | select(.slot == 200 and .item != null)')
+echo "  the upgrade recipe's result: $made"
+case "$made" in
+    *'"item":"refinedstorage:16k_storage_disk"'*) ;;
+    *) fail "a 4k disk and a 16k storage part did not make a 16k disk: $made" ;;
+esac
+case "$made" in
+    *capacity:16384*) ;;
+    *) fail "the crafted 16k disk does not record its own 16,384-item capacity: $made" ;;
+esac
+case "$made" in
+    *cobblestone*) ;;
+    *) fail "the crafted 16k disk did not receive the 4k disk's contents: $made" ;;
+esac
+case "$made" in
+    *count:4096*) ;;
+    *) fail "the crafted 16k disk does not hold the 4,096 cobblestone: $made" ;;
+esac
+# The take: shift-click the result. The source disk and the part are consumed and
+# the source disk's *own* 4k part comes back into the cell the disk left.
+ctl click-slot 200 shift
+ctl wait 4
+grid_after=$(ctl screen | jq -c '[.slots[] | select(.slot >= 100 and .slot <= 108 and .item != null)]')
+echo "  the crafting grid after the take: $grid_after"
+if [ "$SELFTEST" = upgrade ]; then
+    echo "(selftest: asserting the source disk's 4k part was not returned)"
+    case "$grid_after" in
+        *4k_storage_part*) fail "expected the source 4k part not to be returned; this build returns it" ;;
+    esac
+else
+    case "$grid_after" in
+        *'"item":"refinedstorage:4k_storage_part"'*) ;;
+        *) fail "the source disk's own 4k part was not returned into its cell: $grid_after" ;;
+    esac
+    case "$grid_after" in
+        *4k_storage_disk*|*16k_storage_part*) fail "the upgrade left an ingredient in the grid: $grid_after" ;;
+    esac
+fi
+[ "$(ctl screen | jq '[.slots[] | select(.slot < 36 and .item == "refinedstorage:4k_storage_disk")] | length')" = 0 ] \
+    || fail "the 4k disk survived the upgrade: $(ctl screen | jq -c '[.slots[] | select(.item != null)]')"
+upgraded=$(ctl screen | jq -c '[.slots[] | select(.slot < 36 and .item == "refinedstorage:16k_storage_disk")]')
+echo "  the crafted 16k disk in the inventory: $upgraded"
+[ "$(echo "$upgraded" | jq 'length')" = 1 ] \
+    || fail "the crafted 16k disk is not in the inventory: $upgraded"
+ctl close
+ctl wait 4
+# Into the drive through its own menu: the drive reads the disk's own capacity.
+charge_net
+open_menu 42 64 12 9
+disk_slot=$(inv_slot refinedstorage:16k_storage_disk)
+[ -n "$disk_slot" ] || fail "the crafted 16k disk is not in the drive's menu: $(ctl screen | jq -c '[.slots[] | select(.item != null)]')"
+ctl click-slot "$disk_slot"
+ctl wait 2
+ctl click-slot 300
+ctl wait 8
+ctl close
+ctl wait 4
+charge_net
+slots 42 64 12 | jq -e '[.[] | select(.item == "refinedstorage:16k_storage_disk")] | length == 1' >/dev/null \
+    || fail "the drive does not hold the crafted 16k disk: $(slots 42 64 12)"
+expect_info 42 64 12 "1 disks, 4096 items in 1 resources"
+expect_drive 42 64 12 "slot 0: refinedstorage:16k_storage_disk 4096/16384 items"
+ctl command "clear @s" >/dev/null
+ctl command "execute in minecraft:the_end run kill @e[type=item]" >/dev/null 2>&1 || true
+ctl wait 4
+
 # A 4k disk keeps its 4,096 items across a save and a relaunch, at the capacity
 # its item names. It joins the slice-1 drive, so the relaunch below reads two
 # disks of two sizes on one network (the aggregation the network already did).
@@ -2143,5 +2318,5 @@ expect_slots '[{"slot":300,"item":"minecraft:gold_ingot","count":3},{"slot":301,
 ctl close
 ctl wait 4
 
-echo "PASS: the wireless transmitter joined its network through the facing side only (offline facing away, active facing the cable), /refinedstorage info named it and its range 16 blocks, a use 2.5 blocks away and one exactly 16 blocks away were accepted, 17 blocks away was refused naming the distance, an offline transmitter refused and a position without one answered so, a use from the End against the overworld transmitter was refused as a different dimension while the same command under execute in was accepted, the item placed against the clicked face and the block dropped itself, every carried recipe crafts in game with its declared output and count (35 now, each with its wrong-ingredient control), the machine casing places, reads back and drops itself, the wireless grid is unbound until it is used on a transmitter and then names it (dimension and position in its own component), a use inside the range opens the network's 9x6 view with 54 slots, a shift-click in the player inventory deposits 5 diamonds on the network and a shift-click on the view withdraws them back, 17 blocks out is refused naming the distance while 16 blocks out opens the view, the same item and binding is refused as a different dimension from the overworld and accepted in the End, the refinedstorage:wireless advancement is not granted by a transmitter alone and is granted by the grid and a transmitter together, two networks in one dimension each listed their own 3 gold while the other network held 3 too, two grids on one network never offered the same items twice, the cable follows its neighbours and the grid is active with a controller, the disk went into the drive and the grid listed what was deposited through its menu, the search filtered it, a shift-click withdrew the diamonds, breaking the controller took the network offline and putting it back restored the disk's gold, a network without a drive listed nothing, a stick did not enter the drive, a vanilla barrel is not a network block, a range upgrade in the transmitter's own upgrade slot raised its range to 24 blocks so the same 17.0-block use was accepted and the wireless grid opened its view naming 24 blocks, the transmitter's four-slot menu showed the upgrade and refused a diamond, a creative range upgrade gave unlimited range (70.5 blocks out accepted, another dimension still refused), the importer turned on its network moved 3 items in 20 ticks without an upgrade and emptied its source in one pass with a stack upgrade (64 in 20 ticks), four speed upgrades made the same 20 ticks move a stack and /refinedstorage info named the upgrade counts and the work interval (9 ticks down to 1), its filter blocked the resource it names while an empty filter imported everything, the exporter moved exactly the 4 gold its filter names into the chest it faces and an exporter with no filter moved nothing, a machine menu showed its 13 slots and its upgrade row refused a diamond, both machine items were given and read back, both machine blocks dropped themselves, the wireless grid's own 1,000 FE buffer fell by exactly 5 on the open, 5 on a deposit and 5 on a withdrawal with no drift over ticks, and at 0 item FE the same deposit was refused for the item's energy while the network stayed online and still printed its own energy line, a survival break of the importer carried its four speed upgrades, its stack upgrade and its dirt filter entry on the item with none of them spilled beside it and the re-placed machine listed every slot where it was, a broken transmitter's four range upgrades travelled the same way, a 4k disk cut a saved 5,000-item component to its own 4,096 and refused the 4,097th item deposited through the grid while its total stayed 4,096 over a 20-tick window, a 16k disk held 16,384 and a 64k disk 65,536, the creative disk took the same 1-item deposit the full 64k disk refused and kept ingesting past 65,536 with its readout saying unlimited, and the 1k disk's 3 gold and a 4k disk's 4,096 items both kept their contents across a relaunch"
+echo "PASS: the wireless transmitter joined its network through the facing side only (offline facing away, active facing the cable), /refinedstorage info named it and its range 16 blocks, a use 2.5 blocks away and one exactly 16 blocks away were accepted, 17 blocks away was refused naming the distance, an offline transmitter refused and a position without one answered so, a use from the End against the overworld transmitter was refused as a different dimension while the same command under execute in was accepted, the item placed against the clicked face and the block dropped itself, every carried recipe crafts in game with its declared output and count (38 now, each with its wrong-ingredient control), the machine casing places, reads back and drops itself, the wireless grid is unbound until it is used on a transmitter and then names it (dimension and position in its own component), a use inside the range opens the network's 9x6 view with 54 slots, a shift-click in the player inventory deposits 5 diamonds on the network and a shift-click on the view withdraws them back, 17 blocks out is refused naming the distance while 16 blocks out opens the view, the same item and binding is refused as a different dimension from the overworld and accepted in the End, the refinedstorage:wireless advancement is not granted by a transmitter alone and is granted by the grid and a transmitter together, two networks in one dimension each listed their own 3 gold while the other network held 3 too, two grids on one network never offered the same items twice, the cable follows its neighbours and the grid is active with a controller, the disk went into the drive and the grid listed what was deposited through its menu, the search filtered it, a shift-click withdrew the diamonds, breaking the controller took the network offline and putting it back restored the disk's gold, a network without a drive listed nothing, a stick did not enter the drive, a vanilla barrel is not a network block, a range upgrade in the transmitter's own upgrade slot raised its range to 24 blocks so the same 17.0-block use was accepted and the wireless grid opened its view naming 24 blocks, the transmitter's four-slot menu showed the upgrade and refused a diamond, a creative range upgrade gave unlimited range (70.5 blocks out accepted, another dimension still refused), the importer turned on its network moved 3 items in 20 ticks without an upgrade and emptied its source in one pass with a stack upgrade (64 in 20 ticks), four speed upgrades made the same 20 ticks move a stack and /refinedstorage info named the upgrade counts and the work interval (9 ticks down to 1), its filter blocked the resource it names while an empty filter imported everything, the exporter moved exactly the 4 gold its filter names into the chest it faces and an exporter with no filter moved nothing, a machine menu showed its 13 slots and its upgrade row refused a diamond, both machine items were given and read back, both machine blocks dropped themselves, the wireless grid's own 1,000 FE buffer fell by exactly 5 on the open, 5 on a deposit and 5 on a withdrawal with no drift over ticks, and at 0 item FE the same deposit was refused for the item's energy while the network stayed online and still printed its own energy line, a survival break of the importer carried its four speed upgrades, its stack upgrade and its dirt filter entry on the item with none of them spilled beside it and the re-placed machine listed every slot where it was, a broken transmitter's four range upgrades travelled the same way, a 4k disk cut a saved 5,000-item component to its own 4,096 and refused the 4,097th item deposited through the grid while its total stayed 4,096 over a 20-tick window, a 16k disk held 16,384 and a 64k disk 65,536, the creative disk took the same 1-item deposit the full 64k disk refused and kept ingesting past 65,536 with its readout saying unlimited, a 4k disk holding 4,096 cobblestone and a 16k storage part made a 16k disk in a crafting table with the 4k disk's contents and the destination's 16,384-item room, the 4k disk was consumed and its own 4k part came back in the cell it left, the crafted disk read 4096/16384 items in the drive and the network totalled 4,096, and the 1k disk's 3 gold and a 4k disk's 4,096 items both kept their contents across a relaunch"
 # The cleanup trap prints EXIT:<status> as the last line.

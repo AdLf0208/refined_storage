@@ -626,15 +626,152 @@ impl DiskCapacity {
 /// The capacity of the storage disk named by `item` (upstream's
 /// `ItemStorageVariant`), `None` for an item that is not a storage disk.
 pub fn disk_capacity(item: &str) -> Option<DiskCapacity> {
-    Some(match item {
-        "refinedstorage:1k_storage_disk" => DiskCapacity::Items(CAPACITY_1K),
-        "refinedstorage:4k_storage_disk" => DiskCapacity::Items(CAPACITY_4K),
-        "refinedstorage:16k_storage_disk" => DiskCapacity::Items(CAPACITY_16K),
-        "refinedstorage:64k_storage_disk" => DiskCapacity::Items(CAPACITY_64K),
-        // Upstream `ItemStorageVariant.CREATIVE` carries no capacity at all.
-        "refinedstorage:creative_storage_disk" => DiskCapacity::Unlimited,
-        _ => return None,
+    if let Some(variant) = disk_variant(item) {
+        return Some(variant.capacity);
+    }
+    // Upstream `ItemStorageVariant.CREATIVE` carries no capacity at all.
+    (item == DISK_CREATIVE).then_some(DiskCapacity::Unlimited)
+}
+
+/// One storage variant (upstream's `ItemStorageVariant`): the disk item, the
+/// storage part it is built from, and the room its item names. The creative
+/// disk is not here — upstream gives it neither a capacity nor a part.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StorageVariant {
+    /// The variant's own name, the spelling a recipe's `to` field uses (`"4k"`).
+    pub name: &'static str,
+    /// The disk item.
+    pub disk: &'static str,
+    /// The storage part the disk is built from — and what an upgrade returns.
+    pub part: &'static str,
+    /// The room the disk's item names.
+    pub capacity: DiskCapacity,
+}
+
+/// The four finite storage variants, smallest first (upstream's
+/// `ItemStorageVariant` declaration order).
+pub const STORAGE_VARIANTS: [StorageVariant; 4] = [
+    StorageVariant {
+        name: "1k",
+        disk: "refinedstorage:1k_storage_disk",
+        part: "refinedstorage:1k_storage_part",
+        capacity: DiskCapacity::Items(CAPACITY_1K),
+    },
+    StorageVariant {
+        name: "4k",
+        disk: "refinedstorage:4k_storage_disk",
+        part: "refinedstorage:4k_storage_part",
+        capacity: DiskCapacity::Items(CAPACITY_4K),
+    },
+    StorageVariant {
+        name: "16k",
+        disk: "refinedstorage:16k_storage_disk",
+        part: "refinedstorage:16k_storage_part",
+        capacity: DiskCapacity::Items(CAPACITY_16K),
+    },
+    StorageVariant {
+        name: "64k",
+        disk: "refinedstorage:64k_storage_disk",
+        part: "refinedstorage:64k_storage_part",
+        capacity: DiskCapacity::Items(CAPACITY_64K),
+    },
+];
+
+/// The creative disk: the only variant with no capacity and no part.
+pub const DISK_CREATIVE: &str = "refinedstorage:creative_storage_disk";
+
+/// The finite variant a disk item is, `None` for anything else (the creative
+/// disk included: it has no part and no capacity to upgrade into).
+pub fn disk_variant(disk: &str) -> Option<StorageVariant> {
+    STORAGE_VARIANTS
+        .into_iter()
+        .find(|variant| variant.disk == disk)
+}
+
+/// The disk item a recipe's `to` variant names (the creative disk included, so
+/// a file naming it decodes; it is simply never a destination).
+pub fn disk_of_variant(name: &str) -> Option<&'static str> {
+    if name == "creative" {
+        return Some(DISK_CREATIVE);
+    }
+    STORAGE_VARIANTS
+        .into_iter()
+        .find(|variant| variant.name == name)
+        .map(|variant| variant.disk)
+}
+
+/// The storage part a disk item is built from, `None` for the creative disk and
+/// for anything that is not a disk.
+pub fn storage_part_of_disk(disk: &str) -> Option<&'static str> {
+    disk_variant(disk).map(|variant| variant.part)
+}
+
+/// The disks an upgrade into `to_disk` accepts: the finite ones with less room
+/// (upstream's `getValidSourceContainers`), empty for the creative disk, whose
+/// capacity is `null`.
+pub fn upgrade_sources(to_disk: &str) -> Vec<&'static str> {
+    let Some(destination) = disk_variant(to_disk) else {
+        return Vec::new();
+    };
+    STORAGE_VARIANTS
+        .into_iter()
+        .filter(|variant| variant.capacity.room() < destination.capacity.room())
+        .map(|variant| variant.disk)
+        .collect()
+}
+
+/// Where an upgrade grid's two ingredients sit: the source disk's cell and the
+/// destination part's cell.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct UpgradeGrid {
+    /// The cell holding the smaller disk.
+    pub disk: usize,
+    /// The cell holding the destination tier's storage part.
+    pub part: usize,
+}
+
+/// The cells of a matching upgrade grid: exactly one source disk and exactly one
+/// destination part, every other cell empty. `None` when the grid is not that
+/// pair (a third item, two disks, the wrong tier's part, the creative disk).
+pub fn upgrade_cells(cells: &[Option<&str>], to_disk: &str) -> Option<UpgradeGrid> {
+    let destination = disk_variant(to_disk)?;
+    let sources = upgrade_sources(to_disk);
+    let mut disk = None;
+    let mut part = None;
+    for (slot, cell) in cells.iter().enumerate() {
+        let Some(id) = cell else { continue };
+        if sources.contains(id) {
+            if disk.is_some() {
+                return None;
+            }
+            disk = Some(slot);
+        } else if *id == destination.part {
+            if part.is_some() {
+                return None;
+            }
+            part = Some(slot);
+        } else {
+            // A shapeless recipe of two ingredients accepts no third one.
+            return None;
+        }
+    }
+    Some(UpgradeGrid {
+        disk: disk?,
+        part: part?,
     })
+}
+
+/// `source`'s contents on the disk `to_disk` names, with the destination item's
+/// room (upstream's `transferTo`: the new item decides the capacity, the
+/// storage's contents are reused). `None` unless that disk is a bigger one.
+pub fn upgraded_disk<T: Stored>(source: &Disk<T>, to_disk: &str) -> Option<Disk<T>> {
+    let destination = disk_variant(to_disk)?;
+    if destination.capacity.room() <= source.capacity().room() {
+        return None;
+    }
+    let mut upgraded = Disk::new(destination.capacity.room());
+    upgraded.set_entries(source.entries().to_vec());
+    Some(upgraded)
 }
 
 /// One storage disk's contents: at most `capacity` items over any number of
@@ -2312,6 +2449,177 @@ mod tests {
         assert_eq!(DiskCapacity::Items(4096).label(), "4096 items");
         assert_eq!(DiskCapacity::Items(65536).label(), "65536 items");
         assert_eq!(DiskCapacity::Unlimited.label(), "unlimited");
+    }
+
+    // --- the in-place upgrade (slice 12) -----------------------------------
+
+    #[test]
+    fn every_storage_disk_names_its_own_part() {
+        assert_eq!(
+            storage_part_of_disk("refinedstorage:1k_storage_disk"),
+            Some("refinedstorage:1k_storage_part")
+        );
+        assert_eq!(
+            storage_part_of_disk("refinedstorage:4k_storage_disk"),
+            Some("refinedstorage:4k_storage_part")
+        );
+        assert_eq!(
+            storage_part_of_disk("refinedstorage:16k_storage_disk"),
+            Some("refinedstorage:16k_storage_part")
+        );
+        assert_eq!(
+            storage_part_of_disk("refinedstorage:64k_storage_disk"),
+            Some("refinedstorage:64k_storage_part")
+        );
+        assert_eq!(
+            storage_part_of_disk("refinedstorage:creative_storage_disk"),
+            None,
+            "upstream's creative variant has no storage part"
+        );
+        assert_eq!(storage_part_of_disk("refinedstorage:storage_housing"), None);
+        assert_eq!(
+            disk_of_variant("16k"),
+            Some("refinedstorage:16k_storage_disk")
+        );
+        assert_eq!(
+            disk_of_variant("creative"),
+            Some("refinedstorage:creative_storage_disk")
+        );
+        assert_eq!(disk_of_variant("2k"), None);
+        assert_eq!(
+            disk_variant("refinedstorage:64k_storage_disk").map(|variant| variant.name),
+            Some("64k")
+        );
+    }
+
+    #[test]
+    fn an_upgrade_takes_only_the_smaller_disks() {
+        assert_eq!(
+            upgrade_sources("refinedstorage:4k_storage_disk"),
+            vec!["refinedstorage:1k_storage_disk"]
+        );
+        assert_eq!(
+            upgrade_sources("refinedstorage:16k_storage_disk"),
+            vec![
+                "refinedstorage:1k_storage_disk",
+                "refinedstorage:4k_storage_disk"
+            ]
+        );
+        assert_eq!(
+            upgrade_sources("refinedstorage:64k_storage_disk"),
+            vec![
+                "refinedstorage:1k_storage_disk",
+                "refinedstorage:4k_storage_disk",
+                "refinedstorage:16k_storage_disk"
+            ]
+        );
+        assert!(
+            upgrade_sources("refinedstorage:creative_storage_disk").is_empty(),
+            "upstream returns an empty source set for a destination with no capacity"
+        );
+        assert!(upgrade_sources("minecraft:stick").is_empty());
+    }
+
+    #[test]
+    fn an_upgrade_grid_is_exactly_one_disk_and_its_part() {
+        let to = "refinedstorage:16k_storage_disk";
+        let mut cells: [Option<&str>; 9] = [None; 9];
+        cells[3] = Some("refinedstorage:4k_storage_disk");
+        cells[4] = Some("refinedstorage:16k_storage_part");
+        assert_eq!(
+            upgrade_cells(&cells, to),
+            Some(UpgradeGrid { disk: 3, part: 4 })
+        );
+        // A shapeless pair: any two cells, either order.
+        let mut reversed: [Option<&str>; 9] = [None; 9];
+        reversed[0] = Some("refinedstorage:16k_storage_part");
+        reversed[8] = Some("refinedstorage:4k_storage_disk");
+        assert_eq!(
+            upgrade_cells(&reversed, to),
+            Some(UpgradeGrid { disk: 8, part: 0 })
+        );
+        // A third item is not part of a two-ingredient recipe.
+        cells[5] = Some("minecraft:diamond");
+        assert_eq!(
+            upgrade_cells(&cells, to),
+            None,
+            "a shapeless recipe of two ingredients accepts no third item"
+        );
+        cells[5] = None;
+        // The destination's own size is not smaller, so it is no source.
+        cells[3] = Some("refinedstorage:16k_storage_disk");
+        assert_eq!(upgrade_cells(&cells, to), None);
+        // Another tier's part is not this recipe's part.
+        cells[3] = Some("refinedstorage:4k_storage_disk");
+        cells[4] = Some("refinedstorage:64k_storage_part");
+        assert_eq!(upgrade_cells(&cells, to), None);
+        // Two source disks are not one.
+        cells[4] = Some("refinedstorage:16k_storage_part");
+        cells[6] = Some("refinedstorage:1k_storage_disk");
+        assert_eq!(upgrade_cells(&cells, to), None);
+        let empty: [Option<&str>; 9] = [None; 9];
+        assert_eq!(upgrade_cells(&empty, to), None);
+        assert_eq!(
+            upgrade_cells(&cells, "refinedstorage:creative_storage_disk"),
+            None,
+            "the creative disk is never a destination: it has no capacity to grow into"
+        );
+    }
+
+    #[test]
+    fn an_upgraded_disk_keeps_its_contents_with_the_new_room() {
+        let mut source = Disk::<TestItem>::new(CAPACITY_4K);
+        assert_eq!(
+            source.insert(TestItem::new("minecraft:cobblestone", 4096)),
+            4096
+        );
+        let upgraded = upgraded_disk(&source, "refinedstorage:16k_storage_disk")
+            .expect("a 4k disk upgrades into a 16k one");
+        assert_eq!(upgraded.capacity(), DiskCapacity::Items(CAPACITY_16K));
+        assert_eq!(upgraded.total(), 4096, "the contents came across");
+        assert_eq!(
+            upgraded.free(),
+            12288,
+            "the destination item's room, not the source's"
+        );
+        assert_eq!(upgraded.amount("minecraft:cobblestone"), 4096);
+        let empty = upgraded_disk(
+            &Disk::<TestItem>::new(CAPACITY_1K),
+            "refinedstorage:64k_storage_disk",
+        )
+        .expect("an empty 1k disk upgrades into a 64k one");
+        assert_eq!(empty.capacity(), DiskCapacity::Items(CAPACITY_64K));
+        assert_eq!(empty.total(), 0);
+        assert!(empty.entries().is_empty());
+    }
+
+    #[test]
+    fn an_upgrade_refuses_a_disk_that_is_not_bigger() {
+        let source = Disk::<TestItem>::new(CAPACITY_4K);
+        assert_eq!(
+            upgraded_disk(&source, "refinedstorage:4k_storage_disk"),
+            None,
+            "a disk does not upgrade into its own size"
+        );
+        assert_eq!(
+            upgraded_disk(&source, "refinedstorage:1k_storage_disk"),
+            None,
+            "nor into a smaller one"
+        );
+        assert_eq!(
+            upgraded_disk(&source, "refinedstorage:creative_storage_disk"),
+            None,
+            "the creative disk is not a destination: no capacity to grow into"
+        );
+        assert_eq!(upgraded_disk(&source, "minecraft:stick"), None);
+        assert_eq!(
+            upgraded_disk(
+                &Disk::<TestItem>::unlimited(),
+                "refinedstorage:64k_storage_disk"
+            ),
+            None,
+            "the creative disk is never a source either"
+        );
     }
 
     #[test]
