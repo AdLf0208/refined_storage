@@ -14,6 +14,12 @@
 
 /// A 1k storage disk's capacity in items (upstream `ItemStorageVariant.ONE_K`).
 pub const CAPACITY_1K: u64 = 1024;
+/// A 4k storage disk's capacity in items (upstream `ItemStorageVariant.FOUR_K`).
+pub const CAPACITY_4K: u64 = CAPACITY_1K * 4;
+/// A 16k storage disk's capacity in items (upstream `ItemStorageVariant.SIXTEEN_K`).
+pub const CAPACITY_16K: u64 = CAPACITY_1K * 4 * 4;
+/// A 64k storage disk's capacity in items (upstream `ItemStorageVariant.SIXTY_FOUR_K`).
+pub const CAPACITY_64K: u64 = CAPACITY_1K * 4 * 4 * 4;
 /// The grid's menu shows a 9x6 grid of aggregated entries.
 pub const GRID_SLOTS: usize = 54;
 /// The disk drive's slots (upstream `AMOUNT_OF_DISKS` is 8; the pin's menu
@@ -550,26 +556,114 @@ pub trait Stored: Clone {
     fn with_count(&self, count: u32) -> Self;
 }
 
+/// A storage disk's capacity: a finite room in items, or the creative disk's
+/// unlimited marker (upstream `ItemStorageVariant.CREATIVE`'s `@Nullable Long
+/// capacity` of `null`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DiskCapacity {
+    /// Room for this many items.
+    Items(u64),
+    /// No ceiling: the creative disk (`creative_storage_disk`).
+    Unlimited,
+}
+
+impl DiskCapacity {
+    /// The items this disk can hold in total (`u64::MAX` for the creative
+    /// disk, whose `insert` therefore never refuses an amount).
+    pub fn room(self) -> u64 {
+        match self {
+            DiskCapacity::Items(items) => items,
+            // Upstream's creative disk is a plain storage with no `LimitedStorage`
+            // around it, so nothing ever refuses an insertion (`StorageImpl.insert`
+            // answers the whole amount). A `u64` of room is how this port says
+            // "no ceiling" without inventing one.
+            DiskCapacity::Unlimited => u64::MAX,
+        }
+    }
+
+    /// The saved spelling: the item count, or `0` for the creative disk's
+    /// unlimited marker (upstream's `null` has no NBT form, and this port's
+    /// component stores a number).
+    pub fn saved(self) -> u64 {
+        match self {
+            DiskCapacity::Items(items) => items,
+            DiskCapacity::Unlimited => 0,
+        }
+    }
+
+    /// A saved spelling back into a capacity: `0` is the creative disk.
+    pub fn from_saved(saved: u64) -> Self {
+        if saved == 0 {
+            DiskCapacity::Unlimited
+        } else {
+            DiskCapacity::Items(saved)
+        }
+    }
+
+    /// This capacity within `limit`: a disk's item decides how much room it
+    /// has, so a component claiming more is cut to it (a doctored or stale
+    /// item cannot give a 1k disk a 64k room).
+    pub fn clamp(self, limit: Self) -> Self {
+        match (self, limit) {
+            (DiskCapacity::Items(said), DiskCapacity::Items(item)) => {
+                DiskCapacity::Items(said.min(item))
+            }
+            (DiskCapacity::Items(said), DiskCapacity::Unlimited) => DiskCapacity::Items(said),
+            (DiskCapacity::Unlimited, DiskCapacity::Items(item)) => DiskCapacity::Items(item),
+            (DiskCapacity::Unlimited, DiskCapacity::Unlimited) => DiskCapacity::Unlimited,
+        }
+    }
+
+    /// The capacity as a readout: `"4096 items"`, or `"unlimited"`.
+    pub fn label(self) -> String {
+        match self {
+            DiskCapacity::Items(items) => format!("{items} items"),
+            DiskCapacity::Unlimited => "unlimited".to_owned(),
+        }
+    }
+}
+
+/// The capacity of the storage disk named by `item` (upstream's
+/// `ItemStorageVariant`), `None` for an item that is not a storage disk.
+pub fn disk_capacity(item: &str) -> Option<DiskCapacity> {
+    Some(match item {
+        "refinedstorage:1k_storage_disk" => DiskCapacity::Items(CAPACITY_1K),
+        "refinedstorage:4k_storage_disk" => DiskCapacity::Items(CAPACITY_4K),
+        "refinedstorage:16k_storage_disk" => DiskCapacity::Items(CAPACITY_16K),
+        "refinedstorage:64k_storage_disk" => DiskCapacity::Items(CAPACITY_64K),
+        // Upstream `ItemStorageVariant.CREATIVE` carries no capacity at all.
+        "refinedstorage:creative_storage_disk" => DiskCapacity::Unlimited,
+        _ => return None,
+    })
+}
+
 /// One storage disk's contents: at most `capacity` items over any number of
 /// resources.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Disk<T> {
-    capacity: u64,
+    capacity: DiskCapacity,
     entries: Vec<T>,
 }
 
 impl<T: Stored> Disk<T> {
-    /// An empty disk of `capacity` items.
+    /// An empty disk with `capacity` items of room.
     pub fn new(capacity: u64) -> Self {
         Disk {
-            capacity,
+            capacity: DiskCapacity::Items(capacity),
             entries: Vec::new(),
         }
     }
 
-    /// The disk's capacity in items.
-    #[allow(dead_code, reason = "the commands report it; the tick reads `free`")]
-    pub fn capacity(&self) -> u64 {
+    /// An empty creative disk: no ceiling on what it stores.
+    pub fn unlimited() -> Self {
+        Disk {
+            capacity: DiskCapacity::Unlimited,
+            entries: Vec::new(),
+        }
+    }
+
+    /// The disk's capacity.
+    pub fn capacity(&self) -> DiskCapacity {
         self.capacity
     }
 
@@ -594,7 +688,7 @@ impl<T: Stored> Disk<T> {
 
     /// The items the disk can still take.
     pub fn free(&self) -> u64 {
-        self.capacity.saturating_sub(self.total())
+        self.capacity.room().saturating_sub(self.total())
     }
 
     /// How many of `key` the disk holds.
@@ -697,7 +791,7 @@ impl<T: Stored> Disk<T> {
                 None => merged.push(entry),
             }
         }
-        let mut room = self.capacity;
+        let mut room = self.capacity.room();
         merged.retain_mut(|entry| {
             let kept = u64::from(entry.count()).min(room);
             *entry = entry.with_count(kept as u32);
@@ -2098,6 +2192,127 @@ mod tests {
     }
 
     // --- one disk ----------------------------------------------------------
+
+    #[test]
+    fn every_storage_disk_id_names_its_capacity() {
+        assert_eq!(
+            disk_capacity("refinedstorage:1k_storage_disk"),
+            Some(DiskCapacity::Items(1024))
+        );
+        assert_eq!(
+            disk_capacity("refinedstorage:4k_storage_disk"),
+            Some(DiskCapacity::Items(4096))
+        );
+        assert_eq!(
+            disk_capacity("refinedstorage:16k_storage_disk"),
+            Some(DiskCapacity::Items(16384))
+        );
+        assert_eq!(
+            disk_capacity("refinedstorage:64k_storage_disk"),
+            Some(DiskCapacity::Items(65536))
+        );
+        assert_eq!(
+            disk_capacity("refinedstorage:creative_storage_disk"),
+            Some(DiskCapacity::Unlimited)
+        );
+        assert_eq!(
+            disk_capacity("refinedstorage:storage_housing"),
+            None,
+            "an ingredient is not a storage disk"
+        );
+        assert_eq!(disk_capacity("minecraft:paper"), None);
+    }
+
+    #[test]
+    fn a_4k_disk_takes_four_times_what_a_1k_does() {
+        let mut disk = Disk::<TestItem>::new(CAPACITY_4K);
+        assert_eq!(disk.free(), 4096);
+        assert_eq!(
+            disk.insert(TestItem::new("minecraft:cobblestone", 4096)),
+            4096
+        );
+        assert_eq!(disk.total(), 4096);
+        assert_eq!(disk.free(), 0);
+        assert_eq!(
+            disk.insert(TestItem::new("minecraft:dirt", 1)),
+            0,
+            "a full 4k disk refuses the 4,097th item"
+        );
+        assert_eq!(disk.amount("minecraft:cobblestone"), 4096);
+    }
+
+    #[test]
+    fn the_creative_disk_has_no_ceiling() {
+        let mut disk = Disk::<TestItem>::unlimited();
+        assert_eq!(disk.capacity(), DiskCapacity::Unlimited);
+        assert_eq!(disk.free(), u64::MAX, "unlimited means no room count");
+        assert_eq!(
+            disk.insert(TestItem::new("minecraft:cobblestone", 65536)),
+            65536
+        );
+        assert_eq!(
+            disk.insert(TestItem::new("minecraft:cobblestone", 65536)),
+            65536,
+            "the creative disk keeps ingesting past the 64k ceiling"
+        );
+        assert_eq!(disk.total(), 131072);
+    }
+
+    #[test]
+    fn a_saved_fuller_than_capacity_disk_is_cut_to_its_own_room() {
+        let mut disk = Disk::<TestItem>::new(CAPACITY_4K);
+        disk.set_entries(vec![TestItem::new("minecraft:cobblestone", 5000)]);
+        assert_eq!(
+            disk.total(),
+            4096,
+            "a 4k disk is cut to 4,096, not to the 1k default"
+        );
+    }
+
+    #[test]
+    fn the_saved_spelling_marks_the_creative_disk_zero() {
+        assert_eq!(DiskCapacity::from_saved(4096), DiskCapacity::Items(4096));
+        assert_eq!(
+            DiskCapacity::from_saved(0),
+            DiskCapacity::Unlimited,
+            "0 is the only spelling upstream's null has in a component"
+        );
+        assert_eq!(DiskCapacity::Items(65536).saved(), 65536);
+        assert_eq!(DiskCapacity::Unlimited.saved(), 0);
+    }
+
+    #[test]
+    fn a_component_cannot_give_a_disk_more_room_than_its_item() {
+        assert_eq!(
+            DiskCapacity::Items(4096).clamp(DiskCapacity::Items(65536)),
+            DiskCapacity::Items(4096),
+            "the item's own capacity is the limit"
+        );
+        assert_eq!(
+            DiskCapacity::Items(65536).clamp(DiskCapacity::Items(4096)),
+            DiskCapacity::Items(4096)
+        );
+        assert_eq!(
+            DiskCapacity::Unlimited.clamp(DiskCapacity::Items(4096)),
+            DiskCapacity::Items(4096),
+            "a 1k item's component cannot claim to be creative"
+        );
+        assert_eq!(
+            DiskCapacity::Unlimited.clamp(DiskCapacity::Unlimited),
+            DiskCapacity::Unlimited
+        );
+        assert_eq!(
+            DiskCapacity::Items(4096).clamp(DiskCapacity::Unlimited),
+            DiskCapacity::Items(4096)
+        );
+    }
+
+    #[test]
+    fn a_capacity_reads_back_as_its_room() {
+        assert_eq!(DiskCapacity::Items(4096).label(), "4096 items");
+        assert_eq!(DiskCapacity::Items(65536).label(), "65536 items");
+        assert_eq!(DiskCapacity::Unlimited.label(), "unlimited");
+    }
 
     #[test]
     fn a_disk_takes_items_up_to_its_capacity() {

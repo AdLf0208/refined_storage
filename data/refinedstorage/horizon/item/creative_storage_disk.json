@@ -1,0 +1,10 @@
+{
+  "template": "minecraft:paper",
+  "max_stack_size": 1,
+  "rarity": "epic",
+  "components": {
+    "refinedstorage:storage": {
+      "capacity": 0
+    }
+  }
+}

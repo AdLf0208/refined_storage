@@ -30,9 +30,9 @@ use mod_api::{
 };
 
 use crate::runtime::{
-    self, Binding, CAPACITY_1K, Cursor, DRIVE_SLOTS, Delta, Destination, Disk, EnergyType, Face,
-    Fit, GRID_SLOTS, Kind, Node, Place, Plan, Promises, Refusal, Region, Stored, ViewKey,
-    WirelessUse, extract, insert, network, plan_click, view_with,
+    self, Binding, CAPACITY_1K, Cursor, DRIVE_SLOTS, Delta, Destination, Disk, DiskCapacity,
+    EnergyType, Face, Fit, GRID_SLOTS, Kind, Node, Place, Plan, Promises, Refusal, Region, Stored,
+    ViewKey, WirelessUse, disk_capacity, extract, insert, network, plan_click, view_with,
 };
 
 /// The five content ids of the slice, exactly as the content declares them.
@@ -41,6 +41,12 @@ const CABLE: &str = "refinedstorage:cable";
 const DISK_DRIVE: &str = "refinedstorage:disk_drive";
 const GRID: &str = "refinedstorage:grid";
 const DISK: &str = "refinedstorage:1k_storage_disk";
+/// The other disk sizes (slice 11): upstream's `ItemStorageVariant` — 4k, 16k,
+/// 64k, and the creative disk, whose variant carries no capacity at all.
+const DISK_4K: &str = "refinedstorage:4k_storage_disk";
+const DISK_16K: &str = "refinedstorage:16k_storage_disk";
+const DISK_64K: &str = "refinedstorage:64k_storage_disk";
+const DISK_CREATIVE: &str = "refinedstorage:creative_storage_disk";
 /// The wireless transmitter (slice 3): a network node that joins through its
 /// facing side and answers whether a player may use its network.
 const TRANSMITTER: &str = "refinedstorage:wireless_transmitter";
@@ -143,7 +149,10 @@ struct Keys {
     transmitter: BlockKey,
     importer: BlockKey,
     exporter: BlockKey,
-    disk: ItemKey,
+    /// The five storage disk items, upstream's `ItemStorageVariant`. Which one a
+    /// stack is decides its capacity (`runtime::disk_capacity`); a drive takes
+    /// any of them.
+    disks: [ItemKey; 5],
     wireless_grid: ItemKey,
     range_upgrade: ItemKey,
     creative_range_upgrade: ItemKey,
@@ -213,7 +222,13 @@ pub(crate) fn register(registrar: &mut dyn Registrar, _cx: &RegistrationContext)
         transmitter: registrar.block_key(TRANSMITTER),
         importer: registrar.block_key(IMPORTER),
         exporter: registrar.block_key(EXPORTER),
-        disk: registrar.item_key(DISK),
+        disks: [
+            registrar.item_key(DISK),
+            registrar.item_key(DISK_4K),
+            registrar.item_key(DISK_16K),
+            registrar.item_key(DISK_64K),
+            registrar.item_key(DISK_CREATIVE),
+        ],
         wireless_grid: registrar.item_key(WIRELESS_GRID),
         range_upgrade: registrar.item_key(RANGE_UPGRADE),
         creative_range_upgrade: registrar.item_key(CREATIVE_RANGE_UPGRADE),
@@ -543,60 +558,120 @@ fn resource_key(host: &dyn Host, stack: &ItemStack) -> String {
     }
 }
 
-/// The disk items in a drive's slots.
+/// The five disk items in a drive's slots (upstream's `DiskInventory.isValid`
+/// accepts every `StorageDiskItem`).
 fn is_disk(stack: &ItemStack) -> bool {
-    stack.item() == keys().disk
+    keys().disks.contains(&stack.item())
 }
 
 // --- the disk's item component --------------------------------------------
 
-/// The component that carries a 1k disk's contents: the saved stacks, one
-/// compound each, in the stack's own NBT escape.
+/// What a disk's item component saves (slice 11): its capacity and the stacks
+/// it holds.
+struct SavedDisk {
+    /// The capacity the item recorded. A component saved before slice 11 is a
+    /// bare list of stacks and has none, so the disk's own item decides.
+    capacity: Option<DiskCapacity>,
+    stacks: Vec<Compound>,
+}
+
+/// The component that carries a storage disk's contents and capacity:
+/// `{capacity, stacks}` in `refinedstorage:storage`, the compound shape, or —
+/// for a disk saved by 0.2.10 — the bare list of stacks this port wrote then.
 struct StorageComponent;
 
 impl Component for StorageComponent {
-    type Value = Vec<Compound>;
+    type Value = SavedDisk;
 
     fn id(&self) -> &str {
         COMPONENT
     }
 
-    fn decode(&self, value: &Tag) -> Option<Self::Value> {
-        let Tag::List(entries) = value else {
-            return None;
-        };
-        let mut stored = Vec::with_capacity(entries.len());
-        for entry in entries {
-            if let Tag::Compound(compound) = entry {
-                stored.push(compound.clone());
-            }
+    fn decode(&self, value: &Tag) -> Option<SavedDisk> {
+        match value {
+            Tag::List(entries) => Some(SavedDisk {
+                capacity: None,
+                stacks: compounds(entries),
+            }),
+            Tag::Compound(compound) => Some(SavedDisk {
+                capacity: field(compound, "capacity").and_then(saved_capacity),
+                stacks: match field(compound, "stacks") {
+                    Some(Tag::List(entries)) => compounds(entries),
+                    _ => Vec::new(),
+                },
+            }),
+            _ => None,
         }
-        Some(stored)
     }
 
-    fn encode(&self, value: Self::Value) -> Tag {
-        Tag::List(value.into_iter().map(Tag::Compound).collect())
+    fn encode(&self, value: SavedDisk) -> Tag {
+        let capacity = value.capacity.map_or(0, DiskCapacity::saved);
+        Tag::Compound(Compound::from([
+            ("capacity".into(), Tag::Long(capacity as i64)),
+            (
+                "stacks".into(),
+                Tag::List(value.stacks.into_iter().map(Tag::Compound).collect()),
+            ),
+        ]))
     }
 }
 
-/// A disk item's contents from its component; an empty disk when it has none
-/// (a freshly made or creative-given disk).
-fn read_disk(host: &dyn Host, stack: &ItemStack) -> Disk<Net> {
-    let mut disk = Disk::new(CAPACITY_1K);
-    let Some(entries) = stack.get(&StorageComponent) else {
-        return disk;
-    };
-    let stored: Vec<Net> = entries
+/// The compounds of a saved list, skipping anything else.
+fn compounds(entries: &[Tag]) -> Vec<Compound> {
+    entries
         .iter()
-        .filter_map(|entry| ItemStack::from_nbt(host, entry))
-        .map(|stack| Net::of(host, &stack))
-        .collect();
-    disk.set_entries(stored);
+        .filter_map(|entry| match entry {
+            Tag::Compound(compound) => Some(compound.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+/// A saved capacity number: the item count, or the creative disk's `0` marker.
+fn saved_capacity(tag: &Tag) -> Option<DiskCapacity> {
+    let saved = match tag {
+        Tag::Byte(byte) => u64::try_from(*byte).ok()?,
+        Tag::Short(short) => u64::try_from(*short).ok()?,
+        Tag::Int(int) => u64::try_from(*int).ok()?,
+        Tag::Long(long) => u64::try_from(*long).ok()?,
+        _ => return None,
+    };
+    Some(DiskCapacity::from_saved(saved))
+}
+
+/// A disk item's capacity and contents. The capacity is the item's own
+/// (upstream's `ItemStorageVariant`, which is what decides a disk's size), cut
+/// to what the component records when it records less; an item with no
+/// component is an empty disk (a freshly made or creative-given one).
+fn read_disk(host: &dyn Host, stack: &ItemStack) -> Disk<Net> {
+    let item = disk_capacity(&stack.item().id(host)).unwrap_or(DiskCapacity::Items(CAPACITY_1K));
+    let saved = stack.get(&StorageComponent);
+    let capacity = match &saved {
+        Some(saved) => match saved.capacity {
+            Some(said) => item.clamp(said),
+            None => item,
+        },
+        None => item,
+    };
+    let mut disk = match capacity {
+        DiskCapacity::Items(items) => Disk::new(items),
+        DiskCapacity::Unlimited => Disk::unlimited(),
+    };
+    if let Some(saved) = saved {
+        let stored: Vec<Net> = saved
+            .stacks
+            .iter()
+            .filter_map(|entry| ItemStack::from_nbt(host, entry))
+            .map(|stack| Net::of(host, &stack))
+            .collect();
+        disk.set_entries(stored);
+    }
     disk
 }
 
-/// Write a disk's contents into its item component (an empty disk loses the
-/// component rather than keeping an empty list).
+/// Write a disk's contents and capacity into its item component (an empty disk
+/// loses the component rather than keeping an empty list; its item still names
+/// its capacity).
 fn write_disk(host: &dyn Host, stack: &mut ItemStack, disk: &Disk<Net>) {
     if disk.entries().is_empty() {
         stack.remove(&StorageComponent);
@@ -607,7 +682,13 @@ fn write_disk(host: &dyn Host, stack: &mut ItemStack, disk: &Disk<Net>) {
         .iter()
         .filter_map(|entry| entry.stack().to_nbt(host))
         .collect();
-    let _ = stack.set(&StorageComponent, entries);
+    let _ = stack.set(
+        &StorageComponent,
+        SavedDisk {
+            capacity: Some(disk.capacity()),
+            stacks: entries,
+        },
+    );
 }
 
 // --- a wireless grid's binding --------------------------------------------
@@ -2223,11 +2304,18 @@ fn grid_tick(host: &mut dyn ServerHost, pos: [i32; 3], entity: &mut ModBlockEnti
         }
     }
 
-    // Write the network's changes back into the drives' caches.
+    // Write the network's changes back into the drives' caches. Only a disk the
+    // view actually changed is marked dirty: marking every disk on every tick
+    // made the drive rewrite each disk item each tick, and a change made to a
+    // disk's component from outside (a `/data merge`, another tool) was replaced
+    // by the stale cache one tick later.
     with_core(|core| {
         for (key, disk) in used.iter().zip(disks.iter()) {
-            core.disks.insert(key.clone(), disk.clone());
-            core.dirty.insert(key.clone());
+            let changed = core.disks.get(key) != Some(disk);
+            if changed {
+                core.disks.insert(key.clone(), disk.clone());
+                core.dirty.insert(key.clone());
+            }
         }
     });
 
@@ -3300,6 +3388,47 @@ fn info(host: &mut dyn ServerHost, pos: [i32; 3]) {
                 pos[2],
                 runtime::range_label(range),
                 if online { "active" } else { "inactive" },
+            ),
+        );
+    }
+    if kind_at(host, pos) == Some(Kind::DiskDrive) {
+        let Some(level) = host.level(host.dimension()) else {
+            return;
+        };
+        let Some(entity) = host.block_entity(level, pos) else {
+            return;
+        };
+        let mut found: Vec<String> = Vec::new();
+        for slot in 0..DRIVE_SLOTS as u32 {
+            let Some(item) = entity.item_slot(host, slot).ok().flatten() else {
+                continue;
+            };
+            if !is_disk(&item) {
+                continue;
+            }
+            let disk = read_disk(host, &item);
+            found.push(format!(
+                "slot {slot}: {} {}/{}",
+                item.item().id(host),
+                disk.total(),
+                disk.capacity().label()
+            ));
+        }
+        feedback(
+            host,
+            &format!(
+                "Disk drive at {},{},{}: {} disk{}, {}{}",
+                pos[0],
+                pos[1],
+                pos[2],
+                found.len(),
+                if found.len() == 1 { "" } else { "s" },
+                if found.is_empty() {
+                    "empty"
+                } else {
+                    "capacity "
+                },
+                found.join(", "),
             ),
         );
     }

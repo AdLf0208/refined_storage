@@ -36,9 +36,9 @@ The two `check`/`build`/`fits` steps need `BUILD_LOCAL=1` on the slot runner:
 the second build machine has no `cargo-horizon-mod`.
 
 Pin **`0a875da91dbb0fdcb7ba8c42c11341aa229af51a`** + mixins
-`e59da9094f0c2fdda6c627fe9eff22dec6a906f0`. Delivered package (0.2.10):
-`refinedstorage.hmod`, **203,749 B**, SHA-256
-`41c9810a2d6c33a032abc935cad389b56ec5330cfb34141847c620cf017ba922`, 244 entries, no packed
+`e59da9094f0c2fdda6c627fe9eff22dec6a906f0`. Delivered package (0.2.11):
+`refinedstorage.hmod`, **210,866 B**, SHA-256
+`e1c84b64a7804fdbce737ba63ed0b860840c140a43f5da26dbc2262b6c3f9ac4`, 257 entries, no packed
 `Cargo.lock`; a copy of the delivered bytes is at
 `ports/_shared/evidence/refinedstorage/refinedstorage.hmod`, which is the file both `fits`
 runs used.
@@ -62,13 +62,15 @@ SELFTEST=speed … tools/e2e.sh                                     # flipped im
 SELFTEST=stack … tools/e2e.sh                                     # flipped importer quota: EXIT:1
 SELFTEST=itemenergy … tools/e2e.sh                                # flipped item-energy gate: EXIT:1
 SELFTEST=drops … tools/e2e.sh                                     # flipped block-drop carry: EXIT:1
+SELFTEST=diskcap … tools/e2e.sh                                   # flipped 4k capacity (accepted the 4,097th): EXIT:1
 python3 ../tools/check-e2e-logs.py refinedstorage-e2e --strict
 ```
 
 `tools/recipe_check.py` is the recipe family's driver: it reads this package's own
-`data/refinedstorage/recipe/*.json` (29 recipes, including slice 3's `wireless_transmitter`,
-slice 4's `wireless_grid`, slice 6's `upgrade` and `range_upgrade`, and slice 7's `importer`,
-`exporter`, `speed_upgrade` and `stack_upgrade`) and crafts every one of them in a crafting table or a furnace,
+`data/refinedstorage/recipe/*.json` (35 recipes, including slice 3's `wireless_transmitter`,
+slice 4's `wireless_grid`, slice 6's `upgrade` and `range_upgrade`, slice 7's `importer`,
+`exporter`, `speed_upgrade` and `stack_upgrade`, and slice 11's `4k/16k/64k_storage_part` and
+`4k/16k/64k_storage_disk`) and crafts every one of them in a crafting table or a furnace,
 asserting the output id and count, that the ingredients were consumed, and that a
 wrong-ingredient control yields nothing — including one control per shaped tag ingredient
 (slice 4 fixed the driver's tag lookup). Recorded in `notes.md` §"Slice 2", §"Slice 3" and
@@ -133,3 +135,14 @@ creative** restores once, is stripped, and placing the same item again yields an
 transmitter's four range upgrades travel the same way and none spills. `SELFTEST=drops` asserts the
 old, empty re-placed machine and exits 1. The control (the same Nightly with no package) fails at the
 first phase, so the leg is not passing on the engine alone.
+
+Slice 11's assertions are `notes.md` §"Slice 11": a 4k disk is written with a 5,000-item component
+and reads back 4,096 (the pre-slice build cut every disk to 1,024), the 4,097th item deposited
+through the grid's menu is refused with `net_items` flat over a 20-tick window, the refused item comes
+back to the player, a 16k disk holds 16,384 and a 64k disk 65,536 (each named by the drive's own
+info line), a full 64k disk refuses the same 1-item deposit the creative disk accepts (65,536 →
+65,537, readout `65536/unlimited`), and a 4k disk keeps its 4,096 items across `save` + relaunch
+beside the 1k disk's 3 gold (`2 disks, 4099 items in 2 resources`). `SELFTEST=diskcap` inverts the
+capacity refusal and exits 1. The four earlier selftests (`networks`, `energy`, `itemenergy`,
+`drops`) were re-run on this package and each still exits 1 on its own assertion; the 54-log gate is
+green.

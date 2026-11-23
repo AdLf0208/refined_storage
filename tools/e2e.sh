@@ -86,7 +86,9 @@
 # with no energy in the network is accepted, so the run fails on the gate;
 # SELFTEST=itemenergy asserts a deposit at 0 item FE went through, so the run
 # fails on the grid's own gate; SELFTEST=drops asserts the re-placed importer
-# came back empty, so the run fails once the slots travel on the item.
+# came back empty, so the run fails once the slots travel on the item;
+# SELFTEST=diskcap asserts a 4k disk accepted the 4,097th item, so the run fails
+# now that a disk enforces the capacity its item names.
 #
 # Slice 8 (the controller's energy model):
 #  - the controller's buffer is 1,000 FE, its `energy_type` is upstream's four
@@ -114,6 +116,19 @@
 #  - the item is picked up and placed back at the same position, and the
 #    machine's 13 slots list all six where they were;
 #  - a transmitter's four range upgrades travel the same way.
+#
+# Slice 11 (the other disk sizes):
+#  - a 4k disk right-clicked onto a drive reports 0/4096 items, a saved component
+#    of 5,000 items is cut to 4,096 (not the 1k default), and the 4,097th item
+#    deposited through the grid is refused — net_items does not move over a
+#    20-tick window and the item stays in the inventory;
+#  - a 16k disk holds 16,384 and a 64k disk 65,536, each named by the drive's own
+#    info line;
+#  - a full 64k disk refuses a 1-item deposit while the creative disk — given,
+#    since it has no recipe upstream — takes the same deposit and keeps ingesting
+#    past 65,536, its readout saying `unlimited`;
+#  - a 4k disk keeps its 4,096 items across `save` + relaunch, beside the 1k
+#    disk's 3 gold on one network.
 set -euo pipefail
 export LC_ALL=C
 
@@ -151,7 +166,26 @@ export HORIZON_NO_AUDIO=1
 mkdir -p "$(dirname "$SOCK")" "$XDG_CONFIG_HOME"
 rm -f "$SOCK"
 
-ctl() { "$CTL" --socket "$SOCK" "$@"; }
+ctl_raw() { "$CTL" --socket "$SOCK" "$@"; }
+# Every control call is retried once. On a loaded box a single request
+# occasionally answers nothing (the socket read returns empty while the game is
+# fine), and with `set -e` that aborted a leg several phases in with no message.
+# A refused command whose answer names an open (or dead) screen — a menu whose
+# block was broken lives on, and the engine refuses every blocking command while
+# it is up — is retried after closing it. A retry does not weaken an assertion:
+# a wrong answer is still compared, and a genuinely broken command fails both
+# attempts and aborts.
+ctl() {
+    local out
+    if out=$(ctl_raw "$@"); then printf '%s\n' "$out"; return 0; fi
+    case "$out" in
+        *screen*) ctl_raw close >/dev/null 2>&1 || true ;;
+    esac
+    sleep 1
+    if out=$(ctl_raw "$@"); then printf '%s\n' "$out"; return 0; fi
+    printf '%s\n' "$out"
+    return 1
+}
 say() { ctl chat "/$1" >/dev/null; }
 fail() { echo "FAIL: $*" >&2; ctl logs --lines 60 >&2 || true; exit 1; }
 
@@ -253,9 +287,45 @@ expect_machine() { # expect_machine X Y Z TEXT
         *) fail "expected the machine's info line to say '$4', got '$line'" ;;
     esac
 }
+# Open a block's menu, asking again when a click did not register: a right
+# click is a press/release pair, and on a loaded box one occasionally reaches
+# the server without opening the menu (measured while other legs ran here). The
+# assertion is the slot count that follows, never the retry.
+open_menu() { # open_menu X Y Z EXPECTED_CONTAINER_SLOTS
+    local tries got
+    for tries in 1 2 3; do
+        ctl interact "$1" "$2" "$3" >/dev/null
+        ctl wait 8
+        got=$(ctl screen 2>/dev/null | jq -r '[ (.slots // [])[] | select(.slot >= 300)] | length' 2>/dev/null || echo 0)
+        [ "${got:-0}" = "$4" ] && return 0
+        ctl close >/dev/null 2>&1 || true
+        ctl wait 4
+    done
+    fail "the menu at $1,$2,$3 has ${got:-0} container slots, expected $4: $(ctl screen | jq -c '{screen,slots:((.slots // [])|length)}')"
+}
 # How many items `/refinedstorage info` totals for a network.
 net_items() { # net_items X Y Z
     info "$1" "$2" "$3" | sed -n 's/.*disks, \([0-9]*\) items.*/\1/p'
+}
+# A drive's own info line (a second chat line after the network's): every disk in
+# it and the room its item gives it (`… 4096/4096 items`, and `… 65536/unlimited` for
+# the creative variant, which reports no ceiling at all).
+expect_drive() { # expect_drive X Y Z TEXT
+    local line
+    line=$(reply "refinedstorage info $1 $2 $3" | grep -m1 'Disk drive' || true)
+    echo "  info($1,$2,$3) drive: $line"
+    case "$line" in
+        *"$4"*) ;;
+        *) fail "expected the drive's info line to say '$4', got '$line'" ;;
+    esac
+}
+# Fill a drive's first slot with a disk whose saved component holds COUNT
+# cobblestone — the shape a disk carries between worlds (its item's own
+# `refinedstorage:storage` component: `{capacity, stacks}`). CAPACITY is what the
+# component records; 0 is the creative disk's unlimited marker.
+fill_drive() { # fill_drive X Y Z ITEM CAPACITY COUNT
+    ctl command "data merge block $1 $2 $3 {Items:[{Slot:0b,id:\"$4\",count:1,components:{\"refinedstorage:storage\":{capacity:$5,stacks:[{id:\"minecraft:cobblestone\",count:$6}]}}}]}" >/dev/null
+    ctl wait 8
 }
 # The player's saved advancement progress (`players/advancements/<uuid>.json`),
 # written by `ctl save`. The game's data folder is the launch directory
@@ -544,12 +614,7 @@ charge minecraft:the_end 40 64 0
 ctl command "execute in minecraft:the_end run tp @s 42.5 64 2.5"
 ctl wait 4
 charge_net
-ctl interact 43 64 0
-ctl wait 8
-ctl screen | jq -e '.screen == "container"' >/dev/null \
-    || fail "the grid did not open a container menu: $(ctl screen | jq -c '{screen,slots:(.slots|length)}')"
-ctl screen | jq -e '[.slots[] | select(.slot >= 300)] | length == 54' >/dev/null \
-    || fail "the grid menu does not have 54 container slots: $(ctl screen | jq -c '[.slots[] | select(.slot >= 300)] | length')"
+open_menu 43 64 0 54
 charge_net
 expect_slots '[]'
 ctl close
@@ -1324,10 +1389,7 @@ ctl command "clear @s" >/dev/null
 ctl wait 4
 charge minecraft:the_end 48 64 8
 charge_net
-ctl interact 50 64 8 south
-ctl wait 10
-ctl screen | jq -e '.screen == "container"' >/dev/null \
-    || fail "the transmitter's menu did not open: $(ctl screen | jq -c '{screen,slots:(.slots|length)}')"
+open_menu 50 64 8 4
 menu_slots=$(ctl screen | jq '[.slots[] | select(.slot >= 300)] | length')
 echo "  transmitter menu slots: $menu_slots"
 [ "$menu_slots" = 4 ] || fail "the transmitter's menu has $menu_slots container slots, expected 4"
@@ -1462,10 +1524,7 @@ ctl wait 4
 ctl command "execute in minecraft:the_end run tp @s 43.5 64 17.5" >/dev/null
 ctl wait 4
 charge_net
-ctl interact 43 64 16
-ctl wait 8
-ctl screen | jq -e '[.slots[] | select(.slot >= 300)] | length == 13' >/dev/null \
-    || fail "the importer's menu does not have 13 container slots: $(ctl screen | jq -c '[.slots[] | select(.slot >= 300)] | length')"
+open_menu 43 64 16 13
 up=$(inv_slot refinedstorage:stack_upgrade)
 [ -n "$up" ] || fail "no stack upgrade in the importer menu's inventory"
 charge_net
@@ -1627,8 +1686,7 @@ ctl command "execute in minecraft:the_end run tp @s 43.5 64 17.5" >/dev/null
 ctl command "clear @s" >/dev/null
 ctl wait 4
 charge_net
-ctl interact 43 64 16
-ctl wait 8
+open_menu 43 64 16 13
 ctl give minecraft:diamond 1 >/dev/null
 ctl wait 4
 diamond_slot=$(inv_slot minecraft:diamond)
@@ -1823,10 +1881,14 @@ echo "  transmitter drops: $(echo "$broken" | jq -c '.drops')"
     || fail "the transmitter did not drop itself: $(echo "$broken" | jq -c '.drops')"
 [ "$(echo "$broken" | jq -r '.drops["refinedstorage:range_upgrade"] // 0')" = 0 ] \
     || fail "the transmitter's range upgrades spilled as well: $(echo "$broken" | jq -c '.drops')"
-ctl command "execute in minecraft:the_end run tp @s 55.5 64 6.5" >/dev/null
+# Stand *on* the drop, as the importer phase does: a block's item spawns at the
+# block's own centre, and one block away is outside the pickup reach.
+ctl command "execute in minecraft:the_end run tp @s 55.5 64 5.5" >/dev/null
 ctl wait 20
 [ "$(count_of refinedstorage:wireless_transmitter)" = 1 ] \
     || fail "the transmitter item was not picked up: $(ctl inventory | jq -c '.hotbar')"
+ctl command "execute in minecraft:the_end run tp @s 55.5 64 6.5" >/dev/null
+ctl wait 4
 ctl place 55 64 5 --item refinedstorage:wireless_transmitter \
     || fail "cannot place the transmitter back at 55 64 5"
 ctl close >/dev/null 2>&1 || true
@@ -1872,6 +1934,192 @@ case "$unknown_state" in
 esac
 echo "  refinedstorage:no_such_item refused, refinedstorage:no_such_block did not place ($unknown_state)"
 
+echo "== the other disk sizes: the capacity is the disk's own, and the creative disk has none =="
+# Slice 11, from the port's own gap list ("the other disk sizes
+# (4k/16k/64k/creative)", "Disk capacity is fixed at 1k and the disk is one
+# item"). A second network at z=12 carries one drive, so a disk's own capacity is
+# the only room the network has: the 4k refuses the 4,097th item while the 64k
+# takes 65,536, and the creative disk — upstream's `ItemStorageVariant.CREATIVE`,
+# capacity `null`, a plain storage with no `LimitedStorage` around it — keeps
+# ingesting past the 64k ceiling. A disk is filled by writing the component it
+# saves (`/data merge block`), which is the shape a disk carries between worlds.
+net minecraft:the_end 40 64 12
+ctl command "execute in minecraft:the_end run tp @s 41.5 64 13.5"
+ctl command "execute in minecraft:the_end run setblock 40 64 12 refinedstorage:controller"
+ctl command "execute in minecraft:the_end run setblock 41 64 12 refinedstorage:cable"
+ctl command "execute in minecraft:the_end run setblock 42 64 12 refinedstorage:disk_drive"
+ctl command "execute in minecraft:the_end run setblock 43 64 12 refinedstorage:grid"
+ctl wait 12
+charge minecraft:the_end 40 64 12
+expect_info 43 64 12 "online (4 nodes, 1 controller, 1 drive, 1 grid); 0 disks, 0 items in 0 resources"
+
+# Insert a 4k disk the way a player does: right-click it onto the drive.
+ctl give refinedstorage:4k_storage_disk 1
+ctl wait 4
+ctl select refinedstorage:4k_storage_disk
+ctl wait 4
+charge_net
+ctl interact 42 64 12
+ctl wait 8
+[ "$(count_of refinedstorage:4k_storage_disk)" = 0 ] \
+    || fail "the 4k disk stayed in the hand: $(ctl inventory | jq -c '[.hotbar[] | select(.item == "refinedstorage:4k_storage_disk")]')"
+slots 42 64 12 | jq -e '[.[] | select(.item == "refinedstorage:4k_storage_disk")] | length == 1' >/dev/null \
+    || fail "the drive does not hold the 4k disk: $(slots 42 64 12)"
+echo "  drive: $(slots 42 64 12)"
+charge_net
+expect_info 42 64 12 "1 disks, 0 items in 0 resources"
+expect_drive 42 64 12 "1 disk, capacity slot 0: refinedstorage:4k_storage_disk 0/4096 items"
+
+# Fill the disk by writing the component it saves. 5,000 saved items is 904 more
+# than a 4k disk holds: the disk is cut to 4,096 (the 1k default cut it to 1,024
+# before this slice, which is what the counterfactual asserts).
+fill_drive 42 64 12 refinedstorage:4k_storage_disk 4096 5000
+charge_net
+expect_info 42 64 12 "1 disks, 4096 items in 1 resources"
+expect_drive 42 64 12 "slot 0: refinedstorage:4k_storage_disk 4096/4096 items"
+
+# The 4,097th item, deposited through the grid's own menu. The disk is full, so
+# the deposit is refused: the network total does not move over a 20-tick window,
+# and the item is not destroyed — the click leaves it in the grid's own slot,
+# clickable back.
+ctl command "execute in minecraft:the_end run tp @s 42.5 64 14.5"
+ctl wait 4
+charge_net
+ctl interact 43 64 12
+ctl wait 8
+ctl give minecraft:dirt 1
+ctl wait 4
+dirt_slot=$(inv_slot minecraft:dirt)
+[ -n "$dirt_slot" ] || fail "no dirt in the menu's player inventory: $(ctl screen | jq -c '[.slots[] | select(.item != null)]')"
+charge_net
+ctl click-slot "$dirt_slot"
+ctl wait 2
+charge_net
+ctl click-slot 340
+ctl wait 8
+before=$(net_items 42 64 12)
+charge_net
+ctl wait 20
+charge_net
+after=$(net_items 42 64 12)
+echo "  the 4k disk after a 1-item deposit: $before -> $after items"
+if [ "$SELFTEST" = diskcap ]; then
+    echo "(selftest: asserting the 4k disk accepted the 4,097th item)"
+    [ "$after" = 4097 ] || fail "expected the 4k disk to have accepted the 4,097th item (net_items $after); a disk that enforces its capacity cannot fail this way"
+else
+    [ "$after" = 4096 ] || fail "a 4k disk holding 4,096 items took the 4,097th (net_items $before -> $after)"
+fi
+# The refused item comes back: click the slot the click put it in, put it in the
+# inventory, and it is still the player's. A refusal that ate the item fails here.
+charge_net
+ctl click-slot 340
+ctl wait 2
+refused_back=$(empty_inv_slot)
+[ -n "$refused_back" ] || fail "no empty inventory slot for the refused item"
+charge_net
+ctl click-slot "$refused_back"
+ctl wait 4
+[ "$(count_of minecraft:dirt)" = 1 ] \
+    || fail "the refused dirt was destroyed instead of staying with the player: $(ctl inventory | jq -c '[.hotbar // [], .main // []]')"
+ctl close
+ctl wait 4
+ctl command "clear @s" >/dev/null
+ctl command "execute in minecraft:the_end run kill @e[type=item]" >/dev/null 2>&1 || true
+ctl wait 4
+
+# The same drive, a 16k disk: 16,384 items, and the readout says so.
+fill_drive 42 64 12 refinedstorage:16k_storage_disk 16384 16384
+charge_net
+expect_info 42 64 12 "1 disks, 16384 items in 1 resources"
+expect_drive 42 64 12 "slot 0: refinedstorage:16k_storage_disk 16384/16384 items"
+
+# A 64k disk: 65,536 items, and the same deposit the creative disk takes below is
+# refused here.
+fill_drive 42 64 12 refinedstorage:64k_storage_disk 65536 65536
+charge_net
+expect_info 42 64 12 "1 disks, 65536 items in 1 resources"
+expect_drive 42 64 12 "slot 0: refinedstorage:64k_storage_disk 65536/65536 items"
+charge_net
+ctl interact 43 64 12
+ctl wait 8
+ctl give minecraft:dirt 1
+ctl wait 4
+dirt_slot=$(inv_slot minecraft:dirt)
+[ -n "$dirt_slot" ] || fail "no dirt in the grid's player inventory"
+charge_net
+ctl click-slot "$dirt_slot"
+ctl wait 2
+charge_net
+ctl click-slot 340
+ctl wait 8
+charge_net
+[ "$(net_items 42 64 12)" = 65536 ] \
+    || fail "a full 64k disk took the 1-item deposit (net_items $(net_items 42 64 12))"
+echo "  the 64k disk refused the deposit: $(net_items 42 64 12) items"
+# Take the refused item back so the free view slot is free again for the next
+# disk (the grid keeps the player's own stack in the slot it was put in).
+charge_net
+ctl click-slot 340
+ctl wait 2
+refused_back=$(empty_inv_slot)
+[ -n "$refused_back" ] || fail "no empty inventory slot for the refused item"
+charge_net
+ctl click-slot "$refused_back"
+ctl wait 4
+[ "$(count_of minecraft:dirt)" = 1 ] \
+    || fail "the refused dirt was destroyed instead of staying with the player"
+ctl close
+ctl wait 4
+ctl command "clear @s" >/dev/null
+ctl wait 2
+
+# The creative disk: give it (it is creative-tab only upstream — no recipe), swap
+# it into the drive, and make the *same* deposit the 64k disk refused. Upstream's
+# creative variant carries no capacity and is not a `LimitedStorage`, so nothing
+# refuses the insertion and the total passes the 64k ceiling.
+ctl give refinedstorage:creative_storage_disk 1
+ctl wait 4
+[ "$(count_of refinedstorage:creative_storage_disk)" = 1 ] \
+    || fail "the creative disk is not a giveable item: $(ctl inventory | jq -c '[.hotbar // [], .main // []]')"
+fill_drive 42 64 12 refinedstorage:creative_storage_disk 0 65536
+charge_net
+expect_info 42 64 12 "1 disks, 65536 items in 1 resources"
+expect_drive 42 64 12 "slot 0: refinedstorage:creative_storage_disk 65536/unlimited"
+ctl give minecraft:dirt 1
+ctl wait 4
+charge_net
+ctl interact 43 64 12
+ctl wait 8
+dirt_slot=$(inv_slot minecraft:dirt)
+[ -n "$dirt_slot" ] || fail "no dirt in the grid's player inventory"
+charge_net
+ctl click-slot "$dirt_slot"
+ctl wait 2
+charge_net
+ctl click-slot 340
+ctl wait 8
+charge_net
+accepted=$(net_items 42 64 12)
+echo "  the creative disk after the same 1-item deposit: $accepted items"
+[ "$accepted" = 65537 ] \
+    || fail "the creative disk did not take an item past the 64k ceiling (net_items $accepted)"
+[ "$(count_of minecraft:dirt)" = 0 ] \
+    || fail "the creative disk's accepted deposit is still in the inventory: $(ctl inventory | jq -c '[.hotbar // [], .main // []]')"
+ctl close
+ctl wait 4
+ctl command "clear @s" >/dev/null
+ctl wait 2
+
+# A 4k disk keeps its 4,096 items across a save and a relaunch, at the capacity
+# its item names. It joins the slice-1 drive, so the relaunch below reads two
+# disks of two sizes on one network (the aggregation the network already did).
+net minecraft:the_end 40 64 0
+ctl command "data modify block 42 64 0 Items append value {Slot:1b,id:\"refinedstorage:4k_storage_disk\",count:1,components:{\"refinedstorage:storage\":{capacity:4096,stacks:[{id:\"minecraft:cobblestone\",count:4096}]}}}"
+ctl wait 8
+charge_net
+expect_info 43 64 0 "2 disks, 4099 items in 2 resources"
+expect_drive 42 64 0 "slot 1: refinedstorage:4k_storage_disk 4096/4096 items"
+
 echo "== the disk keeps its contents across a relaunch =="
 net minecraft:the_end 40 64 0
 ctl command "execute in minecraft:the_end run tp @s 42.5 64 2.5"
@@ -1884,14 +2132,16 @@ charge_net
 ctl wait 20
 charge minecraft:the_end 40 64 0
 charge_net
-expect_info 43 64 0 "online (4 nodes, 1 controller, 1 drive, 1 grid); 1 disks, 3 items in 1 resources"
+expect_info 43 64 0 "online (4 nodes, 1 controller, 1 drive, 1 grid); 2 disks, 4099 items in 2 resources"
+charge_net
+expect_drive 42 64 0 "slot 1: refinedstorage:4k_storage_disk 4096/4096 items"
 charge_net
 ctl interact 43 64 0
 ctl wait 10
 charge_net
-expect_slots '[{"slot":300,"item":"minecraft:gold_ingot","count":3}]'
+expect_slots '[{"slot":300,"item":"minecraft:gold_ingot","count":3},{"slot":301,"item":"minecraft:cobblestone","count":64}]'
 ctl close
 ctl wait 4
 
-echo "PASS: the wireless transmitter joined its network through the facing side only (offline facing away, active facing the cable), /refinedstorage info named it and its range 16 blocks, a use 2.5 blocks away and one exactly 16 blocks away were accepted, 17 blocks away was refused naming the distance, an offline transmitter refused and a position without one answered so, a use from the End against the overworld transmitter was refused as a different dimension while the same command under execute in was accepted, the item placed against the clicked face and the block dropped itself, every carried recipe crafts in game with its declared output and count (29 now, each with its wrong-ingredient control), the machine casing places, reads back and drops itself, the wireless grid is unbound until it is used on a transmitter and then names it (dimension and position in its own component), a use inside the range opens the network's 9x6 view with 54 slots, a shift-click in the player inventory deposits 5 diamonds on the network and a shift-click on the view withdraws them back, 17 blocks out is refused naming the distance while 16 blocks out opens the view, the same item and binding is refused as a different dimension from the overworld and accepted in the End, the refinedstorage:wireless advancement is not granted by a transmitter alone and is granted by the grid and a transmitter together, two networks in one dimension each listed their own 3 gold while the other network held 3 too, two grids on one network never offered the same items twice, the cable follows its neighbours and the grid is active with a controller, the disk went into the drive and the grid listed what was deposited through its menu, the search filtered it, a shift-click withdrew the diamonds, breaking the controller took the network offline and putting it back restored the disk's gold, a network without a drive listed nothing, a stick did not enter the drive, a vanilla barrel is not a network block, a range upgrade in the transmitter's own upgrade slot raised its range to 24 blocks so the same 17.0-block use was accepted and the wireless grid opened its view naming 24 blocks, the transmitter's four-slot menu showed the upgrade and refused a diamond, a creative range upgrade gave unlimited range (70.5 blocks out accepted, another dimension still refused), the importer turned on its network moved 3 items in 20 ticks without an upgrade and emptied its source in one pass with a stack upgrade (64 in 20 ticks), four speed upgrades made the same 20 ticks move a stack and /refinedstorage info named the upgrade counts and the work interval (9 ticks down to 1), its filter blocked the resource it names while an empty filter imported everything, the exporter moved exactly the 4 gold its filter names into the chest it faces and an exporter with no filter moved nothing, a machine menu showed its 13 slots and its upgrade row refused a diamond, both machine items were given and read back, both machine blocks dropped themselves, the wireless grid's own 1,000 FE buffer fell by exactly 5 on the open, 5 on a deposit and 5 on a withdrawal with no drift over ticks, and at 0 item FE the same deposit was refused for the item's energy while the network stayed online and still printed its own energy line, a survival break of the importer carried its four speed upgrades, its stack upgrade and its dirt filter entry on the item with none of them spilled beside it and the re-placed machine listed every slot where it was, a broken transmitter's four range upgrades travelled the same way, and the disk kept its 3 gold across a relaunch"
+echo "PASS: the wireless transmitter joined its network through the facing side only (offline facing away, active facing the cable), /refinedstorage info named it and its range 16 blocks, a use 2.5 blocks away and one exactly 16 blocks away were accepted, 17 blocks away was refused naming the distance, an offline transmitter refused and a position without one answered so, a use from the End against the overworld transmitter was refused as a different dimension while the same command under execute in was accepted, the item placed against the clicked face and the block dropped itself, every carried recipe crafts in game with its declared output and count (35 now, each with its wrong-ingredient control), the machine casing places, reads back and drops itself, the wireless grid is unbound until it is used on a transmitter and then names it (dimension and position in its own component), a use inside the range opens the network's 9x6 view with 54 slots, a shift-click in the player inventory deposits 5 diamonds on the network and a shift-click on the view withdraws them back, 17 blocks out is refused naming the distance while 16 blocks out opens the view, the same item and binding is refused as a different dimension from the overworld and accepted in the End, the refinedstorage:wireless advancement is not granted by a transmitter alone and is granted by the grid and a transmitter together, two networks in one dimension each listed their own 3 gold while the other network held 3 too, two grids on one network never offered the same items twice, the cable follows its neighbours and the grid is active with a controller, the disk went into the drive and the grid listed what was deposited through its menu, the search filtered it, a shift-click withdrew the diamonds, breaking the controller took the network offline and putting it back restored the disk's gold, a network without a drive listed nothing, a stick did not enter the drive, a vanilla barrel is not a network block, a range upgrade in the transmitter's own upgrade slot raised its range to 24 blocks so the same 17.0-block use was accepted and the wireless grid opened its view naming 24 blocks, the transmitter's four-slot menu showed the upgrade and refused a diamond, a creative range upgrade gave unlimited range (70.5 blocks out accepted, another dimension still refused), the importer turned on its network moved 3 items in 20 ticks without an upgrade and emptied its source in one pass with a stack upgrade (64 in 20 ticks), four speed upgrades made the same 20 ticks move a stack and /refinedstorage info named the upgrade counts and the work interval (9 ticks down to 1), its filter blocked the resource it names while an empty filter imported everything, the exporter moved exactly the 4 gold its filter names into the chest it faces and an exporter with no filter moved nothing, a machine menu showed its 13 slots and its upgrade row refused a diamond, both machine items were given and read back, both machine blocks dropped themselves, the wireless grid's own 1,000 FE buffer fell by exactly 5 on the open, 5 on a deposit and 5 on a withdrawal with no drift over ticks, and at 0 item FE the same deposit was refused for the item's energy while the network stayed online and still printed its own energy line, a survival break of the importer carried its four speed upgrades, its stack upgrade and its dirt filter entry on the item with none of them spilled beside it and the re-placed machine listed every slot where it was, a broken transmitter's four range upgrades travelled the same way, a 4k disk cut a saved 5,000-item component to its own 4,096 and refused the 4,097th item deposited through the grid while its total stayed 4,096 over a 20-tick window, a 16k disk held 16,384 and a 64k disk 65,536, the creative disk took the same 1-item deposit the full 64k disk refused and kept ingesting past 65,536 with its readout saying unlimited, and the 1k disk's 3 gold and a 4k disk's 4,096 items both kept their contents across a relaunch"
 # The cleanup trap prints EXIT:<status> as the last line.

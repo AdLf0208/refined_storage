@@ -1,13 +1,14 @@
 id = "refinedstorage"
 name = "Refined Storage"
-version = "0.2.10"
+version = "0.2.11"
 description = """A port of Refined Storage 2.0.9 for Horizon, scoped to the item network core: a
 controller (a network is online when its connected component holds one), a cable with its six
 connection states, a disk drive with nine slots of storage disks, the 1k storage disk (1,024 items,
 kept in the disk item's own component) and a grid: a 9x6 menu that searches, withdraws from and
 deposits into the network's disks. The crafting chain that reaches them is carried too — quartz
 enriched iron and copper, silicon, processor bindings and the three processors, the machine casing,
-construction and destruction cores, the 1k storage part and the storage housing — with the recipes
+construction and destruction cores, the 1k storage part, the storage housing and — for the three
+larger craftable disks — the 4k, 16k and 64k storage parts, with the recipes
 that turn vanilla materials into the blocks and the items. A wireless transmitter joins a
 network through its facing side and answers whether a player may use that network: the same dimension,
 online, and within 16 blocks. The wireless grid is the item that asks it: use it on a transmitter to bind
@@ -26,9 +27,13 @@ a buffer of its own: 1,000 FE, charged 5 per open, per deposit and per withdrawa
 moves nothing (and says so) while its network stays online. An importer, an exporter or a wireless
 transmitter broken in survival carries its own slots on the dropped item — a machine's nine filter
 entries and four upgrades, a transmitter's four upgrades — and gives every one back when the item is
-placed again, with nothing spilled beside it. Crafters,
+placed again, with nothing spilled beside it. A storage disk is one of five sizes — 1k, 4k, 16k,
+64k and the creative disk — and its capacity travels in the disk item's own storage component beside
+its contents (a 0 there is the creative disk's unlimited marker, which never refuses an item); a drive
+adds up whatever its disks say, and the 4k, 16k and 64k disks and the storage parts they are built
+from are crafted out of the same chain as the 1k disk. Crafters,
 external storage, interfaces, relays, the security manager, the portable grid, autocrafting, fluid
-storage and the other disk sizes are the port's gap list, not this version."""
+storage and the in-place disk upgrade are the port's gap list, not this version."""
 authors = ["Refined Mods", "AdLf0208"]
 license = "MIT"
 homepage = "https://github.com/AdLf0208/refinedstorage"

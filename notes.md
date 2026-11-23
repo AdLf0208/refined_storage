@@ -19,14 +19,15 @@ the network; no entities, renderers, dimensions or new vanilla hooks.
 Ported now because it is the **#1 core base** of the core-first queue: 13
 pending ATM10 mods depend on it (`ports/tools/port_queue.py`).
 
-Status: **slice 10 — a broken machine carries its own slots (0.2.10)** — the network core of slice 1, the
+Status: **slice 11 — the other storage disks (0.2.11)** — the network core of slice 1, the
 crafting chain of slice 2, the finite-range, same-dimension transmitter of slice 3, the item that
 asks its admission (slice 4), the promise table keyed by network (slice 5), the transmitter's four
 upgrade slots with the range and creative range upgrades (slice 6), the two transfer machines with
 the speed and stack upgrades (slice 7), the network's energy model (slice 8), the grid item's
-own 1,000 FE buffer (slice 9), and now the block drops: an importer, an exporter or a wireless
-transmitter broken in survival keeps its filter entries and upgrades on its own item, so they come
-back when it is placed again instead of vanishing. Everything else is the gap list below, not a claim.
+own 1,000 FE buffer (slice 9), the block drops that carry a broken machine's slots (slice 10), and
+now the other disk sizes: 4k (4,096), 16k (16,384), 64k (65,536) and the creative disk, whose
+capacity lives in the disk item's own component beside its contents — the creative one has none
+(upstream's `null`), so it never refuses an item. Everything else is the gap list below, not a claim.
 
 > The sections from `## Behaviour` to `### Verification after the repairs`
 > describe the **retired `.hnmod`** layout. They are kept as history: the
@@ -121,8 +122,11 @@ and in the gaps below.
    block, its item, the facing-only connection rule, the same-dimension/16-block
    admission, its recipe and the `refinedstorage:wireless` advancement),
    ~~the wireless grid~~ (**done in slice 4, 0.2.4**), portable grid, crafting/pattern
-   grids, autocrafting, fluid storage and disks, the other disk sizes (4k/16k/
-   64k/creative), storage blocks, ~~the range and creative range upgrades~~
+   grids, autocrafting, fluid storage and disks, ~~the other disk sizes (4k/16k/
+   64k/creative)~~ (**done in slice 11, 0.2.11**: all five disk items, each
+   capacity saved in the disk's own component, the creative disk unlimited and
+   reporting no ceiling, the three larger disks and the storage parts they are
+   built from crafting from the 1k chain's own materials), storage blocks, ~~the range and creative range upgrades~~
    (**done in slice 6, 0.2.6**: the transmitter's four upgrade slots, the base
    `upgrade` item and its recipe, +8 blocks per range upgrade up to four, the
    creative one unlimited but never cross-dimension),
@@ -2515,3 +2519,271 @@ Evidence: `ports/_shared/evidence/refinedstorage/` — `plan-slice10-drops.md`,
 `e2e-slice10-selftest-energy.log`, `e2e-slice10-selftest-itemenergy.log`, and
 `launcher-build-0.2.10.log` (`Compiling refinedstorage (1 of 1)`, `native-0a875da-3bdf09dd1977` — the
 build every leg ran on).
+
+## Slice 11 — the other storage disks: 4k, 16k, 64k and creative (2026-11-23) — version 0.2.11
+
+### The gap lines this slice answers (verbatim)
+
+- §"Slice 10" next-slice proposal: *"the other disk sizes (4k/16k/64k/creative)"*.
+- §"Gaps / deviations (slice 1)" item 2: *"… fluid storage and disks, the other disk sizes (4k/16k/
+  64k/creative), storage blocks, …"*, and the 0.2.10 manifest's last line: *"… and the other disk
+  sizes are the port's gap list, not this version."*
+- The slice's own note in the previous report: *"Disk capacity is fixed at 1k and the disk is one
+  item"*.
+
+### The reference (read, not guessed)
+
+Upstream `refinedmods/refinedstorage2` v2.0.9, MIT, commit `0dec63affe8147702b020843c22748483ef18c01`
+(`ports/_shared/upstream/refinedstorage/`):
+
+| file | what it says |
+|---|---|
+| `common/storage/ItemStorageVariant.java` | `ONE_K("1k", 1024)`, `FOUR_K("4k", 4096)`, `SIXTEEN_K("16k", 16384)`, `SIXTY_FOUR_K("64k", 65536)`, `CREATIVE("creative", null)` — **the creative variant's capacity is `null`** |
+| `common/storage/storagedisk/ItemStorageDiskItem.java` | `getCapacity()` is the variant's; `createStorage` hands the variant's capacity to `StorageTypes.ITEM.create(capacity, …)` |
+| `common/storage/SameTypeStorageType.java` | `data.capacity().map(limited).orElseGet(plain)`: a **null** capacity builds a plain `PlatformStorage` — **no `LimitedStorage`, no `getCapacity()`**, so the creative disk is unbounded and reports no ceiling |
+| `common/storage/LimitedPlatformStorage.java` | only the finite variants implement `LimitedStorage.getCapacity()` |
+| `api/storage/StorageImpl.java` | `insert` returns the whole amount — **there is no per-operation cap** either |
+| `resources/…/recipe/{4k,16k,64k}_storage_disk.json` | `GRG/RPR/EEE` with `P` = that tier's storage part (the 1k disk's own shape) |
+| `resources/…/recipe/{4k,16k,64k}_storage_part.json` | `PEP/SRS/PSP`, `P` = basic/improved/advanced processor, `S` = the previous tier's part |
+| `resources/…/recipe/*_storage_disk_from_storage_housing.json` | a second, shapeless route (housing + part) |
+| `resources/…/recipe/*_storage_disk_upgrade.json` + `StorageContainerUpgradeRecipe` | the in-place upgrade: a smaller disk + the bigger part → the bigger disk, the source part returned, contents transferred |
+| `CreativeModeTabItems.java` | the **creative disk is creative-tab only**: no recipe, and filtered out of the part list |
+
+**The creative disk's semantics, as read** (not inferred from its name): unlimited stored items,
+**no capacity reported** (it is not a `LimitedStorage`, so `getCapacity()` does not exist for it),
+**no per-insertion ceiling**, and **no recipe**. It is the only disk whose capacity upstream leaves
+`null`; this port's component stores that as `0`, the one spelling a number can give a `null`.
+
+### What was implemented
+
+- **`runtime::DiskCapacity`** — `Items(u64)` or `Unlimited`, with `room()` (`u64::MAX` for the
+  creative disk, so `insert` never refuses an amount), `saved()`/`from_saved()` (0 = the creative
+  marker), `clamp()` (a component can never give a disk more room than its item names) and `label()`
+  (`"4096 items"` / `"unlimited"`).
+- **`runtime::disk_capacity(item_id)`** — the five ids → their capacity, `None` for anything else
+  (`storage_housing`, a stick). `CAPACITY_4K/16K/64K` sit beside `CAPACITY_1K`, all derived from it
+  the way upstream writes `1024 * 4 * 4 * 4`.
+- **`Disk`** carries a `DiskCapacity` (`Disk::new(n)` / `Disk::unlimited()`): `free()`, `insert()`
+  and `trim()` honour it, so a saved 4k disk with 5,000 items is cut to 4,096 (before this slice
+  every disk was cut to the 1k default), and a creative disk's `free()` is `u64::MAX - total`.
+- **`support::StorageComponent`** now saves `{capacity, stacks}` in the **same**
+  `refinedstorage:storage` component and still reads a 0.2.10 disk's bare list (no capacity → the
+  item's own). `read_disk` takes the capacity from the item id, clamped by what the component says;
+  `write_disk` records it.
+- **New content, upstream's own ids**: `refinedstorage:{4k,16k,64k,creative}_storage_disk` and the
+  three storage parts the disk recipes name. Each disk item declares its capacity as the component's
+  **default** (`{"capacity": 4096}`), so a crafted or given disk is self-describing; the creative
+  one declares `0`. All seven join the creative tab.
+- **Recipes** (upstream's own shapes, adapted only to the pin's `"#tag"` string spelling): the three
+  parts and the three disks from their part — six new recipes, each crafted in game.
+- **`/refinedstorage info` on a drive** now names every disk and its room:
+  `Disk drive at 42,64,12: 1 disk, capacity slot 0: refinedstorage:4k_storage_disk 4096/4096 items`,
+  and `… creative_storage_disk 65536/unlimited` (the creative variant reports no ceiling).
+
+### Port defect fixed (found by this slice's own first leg)
+
+`grid_tick` marked **every** disk of its network dirty on every tick it worked, so the drive rewrote
+each disk item every tick and any change made to a disk's component from outside (a `/data merge`,
+another tool) was replaced by the stale cache one tick later — the first leg's fill vanished and the
+four disk readouts stayed `0 items`. It now marks a disk dirty only when the view **changed** it
+(`core.disks[key] != disk`), which is also what the module's own contract says ("the disk's item
+component is the truth whenever the drive is loaded and not mid-write"). The in-game proof is the
+fill itself: the same `/data merge` now reaches 4,096 and stays there.
+
+### Harness repairs made while proving it (the tool, not the mod)
+
+1. **`ctl` retries once**, and closes a screen when the refusal names one. Three consecutive legs
+   aborted with no message (a single control request answering nothing under load, or a dead menu
+   outliving a broken block), which cost three 15-minute runs. A retry cannot weaken an assertion:
+   a wrong answer is still compared, and a genuinely broken command fails twice.
+2. **`open_menu X Y Z N`** asks up to three times for a menu, because a right click is a
+   press/release pair and occasionally does not open one on a loaded box; the slot-count assertion
+   follows it unchanged.
+3. **The transmitter's pickup stands on the drop's own position** (`55.5 64 5.5`, as the importer
+   phase already did); one block away (`z = 6.5`) was outside the pickup reach and failed once.
+4. **A block-grid deposit goes into a free view slot.** A view slot holds the network's own stack,
+   and the engine *swaps* a cursor of another resource with it, which the tick reads back as a
+   withdrawal — the first attempt "failed to accept" 63 items it had actually withdrawn. Only an
+   empty slot is a deposit.
+
+### The rules as tests (red first)
+
+`runtime.rs`: `every_storage_disk_id_names_its_capacity`, `a_4k_disk_takes_four_times_what_a_1k_does`,
+`the_creative_disk_has_no_ceiling`, `a_saved_fuller_than_capacity_disk_is_cut_to_its_own_room`,
+`the_saved_spelling_marks_the_creative_disk_zero`,
+`a_component_cannot_give_a_disk_more_room_than_its_item`, `a_capacity_reads_back_as_its_room`.
+
+### Red proof — verbatim, before the glue
+
+`cargo test`, 2026-11-23 06:0x, `runtime-red-slice11-disks.log`
+(`ports/_shared/evidence/refinedstorage/runtime-red-slice11-disks.log`), against stubs that kept the
+old behaviour in the new types (every disk a 1k disk, `0` read as 1,024, the component always winning):
+
+```
+---- runtime::tests::every_storage_disk_id_names_its_capacity stdout ----
+thread 'runtime::tests::every_storage_disk_id_names_its_capacity' (118037) panicked at src/runtime.rs:2184:9:
+assertion `left == right` failed
+  left: Some(Items(1024))
+ right: Some(Items(4096))
+---- runtime::tests::the_creative_disk_has_no_ceiling stdout ----
+assertion `left == right` failed: unlimited means no room count
+  left: 1024
+ right: 18446744073709551615
+---- runtime::tests::the_saved_spelling_marks_the_creative_disk_zero stdout ----
+assertion `left == right` failed: 0 is the only spelling upstream's null has in a component
+  left: Items(1024)
+ right: Unlimited
+---- runtime::tests::a_component_cannot_give_a_disk_more_room_than_its_item stdout ----
+assertion `left == right` failed
+  left: Items(65536)
+ right: Items(4096)
+---- runtime::tests::a_capacity_reads_back_as_its_room stdout ----
+assertion `left == right` failed
+  left: "1024 items"
+ right: "unlimited"
+
+failures:
+    runtime::tests::a_capacity_reads_back_as_its_room
+    runtime::tests::a_component_cannot_give_a_disk_more_room_than_its_item
+    runtime::tests::every_storage_disk_id_names_its_capacity
+    runtime::tests::the_creative_disk_has_no_ceiling
+    runtime::tests::the_saved_spelling_marks_the_creative_disk_zero
+
+test result: FAILED. 100 passed; 5 failed; 0 ignored; 0 measured; 0 filtered out
+```
+
+Honest note: two of the seven new tests (`a_4k_disk_takes_four_times_what_a_1k_does`,
+`a_saved_fuller_than_capacity_disk_is_cut_to_its_own_room`) were **already green**: `Disk` always
+took an arbitrary capacity, and what was missing was the id→capacity mapping, the unlimited variant
+and the saved-capacity clamp. They stay as regression guards for the generic capacity.
+
+### Green — the ladder and the in-game leg (one launcher build at `0a875da`)
+
+| Step | Command | Result |
+|---|---|---|
+| runtime + glue tests | `rm -f Cargo.lock && cargo test` | **105 passed**, 0 failed (`sdk-test.log`) |
+| lints | `cargo clippy --all-targets --offline -- -D warnings` | exit 0, **0 warnings** (`sdk-clippy.log`) |
+| formatting | `rustfmt --edition 2024 --check src/{lib,support,runtime}.rs` | clean, exit 0 (`sdk-fmt.log`) |
+| SDK check | `cargo horizon-mod check` | *"Refined Storage uses 645 items of the API (…). Made for 0a875da."* (`sdk-check-0.2.11.log`) |
+| package | `rm -f Cargo.lock && cargo horizon-mod build` ×2 | **byte-identical** (`cmp`, `CMP_EXIT:0`), **210,866 B**, SHA-256 `e1c84b64a7804fdbce737ba63ed0b860840c140a43f5da26dbc2262b6c3f9ac4`, **257 entries**, no `Cargo.lock` (`sdk-build-0.2.11.log`) |
+| package check | `cargo horizon-mod check refinedstorage.hmod` | `0.2.11 (native-mod, format native-1/0a875da…/e59da909…, for 26.3) 210866 bytes`, `CHECK_FILE_EXIT:0` |
+| fits (pin) | `… fits refinedstorage.hmod --build 0a875da` | `0a875da  made for`, `FITS_PIN_EXIT:0` |
+| fits (other build) | `… fits refinedstorage.hmod --build 0b14f8a` | `0b14f8a  fits`, `FITS_OTHER_EXIT:0` (both in `sdk-check-fits-0.2.11.log`) |
+| launcher build | `launcher-game.sh build refinedstorage --rebuild` | exit 0, **`Compiling refinedstorage (1 of 1)`**, `native-0a875da-25454b066fed` (`launcher-build-0.2.11.log`) |
+| in-game leg | `build-slot.sh run … --step e2e -- tools/e2e.sh` | **PASS** + **`EXIT:0`** (`e2e-slice11-green.log`) |
+| control (same Nightly, no package) | `GAME=$CONTROL_GAME …` | **FAIL** + **`EXIT:1`** — *"the block at 41,64,1 is minecraft:air, expected facing=north"* (`e2e-slice11-control.log`) |
+| counterfactual (this slice) | `SELFTEST=diskcap …` | **FAIL** + **`EXIT:1`** — *"expected the 4k disk to have accepted the 4,097th item (net_items 4096)"* (`e2e-slice11-selftest-diskcap.log`) |
+| selftest (slice-5 promise rule) | `SELFTEST=networks …` | **FAIL** + **`EXIT:1`** — *"the grid's view is [{"count":3,"item":"minecraft:gold_ingot","slot":300}], expected []"* |
+| selftest (slice-8 network gate) | `SELFTEST=energy …` | **FAIL** + **`EXIT:1`** — *"… refused (not enough energy: 0 of 16 FE)"* |
+| selftest (slice-9 item gate) | `SELFTEST=itemenergy …` | **FAIL** + **`EXIT:1`** — *"expected the 0-FE deposit to have moved the stack, it is still in the inventory"* |
+| selftest (slice-10 carry) | `SELFTEST=drops …` | **FAIL** + **`EXIT:1`** — *"the re-placed importer carried its slots back ([…]); the empty drop it used to have is gone"* |
+| log gate | `check-e2e-logs.py refinedstorage-e2e --strict` | `logs=54 ok=54 missing-exit=0 bad-exit=0` |
+| package gate | `verify-sdk-package.py refinedstorage` | **1/1** |
+
+The new phase, quoted from `e2e-slice11-green.log` (a second network at z=12: controller 40, cable
+41, drive 42, grid 43):
+
+```
+  info(43,64,12): … 1 disks, 0 items in 0 resources; energy 900/1000 FE, drawing 24/tick, t=10809
+  info(42,64,12) drive: Disk drive at 42,64,12: 1 disk, capacity slot 0: refinedstorage:4k_storage_disk 0/4096 items
+  info(42,64,12): … 1 disks, 4096 items in 1 resources; …
+  info(42,64,12) drive: Disk drive at 42,64,12: 1 disk, capacity slot 0: refinedstorage:4k_storage_disk 4096/4096 items
+  the 4k disk after a 1-item deposit: 4096 -> 4096 items
+  info(42,64,12) drive: Disk drive at 42,64,12: 1 disk, capacity slot 0: refinedstorage:16k_storage_disk 16384/16384 items
+  info(42,64,12) drive: Disk drive at 42,64,12: 1 disk, capacity slot 0: refinedstorage:64k_storage_disk 65536/65536 items
+  the 64k disk refused the deposit: 65536 items
+  info(42,64,12) drive: Disk drive at 42,64,12: 1 disk, capacity slot 0: refinedstorage:creative_storage_disk 65536/unlimited
+  the creative disk after the same 1-item deposit: 65537 items
+  info(42,64,0) drive: Disk drive at 42,64,0: 2 disks, capacity slot 0: refinedstorage:1k_storage_disk 3/1024 items, slot 1: refinedstorage:4k_storage_disk 4096/4096 items
+```
+
+and after `ctl save` + quit + relaunch (the existing slice-1 phase, extended):
+
+```
+  info(43,64,0): … 2 disks, 4099 items in 2 resources; …
+  info(42,64,0) drive: Disk drive at 42,64,0: 2 disks, capacity slot 0: refinedstorage:1k_storage_disk 3/1024 items, slot 1: refinedstorage:4k_storage_disk 4096/4096 items
+  grid view: [{"count":3,"item":"minecraft:gold_ingot","slot":300},{"count":64,"item":"minecraft:cobblestone","slot":301}]
+```
+
+### The assertions and their differentials
+
+- **The fill is the 5,000-item component.** A 4k disk is written with 5,000 saved items and reads
+  back 4,096 — the old code cut every disk to 1,024, so this line alone separates the two builds
+  (and `SELFTEST=diskcap` asserts the opposite of the refusal, which fails).
+- **The refusal is a 1-item deposit through the grid's own menu**, `net_items` read before and after
+  a 20-tick window: 4,096 → 4,096 on the 4k and 65,536 → 65,536 on the 64k.
+- **The accepted deposit is the same action on the creative disk**: 65,536 → 65,537, past the 64k
+  ceiling, with `…/unlimited` in its readout — the pair is the capacity differential.
+- **A refusal does not destroy the item**: the dirt left in the grid's own slot is clicked back and
+  lands in the inventory (`count_of minecraft:dirt = 1`).
+- **Each capacity is named by the drive's own info line**, not only by the total: `4096/4096`,
+  `16384/16384`, `65536/65536`, `65536/unlimited`.
+- **Across a relaunch** the 1k disk (3 gold) and the 4k disk (4,096 cobblestone) both keep their
+  contents on one network: `2 disks, 4099 items in 2 resources`, the drive line naming both
+  capacities.
+
+### Recipes (the parity rule)
+
+Six new recipes, each crafted in a real crafting table by `tools/recipe_check.py` (35 recipes now,
+each with its wrong-ingredient control): `4k/16k/64k_storage_part` (four tier processors, two
+quartz-enriched iron, three of the previous part, one redstone) and `4k/16k/64k_storage_disk` (the
+1k disk's own `GRG/RPR/EEE` shape with its own part). The driver reads the package's own JSON, so a
+carried recipe cannot be dead data.
+
+### Deviations and gaps (recorded, not hidden)
+
+1. **The from-housing route is not carried for the three larger disks.** Upstream has both a shaped
+   disk recipe and a shapeless `housing + part` one; the port carries the shaped one (the 1k disk's
+   pair was already carried in slice 2). One route per item, stated rather than duplicated.
+2. **The in-place upgrade is not carried.** Upstream's `refinedstorage:storage_disk_upgrade` is a
+   custom recipe type (`CraftingRecipeKind` here) that upgrades a smaller disk with the bigger part
+   and **returns the smaller disk's own part** while transferring the contents; it is
+   `not ported` — the pin can express it (`remaining_items`), but it needs its own decode/match/
+   assemble code and its own in-game proof, so it is the next slice rather than half of this one.
+3. **The creative disk's tooltip/help text** (`item.refinedstorage.creative_storage_disk.help`) and
+   the disks' `fireResistant` property are not carried: the port has no tooltip text for any item and
+   no fire-resistance test, so shipping either would be an unproven claim.
+4. **The capacity is clamped by the item**, not taken on trust: a component that names 65,536 on a
+   1k disk reads as 1,024 (unit test `a_component_cannot_give_a_disk_more_room_than_its_item`).
+   Upstream has no component at all here, so this is the port's own safety rule, not a deviation
+   from behaviour a player can see.
+5. **The drive still shows nine slots** where upstream has eight (slice 1's recorded deviation).
+
+### Coverage (parity rule) — every family this slice ships
+
+| family | state |
+|---|---|
+| the five disk items | **tested** — each id is given/inserted, read back by `ctl container`, and its capacity read from the drive's info line |
+| the 4k disk's capacity | **tested** — 5,000 saved items cut to 4,096; the 4,097th deposit refused with `net_items` flat over 20 ticks |
+| the 16k and 64k disks' capacity | **tested** — 16,384 and 65,536 items, each named by its own readout; the 64k refuses the 1-item deposit |
+| the creative disk | **tested** — 65,536 stored, the same deposit accepted (65,537), readout `…/unlimited`; item given and read back |
+| a refused deposit | **tested** — the item comes back to the player (clicked out of the grid's slot into the inventory) |
+| contents across a relaunch | **tested** — save, quit, relaunch: `2 disks, 4099 items`, both capacities named |
+| the three storage parts and six recipes | **tested** — `tools/recipe_check.py` crafts all six with their declared output and count, consumes them, and its controls yield nothing |
+| the creative disk's recipe | **not ported** — upstream ships none (creative-tab only) |
+| the `*_from_storage_housing` duplicates | **not ported** — deviation 1 |
+| the in-place disk upgrade | **not ported** — deviation 2, `blocked(recipe-serializer)` for this slice |
+| fluid disks | **not ported** — the fluid storage system is still a gap (slice 1 item 2) |
+
+### Harness facts learned here
+
+- **`/data merge block` reaches a mod block entity**: the engine decodes `Items` (with components)
+  into the mod's slots, and `data get block` shows the tag back. It is how a disk is filled with
+  4,096/16,384/65,536 items without thousands of clicks.
+- **A view slot is not an empty slot**: a click with a *different* resource swaps with the network's
+  stack and reads back as a withdrawal; a deposit must land on a free view slot.
+- **A refused deposit stays in the grid's slot as the player's** (the slice-10 "owned slot" rule), so
+  the slot must be emptied before the next deposit test.
+- **The drive's info line is the per-disk readout**: `Disk drive at X,Y,Z: N disks, capacity slot 0:
+  …`, which is what makes a per-disk capacity assertable at all.
+- **`ctl` needs a retry on a loaded box**; without one, a leg can abort with no message at all.
+
+Skills: superpowers/using-superpowers,brainstorming,writing-plans,test-driven-development,systematic-debugging,verification-before-completion; BeautifulRust/rust-best-practices
+
+Evidence: `ports/_shared/evidence/refinedstorage/` — `plan-slice11-disks.md`,
+`runtime-red-slice11-disks.log`, `sdk-test.log` (105), `sdk-clippy.log`, `sdk-fmt.log`,
+`sdk-build-0.2.11.log` (two builds + `cmp`), `sdk-check-0.2.11.log`, `sdk-check-fits-0.2.11.log`,
+`refinedstorage.hmod` (the delivered bytes) — and `ports/_shared/evidence/refinedstorage-e2e/` —
+`e2e-slice11-green.log`, `e2e-slice11-control.log`, `e2e-slice11-selftest-diskcap.log`,
+`e2e-slice11-selftest-{networks,energy,itemenergy,drops}.log`, and `launcher-build-0.2.11.log`
+(`Compiling refinedstorage (1 of 1)`, `native-0a875da-25454b066fed` — the build every leg ran on).

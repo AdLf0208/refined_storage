@@ -1,0 +1,17 @@
+{
+  "type": "minecraft:crafting_shaped",
+  "pattern": [
+    "PEP",
+    "SRS",
+    "PSP"
+  ],
+  "key": {
+    "P": "refinedstorage:advanced_processor",
+    "E": "refinedstorage:quartz_enriched_iron",
+    "S": "refinedstorage:16k_storage_part",
+    "R": "#c:dusts/redstone"
+  },
+  "result": {
+    "id": "refinedstorage:64k_storage_part"
+  }
+}

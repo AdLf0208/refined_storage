@@ -1,5 +1,10 @@
 {
   "template": "minecraft:paper",
   "max_stack_size": 1,
-  "rarity": "common"
+  "rarity": "common",
+  "components": {
+    "refinedstorage:storage": {
+      "capacity": 1024
+    }
+  }
 }
