@@ -1412,6 +1412,75 @@ pub fn charge_item(stored: u32, used: WirelessUse) -> Result<u32, Refusal> {
         .ok_or(Refusal::NoItemEnergy { stored, cost })
 }
 
+// --- a broken block's own slots on its item (slice 10) ---------------------
+
+/// A machine's filter entries: upstream's `ResourceContainerImpl.createForFilter`
+/// makes a nine-slot container (`AbstractSimpleFilterContainerMenu.addSlots`
+/// puts them first).
+pub const MACHINE_FILTERS: usize = 9;
+
+/// A machine's upgrade slots: upstream's `UpgradeContainer` default size.
+pub const MACHINE_UPGRADES: usize = 4;
+
+/// The transmitter's upgrade slots: the same `UpgradeContainer`, which its
+/// `WirelessTransmitterBlockEntity` builds with no destination.
+pub const TRANSMITTER_SLOTS: usize = MACHINE_UPGRADES;
+
+impl Kind {
+    /// Whether this block carries its own slots on its item when it is broken:
+    /// the two machines (nine filter entries and four upgrades) and the
+    /// transmitter (four upgrades) do. The controller, cable and grid have no
+    /// slots, and a drive's nine slots are the player's disks — upstream drops
+    /// those as items and keeps them off the drive's item, so the engine's own
+    /// container spill stays the drive's route.
+    pub fn carries_contents(self) -> bool {
+        matches!(
+            self,
+            Kind::Importer | Kind::Exporter | Kind::WirelessTransmitter
+        )
+    }
+
+    /// The slots this block's own container has, or zero for a block without
+    /// one. A restore is clamped to it, so a doctored item cannot write into a
+    /// slot the block does not have.
+    pub fn own_slots(self) -> usize {
+        match self {
+            Kind::Importer | Kind::Exporter => MACHINE_FILTERS + MACHINE_UPGRADES,
+            Kind::WirelessTransmitter => TRANSMITTER_SLOTS,
+            Kind::Controller | Kind::Cable | Kind::DiskDrive | Kind::Grid => 0,
+        }
+    }
+}
+
+/// What a broken block carries on its item: every slot that held something,
+/// with the slot index it held it in. `None` when the container was empty, so
+/// a plain machine drops a plain machine item.
+pub fn carry<T: Clone>(slots: &[Option<T>]) -> Option<Vec<(u32, T)>> {
+    let held: Vec<(u32, T)> = slots
+        .iter()
+        .enumerate()
+        .filter_map(|(slot, stack)| Some((u32::try_from(slot).ok()?, stack.clone()?)))
+        .collect();
+    (!held.is_empty()).then_some(held)
+}
+
+/// The slots a carried list may restore into a container of `capacity` slots:
+/// an index at or past it is dropped (the item is a player's data, not the
+/// container's definition), and a slot named twice keeps its first entry.
+pub fn restore<T: Clone>(carried: &[(u32, T)], capacity: usize) -> Vec<(u32, T)> {
+    let mut out: Vec<(u32, T)> = Vec::with_capacity(carried.len().min(capacity));
+    for (slot, stack) in carried {
+        if *slot as usize >= capacity {
+            continue;
+        }
+        if out.iter().any(|(taken, _)| taken == slot) {
+            continue;
+        }
+        out.push((*slot, stack.clone()));
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2909,5 +2978,104 @@ mod tests {
         assert_eq!(WirelessUse::Open.cost(), 5, "WIRELESS_GRID_OPEN");
         assert_eq!(WirelessUse::Insert.cost(), 5, "WIRELESS_GRID_INSERT");
         assert_eq!(WirelessUse::Extract.cost(), 5, "WIRELESS_GRID_EXTRACT");
+    }
+
+    // --- a broken block's own slots on its item (slice 10) ------------------
+
+    #[test]
+    fn the_slot_counts_are_what_the_content_registers() {
+        assert_eq!(MACHINE_FILTERS, 9, "a machine's filter entries");
+        assert_eq!(MACHINE_UPGRADES, 4, "a machine's upgrade slots");
+        assert_eq!(TRANSMITTER_SLOTS, 4, "the transmitter's upgrade slots");
+        assert_eq!(
+            Kind::Importer.own_slots(),
+            13,
+            "nine filters, four upgrades"
+        );
+        assert_eq!(
+            Kind::Exporter.own_slots(),
+            13,
+            "nine filters, four upgrades"
+        );
+        assert_eq!(Kind::WirelessTransmitter.own_slots(), 4, "four upgrades");
+        for kind in [Kind::Controller, Kind::Cable, Kind::DiskDrive, Kind::Grid] {
+            assert_eq!(kind.own_slots(), 0, "{kind:?} has no container of its own");
+        }
+    }
+
+    #[test]
+    fn a_machines_slots_travel_on_its_item_and_a_drives_do_not() {
+        for kind in [Kind::Importer, Kind::Exporter, Kind::WirelessTransmitter] {
+            assert!(
+                kind.carries_contents(),
+                "{kind:?} keeps its own slots on its item"
+            );
+        }
+        for kind in [Kind::Controller, Kind::Cable, Kind::DiskDrive, Kind::Grid] {
+            assert!(
+                !kind.carries_contents(),
+                "{kind:?} does not: a drive's disks spill as items, as upstream drops them"
+            );
+        }
+    }
+
+    #[test]
+    fn an_empty_machine_carries_nothing() {
+        assert_eq!(carry::<&str>(&[]), None);
+        assert_eq!(
+            carry::<&str>(&[None, None, None]),
+            None,
+            "an empty container carries nothing, so the item stays plain"
+        );
+        assert_eq!(
+            carry(&[None, Some("minecraft:dirt")]),
+            Some(vec![(1, "minecraft:dirt")]),
+            "a slot that held something keeps its index"
+        );
+        assert_eq!(
+            carry(&[Some("refinedstorage:speed_upgrade"), None]),
+            Some(vec![(0, "refinedstorage:speed_upgrade")])
+        );
+    }
+
+    #[test]
+    fn a_carried_list_restores_the_slots_it_names() {
+        let carried = [
+            (0, "refinedstorage:speed_upgrade"),
+            (4, "refinedstorage:stack_upgrade"),
+            (8, "minecraft:dirt"),
+        ];
+        assert_eq!(
+            restore(&carried, MACHINE_FILTERS + MACHINE_UPGRADES),
+            carried.to_vec(),
+            "every carried slot is restored where it was"
+        );
+    }
+
+    #[test]
+    fn a_doctored_carried_list_cannot_reach_past_the_container() {
+        let carried = [
+            (0, "refinedstorage:range_upgrade"),
+            (3, "refinedstorage:range_upgrade"),
+            (4, "minecraft:diamond"),
+            (99, "minecraft:diamond"),
+        ];
+        assert_eq!(
+            restore(&carried, TRANSMITTER_SLOTS),
+            vec![
+                (0, "refinedstorage:range_upgrade"),
+                (3, "refinedstorage:range_upgrade"),
+            ],
+            "a slot at or past the container is dropped"
+        );
+        assert_eq!(
+            restore(
+                &[(2, "minecraft:dirt"), (2, "minecraft:stone")],
+                MACHINE_FILTERS
+            ),
+            vec![(2, "minecraft:dirt")],
+            "a slot named twice keeps its first entry"
+        );
+        assert_eq!(restore::<&str>(&[(0, "x")], 0), vec![], "no slots, nothing");
     }
 }

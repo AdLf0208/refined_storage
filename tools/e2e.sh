@@ -85,7 +85,8 @@
 # count, so both fail on the working importer; SELFTEST=energy asserts a use
 # with no energy in the network is accepted, so the run fails on the gate;
 # SELFTEST=itemenergy asserts a deposit at 0 item FE went through, so the run
-# fails on the grid's own gate.
+# fails on the grid's own gate; SELFTEST=drops asserts the re-placed importer
+# came back empty, so the run fails once the slots travel on the item.
 #
 # Slice 8 (the controller's energy model):
 #  - the controller's buffer is 1,000 FE, its `energy_type` is upstream's four
@@ -105,6 +106,14 @@
 #  - at 0 item FE the same deposit is refused `not enough item energy: 0 of 5 FE`
 #    while the network stays online and still prints its own energy line, and a
 #    use at 0 opens nothing; charged, both work again.
+#
+# Slice 10 (a broken machine's own slots travel on its item):
+#  - an importer filled with four speed upgrades, one stack upgrade and a dirt
+#    filter entry is broken in survival: its item drops with every slot and the
+#    upgrade and filter items do not spill onto the ground beside it;
+#  - the item is picked up and placed back at the same position, and the
+#    machine's 13 slots list all six where they were;
+#  - a transmitter's four range upgrades travel the same way.
 set -euo pipefail
 export LC_ALL=C
 
@@ -148,6 +157,9 @@ fail() { echo "FAIL: $*" >&2; ctl logs --lines 60 >&2 || true; exit 1; }
 
 # The non-null slots of the container at a position, as JSON.
 slots() { ctl container "$1" "$2" "$3" | jq -c '[.slots[] | select(. != null)]'; }
+# The same with the index every item sits in: a carried payload must come back
+# to the slot it left, which the order-only list above cannot prove.
+slots_indexed() { ctl container "$1" "$2" "$3" | jq -c '[.slots | to_entries[] | select(.value != null) | {slot: .key} + .value]'; }
 # The open menu's container slots (the grid's view, the drive's disks).
 view() { ctl screen | jq -c '[.slots[] | select(.slot >= 300 and .item != null)]'; }
 count_of() { # count_of ITEM
@@ -1666,6 +1678,168 @@ ctl command "gamemode creative" >/dev/null
 ctl command "clear @s" >/dev/null
 ctl wait 4
 
+echo "== a broken machine carries its own slots on its item =="
+# Slice 10, from two gap lines: slice 6's "the transmitter's upgrade drops when
+# the block is broken | not ported — the game's mod block entity drops an empty
+# item", and slice 7's deviation 5 (a machine's upgrades and filter items are
+# lost the same way). The engine spills a mod block entity's declared container
+# on removal and drops the block's item empty — `canonical()` answers None for a
+# mod type id, so `minecraft:block_entity_data` is never merged back in on
+# placement. The port takes the slots *before* the removal and puts a fresh
+# payload on the drop, so the item carries them and nothing spills; a survival
+# break, a pickup and a re-place must find every slot where it was, and the
+# drops must not list the items a second time (the duplication a whole-compound
+# copy caused in another port's review).
+net minecraft:the_end 40 64 16
+ctl command "execute in minecraft:the_end run kill @e[type=item]" >/dev/null 2>&1 || true
+# The hopper the slice-7 importer read is not needed here, and an empty
+# neighbour keeps the machine's own work from moving anything mid-phase.
+ctl command "execute in minecraft:the_end run setblock 44 64 16 minecraft:air" >/dev/null
+ctl command "gamemode creative" >/dev/null
+ctl command "clear @s" >/dev/null
+ctl wait 6
+# The slice-7 phase above broke this importer; put a fresh one back.
+ctl command "execute in minecraft:the_end run setblock 43 64 16 refinedstorage:importer[facing=east]" >/dev/null
+ctl wait 8
+# Its 13 slots, filled directly: four speed upgrades (slots 0-3), one stack
+# upgrade (4) and a dirt filter entry (5). `ctl container` fills the first empty
+# slot one item at a time, so each call lands where the assertion expects.
+for _ in 1 2 3 4; do ctl container 43 64 16 refinedstorage:speed_upgrade 1 >/dev/null; done
+ctl container 43 64 16 refinedstorage:stack_upgrade 1 >/dev/null
+ctl container 43 64 16 minecraft:dirt 1 >/dev/null
+ctl wait 6
+machine_before=$(slots_indexed 43 64 16)
+echo "  importer before the break: $machine_before"
+[ "$(echo "$machine_before" | jq 'length')" = 6 ] \
+    || fail "the importer did not take the six slot items: $machine_before"
+ctl command "gamemode survival" >/dev/null
+ctl give minecraft:diamond_pickaxe 1 >/dev/null
+ctl wait 4
+ctl select minecraft:diamond_pickaxe >/dev/null
+ctl command "execute in minecraft:the_end run tp @s 43.5 64 17.5" >/dev/null
+ctl wait 6
+broken=$(ctl break 43 64 16) || fail "cannot break the importer: $broken"
+echo "  importer drops: $(echo "$broken" | jq -c '.drops')"
+[ "$(echo "$broken" | jq -r '.drops["refinedstorage:importer"] // 0')" -ge 1 ] \
+    || fail "the importer did not drop itself: $(echo "$broken" | jq -c '.drops')"
+# None of the six is on the ground: the item is the only copy.
+for spilled in refinedstorage:speed_upgrade refinedstorage:stack_upgrade minecraft:dirt; do
+    [ "$(echo "$broken" | jq -r --arg i "$spilled" '.drops[$i] // 0')" = 0 ] \
+        || fail "the importer's $spilled spilled as well as travelling on the item: $(echo "$broken" | jq -c '.drops')"
+done
+# The drop sits at the block's centre; the player steps onto it, then aside to
+# place it back at the same position.
+ctl command "execute in minecraft:the_end run tp @s 43.5 64 16.5" >/dev/null
+ctl wait 20
+[ "$(count_of refinedstorage:importer)" = 1 ] \
+    || fail "the importer item was not picked up: $(ctl inventory | jq -c '.hotbar')"
+ctl command "execute in minecraft:the_end run tp @s 43.5 64 17.5" >/dev/null
+ctl wait 4
+ctl place 43 64 16 --item refinedstorage:importer \
+    || fail "cannot place the importer back at 43 64 16"
+# `ctl place` right-clicks, and a click that lands on the machine's own face
+# opens its menu: close it before the next blocking command (the engine refuses
+# one while a screen is up).
+ctl close >/dev/null 2>&1 || true
+ctl wait 10
+expect_state 43 64 16 'refinedstorage:importer'
+machine_after=$(slots_indexed 43 64 16)
+echo "  importer after the re-place: $machine_after"
+if [ "$SELFTEST" = drops ]; then
+    echo "(selftest: asserting the re-placed importer came back empty)"
+    [ "$(echo "$machine_after" | jq 'length')" = 0 ] \
+        || fail "the re-placed importer carried its slots back ($machine_after); the empty drop it used to have is gone"
+fi
+[ "$(jq -S -c . <<<"$machine_after")" = "$(jq -S -c . <<<"$machine_before")" ] \
+    || fail "the re-placed importer's slots are $machine_after, expected $machine_before"
+# A creative placement keeps the stack, so the payload must come off the item:
+# the same item placed twice must not restore the six slots twice. Break the
+# machine in survival (the payload lands on its item), pick that item up in
+# creative, place it once (restores), remove the block, and place the *same*
+# item again — the second machine must be empty.
+ctl command "gamemode survival" >/dev/null
+ctl give minecraft:diamond_pickaxe 1 >/dev/null
+ctl wait 4
+ctl select minecraft:diamond_pickaxe >/dev/null
+ctl command "execute in minecraft:the_end run tp @s 43.5 64 17.5" >/dev/null
+ctl wait 6
+broken=$(ctl break 43 64 16) || fail "cannot break the re-placed importer: $broken"
+[ "$(echo "$broken" | jq -r '.drops["refinedstorage:importer"] // 0')" -ge 1 ] \
+    || fail "the re-placed importer did not drop itself: $(echo "$broken" | jq -c '.drops')"
+ctl command "gamemode creative" >/dev/null
+ctl command "execute in minecraft:the_end run tp @s 43.5 64 16.5" >/dev/null
+ctl wait 20
+[ "$(count_of refinedstorage:importer)" = 1 ] \
+    || fail "the importer item was not picked up in creative: $(ctl inventory | jq -c '.hotbar')"
+ctl command "execute in minecraft:the_end run tp @s 43.5 64 17.5" >/dev/null
+ctl wait 4
+ctl place 43 64 16 --item refinedstorage:importer \
+    || fail "cannot place the importer in creative"
+ctl close >/dev/null 2>&1 || true
+ctl wait 10
+creative_restored=$(slots_indexed 43 64 16)
+echo "  importer after a creative re-place: $creative_restored"
+[ "$(jq -S -c . <<<"$creative_restored")" = "$(jq -S -c . <<<"$machine_before")" ] \
+    || fail "a creative placement did not restore the slots: $creative_restored"
+# Remove the block (whatever it held is spilled, and cleared) and place the
+# same, now stripped, item again: a payload still on it would restore twice.
+ctl command "execute in minecraft:the_end run setblock 43 64 16 minecraft:air" >/dev/null
+ctl wait 6
+ctl command "execute in minecraft:the_end run kill @e[type=item]" >/dev/null 2>&1 || true
+ctl place 43 64 16 --item refinedstorage:importer \
+    || fail "cannot place the stripped importer again"
+ctl close >/dev/null 2>&1 || true
+ctl wait 10
+stripped=$(slots_indexed 43 64 16)
+echo "  importer after placing the stripped item again: $stripped"
+[ "$(echo "$stripped" | jq 'length')" = 0 ] \
+    || fail "the same item restored its slots a second time ($stripped): the payload was not taken off the stack"
+ctl command "gamemode creative" >/dev/null
+ctl command "clear @s" >/dev/null
+ctl wait 4
+
+echo "== a broken transmitter carries its four upgrade slots =="
+# The same rule for the transmitter (slice 6's gap line): its own four slots
+# travel on its item too. The transmitter itself is left standing on the floor
+# so the drop and the re-place use the position the slice-3 phase broke from.
+ctl command "execute in minecraft:the_end run kill @e[type=item]" >/dev/null 2>&1 || true
+ctl command "execute in minecraft:the_end run setblock 55 64 5 refinedstorage:wireless_transmitter[facing=north]" >/dev/null
+ctl wait 8
+for _ in 1 2 3 4; do ctl container 55 64 5 refinedstorage:range_upgrade 1 >/dev/null; done
+ctl wait 4
+transmitter_before=$(slots_indexed 55 64 5)
+echo "  transmitter before the break: $transmitter_before"
+[ "$(echo "$transmitter_before" | jq 'length')" = 4 ] \
+    || fail "the transmitter did not take four range upgrades: $transmitter_before"
+ctl command "gamemode survival" >/dev/null
+ctl give minecraft:diamond_pickaxe 1 >/dev/null
+ctl wait 4
+ctl select minecraft:diamond_pickaxe >/dev/null
+ctl command "execute in minecraft:the_end run tp @s 55.5 64 7.5" >/dev/null
+ctl wait 6
+broken=$(ctl break 55 64 5) || fail "cannot break the transmitter: $broken"
+echo "  transmitter drops: $(echo "$broken" | jq -c '.drops')"
+[ "$(echo "$broken" | jq -r '.drops["refinedstorage:wireless_transmitter"] // 0')" -ge 1 ] \
+    || fail "the transmitter did not drop itself: $(echo "$broken" | jq -c '.drops')"
+[ "$(echo "$broken" | jq -r '.drops["refinedstorage:range_upgrade"] // 0')" = 0 ] \
+    || fail "the transmitter's range upgrades spilled as well: $(echo "$broken" | jq -c '.drops')"
+ctl command "execute in minecraft:the_end run tp @s 55.5 64 6.5" >/dev/null
+ctl wait 20
+[ "$(count_of refinedstorage:wireless_transmitter)" = 1 ] \
+    || fail "the transmitter item was not picked up: $(ctl inventory | jq -c '.hotbar')"
+ctl place 55 64 5 --item refinedstorage:wireless_transmitter \
+    || fail "cannot place the transmitter back at 55 64 5"
+ctl close >/dev/null 2>&1 || true
+ctl wait 10
+expect_state 55 64 5 'refinedstorage:wireless_transmitter'
+transmitter_after=$(slots_indexed 55 64 5)
+echo "  transmitter after the re-place: $transmitter_after"
+[ "$(jq -S -c . <<<"$transmitter_after")" = "$(jq -S -c . <<<"$transmitter_before")" ] \
+    || fail "the re-placed transmitter's slots are $transmitter_after, expected $transmitter_before"
+ctl command "gamemode creative" >/dev/null
+ctl command "clear @s" >/dev/null
+ctl wait 4
+
 # The advancement needs the grid and a transmitter in one `inventory_changed`
 # criterion (upstream `advancement/wireless.json`): giving both completes it,
 # while the transmitter-only phase above left it unobtained.
@@ -1719,5 +1893,5 @@ expect_slots '[{"slot":300,"item":"minecraft:gold_ingot","count":3}]'
 ctl close
 ctl wait 4
 
-echo "PASS: the wireless transmitter joined its network through the facing side only (offline facing away, active facing the cable), /refinedstorage info named it and its range 16 blocks, a use 2.5 blocks away and one exactly 16 blocks away were accepted, 17 blocks away was refused naming the distance, an offline transmitter refused and a position without one answered so, a use from the End against the overworld transmitter was refused as a different dimension while the same command under execute in was accepted, the item placed against the clicked face and the block dropped itself, every carried recipe crafts in game with its declared output and count (29 now, each with its wrong-ingredient control), the machine casing places, reads back and drops itself, the wireless grid is unbound until it is used on a transmitter and then names it (dimension and position in its own component), a use inside the range opens the network's 9x6 view with 54 slots, a shift-click in the player inventory deposits 5 diamonds on the network and a shift-click on the view withdraws them back, 17 blocks out is refused naming the distance while 16 blocks out opens the view, the same item and binding is refused as a different dimension from the overworld and accepted in the End, the refinedstorage:wireless advancement is not granted by a transmitter alone and is granted by the grid and a transmitter together, two networks in one dimension each listed their own 3 gold while the other network held 3 too, two grids on one network never offered the same items twice, the cable follows its neighbours and the grid is active with a controller, the disk went into the drive and the grid listed what was deposited through its menu, the search filtered it, a shift-click withdrew the diamonds, breaking the controller took the network offline and putting it back restored the disk's gold, a network without a drive listed nothing, a stick did not enter the drive, a vanilla barrel is not a network block, a range upgrade in the transmitter's own upgrade slot raised its range to 24 blocks so the same 17.0-block use was accepted and the wireless grid opened its view naming 24 blocks, the transmitter's four-slot menu showed the upgrade and refused a diamond, a creative range upgrade gave unlimited range (70.5 blocks out accepted, another dimension still refused), the importer turned on its network moved 3 items in 20 ticks without an upgrade and emptied its source in one pass with a stack upgrade (64 in 20 ticks), four speed upgrades made the same 20 ticks move a stack and /refinedstorage info named the upgrade counts and the work interval (9 ticks down to 1), its filter blocked the resource it names while an empty filter imported everything, the exporter moved exactly the 4 gold its filter names into the chest it faces and an exporter with no filter moved nothing, a machine menu showed its 13 slots and its upgrade row refused a diamond, both machine items were given and read back, both machine blocks dropped themselves, the wireless grid's own 1,000 FE buffer fell by exactly 5 on the open, 5 on a deposit and 5 on a withdrawal with no drift over ticks, and at 0 item FE the same deposit was refused for the item's energy while the network stayed online and still printed its own energy line, and the disk kept its 3 gold across a relaunch"
+echo "PASS: the wireless transmitter joined its network through the facing side only (offline facing away, active facing the cable), /refinedstorage info named it and its range 16 blocks, a use 2.5 blocks away and one exactly 16 blocks away were accepted, 17 blocks away was refused naming the distance, an offline transmitter refused and a position without one answered so, a use from the End against the overworld transmitter was refused as a different dimension while the same command under execute in was accepted, the item placed against the clicked face and the block dropped itself, every carried recipe crafts in game with its declared output and count (29 now, each with its wrong-ingredient control), the machine casing places, reads back and drops itself, the wireless grid is unbound until it is used on a transmitter and then names it (dimension and position in its own component), a use inside the range opens the network's 9x6 view with 54 slots, a shift-click in the player inventory deposits 5 diamonds on the network and a shift-click on the view withdraws them back, 17 blocks out is refused naming the distance while 16 blocks out opens the view, the same item and binding is refused as a different dimension from the overworld and accepted in the End, the refinedstorage:wireless advancement is not granted by a transmitter alone and is granted by the grid and a transmitter together, two networks in one dimension each listed their own 3 gold while the other network held 3 too, two grids on one network never offered the same items twice, the cable follows its neighbours and the grid is active with a controller, the disk went into the drive and the grid listed what was deposited through its menu, the search filtered it, a shift-click withdrew the diamonds, breaking the controller took the network offline and putting it back restored the disk's gold, a network without a drive listed nothing, a stick did not enter the drive, a vanilla barrel is not a network block, a range upgrade in the transmitter's own upgrade slot raised its range to 24 blocks so the same 17.0-block use was accepted and the wireless grid opened its view naming 24 blocks, the transmitter's four-slot menu showed the upgrade and refused a diamond, a creative range upgrade gave unlimited range (70.5 blocks out accepted, another dimension still refused), the importer turned on its network moved 3 items in 20 ticks without an upgrade and emptied its source in one pass with a stack upgrade (64 in 20 ticks), four speed upgrades made the same 20 ticks move a stack and /refinedstorage info named the upgrade counts and the work interval (9 ticks down to 1), its filter blocked the resource it names while an empty filter imported everything, the exporter moved exactly the 4 gold its filter names into the chest it faces and an exporter with no filter moved nothing, a machine menu showed its 13 slots and its upgrade row refused a diamond, both machine items were given and read back, both machine blocks dropped themselves, the wireless grid's own 1,000 FE buffer fell by exactly 5 on the open, 5 on a deposit and 5 on a withdrawal with no drift over ticks, and at 0 item FE the same deposit was refused for the item's energy while the network stayed online and still printed its own energy line, a survival break of the importer carried its four speed upgrades, its stack upgrade and its dirt filter entry on the item with none of them spilled beside it and the re-placed machine listed every slot where it was, a broken transmitter's four range upgrades travelled the same way, and the disk kept its 3 gold across a relaunch"
 # The cleanup trap prints EXIT:<status> as the last line.

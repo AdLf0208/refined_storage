@@ -6,7 +6,8 @@ tables (the retired `.hnmod` ladder, the SDK-format one, slice 2's red→green
 recipe proof, slice 3's wireless-transmitter red→green and in-game leg, slice
 4's wireless-grid one, slice 5's network-keyed promise table, slice 6's upgrade
 items and the raised range, slice 7's importer/exporter pair with the speed and stack
-upgrades, and slice 9's wireless-grid item buffer).
+upgrades, slice 9's wireless-grid item buffer, and slice 10's block drops that carry
+the broken machine's own slots).
 
 Quick reproduction (a build slot is required; see the campaign's AGENTS.md):
 
@@ -35,9 +36,9 @@ The two `check`/`build`/`fits` steps need `BUILD_LOCAL=1` on the slot runner:
 the second build machine has no `cargo-horizon-mod`.
 
 Pin **`0a875da91dbb0fdcb7ba8c42c11341aa229af51a`** + mixins
-`e59da9094f0c2fdda6c627fe9eff22dec6a906f0`. Delivered package (0.2.9):
-`refinedstorage.hmod`, **197,142 B**, SHA-256
-`397bb8c0cd23c708b80e0b2b253f85280c89dfbc6a5d991d34d0e98b505d2014`, 244 entries, no packed
+`e59da9094f0c2fdda6c627fe9eff22dec6a906f0`. Delivered package (0.2.10):
+`refinedstorage.hmod`, **203,749 B**, SHA-256
+`41c9810a2d6c33a032abc935cad389b56ec5330cfb34141847c620cf017ba922`, 244 entries, no packed
 `Cargo.lock`; a copy of the delivered bytes is at
 `ports/_shared/evidence/refinedstorage/refinedstorage.hmod`, which is the file both `fits`
 runs used.
@@ -60,6 +61,7 @@ SELFTEST=creative … tools/e2e.sh                                  # flipped cr
 SELFTEST=speed … tools/e2e.sh                                     # flipped importer interval: EXIT:1
 SELFTEST=stack … tools/e2e.sh                                     # flipped importer quota: EXIT:1
 SELFTEST=itemenergy … tools/e2e.sh                                # flipped item-energy gate: EXIT:1
+SELFTEST=drops … tools/e2e.sh                                     # flipped block-drop carry: EXIT:1
 python3 ../tools/check-e2e-logs.py refinedstorage-e2e --strict
 ```
 
@@ -122,3 +124,12 @@ withdrawal each cost exactly 5; at 0 item FE the same deposit is refused `not en
 5 FE` while the network stays online with its own energy line, and a use at 0 opens nothing while the
 same use charged opens for 5. `SELFTEST=itemenergy` inverts the 0-FE deposit and exits 1. The
 slice-8 rate window starts full (1,000 FE) after it ran dry under load and produced a false red.
+
+Slice 10's assertions are `notes.md` §"Slice 10": an importer filled with four speed upgrades, one
+stack upgrade and a dirt filter entry is broken in survival, and its drop lists only the block item —
+none of the six spills beside it; the item is picked up and placed back at the same position, and
+`ctl container` lists all six at their own indices; a second break with the item picked up **in
+creative** restores once, is stripped, and placing the same item again yields an empty machine; a
+transmitter's four range upgrades travel the same way and none spills. `SELFTEST=drops` asserts the
+old, empty re-placed machine and exits 1. The control (the same Nightly with no package) fails at the
+first phase, so the leg is not passing on the engine alone.

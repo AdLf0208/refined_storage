@@ -1,6 +1,6 @@
 id = "refinedstorage"
 name = "Refined Storage"
-version = "0.2.9"
+version = "0.2.10"
 description = """A port of Refined Storage 2.0.9 for Horizon, scoped to the item network core: a
 controller (a network is online when its connected component holds one), a cable with its six
 connection states, a disk drive with nine slots of storage disks, the 1k storage disk (1,024 items,
@@ -23,7 +23,10 @@ charge read from the reference (a grid 10, a drive 10 plus 4 a disk, a transmitt
 upgrade, an importer or exporter 2 a work pass plus its upgrades), and a network that does no work —
 and refuses a wireless use naming the reason — while it cannot pay it. The wireless grid is an item with
 a buffer of its own: 1,000 FE, charged 5 per open, per deposit and per withdrawal, so an empty grid
-moves nothing (and says so) while its network stays online. Crafters,
+moves nothing (and says so) while its network stays online. An importer, an exporter or a wireless
+transmitter broken in survival carries its own slots on the dropped item — a machine's nine filter
+entries and four upgrades, a transmitter's four upgrades — and gives every one back when the item is
+placed again, with nothing spilled beside it. Crafters,
 external storage, interfaces, relays, the security manager, the portable grid, autocrafting, fluid
 storage and the other disk sizes are the port's gap list, not this version."""
 authors = ["Refined Mods", "AdLf0208"]

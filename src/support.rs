@@ -17,15 +17,16 @@ use std::sync::{Mutex, OnceLock};
 
 use mod_api::item::containers::ModBlockEntityFields;
 use mod_api::{
-    self, BlockEntityEvent, BlockEntityPart, BlockEntityTickEvent, BlockEntityTicksEvent, BlockKey,
-    BlockPart, BlockState, Command, CommandArgumentValue, CommandInvocation, CommandSource,
-    Component, Compound, ENERGY, Flow, Hand, Host, HostSide, HostTransaction, ITEM_ENERGY, ITEMS,
-    InteractionResult, ItemKey, ItemPart, ItemPlace, ItemResource, ItemStack, LevelHost, LevelRef,
-    LevelSide, MenuClickedEvent, MenuClosedEvent, MenuContainer, MenuPart, MenuRef, MenuReplace,
+    self, BlockDropsEvent, BlockEntityEvent, BlockEntityItemError, BlockEntityPart,
+    BlockEntityTickEvent, BlockEntityTicksEvent, BlockKey, BlockPart, BlockState, BreakBlockEvent,
+    Command, CommandArgumentValue, CommandInvocation, CommandSource, Component, Compound, ENERGY,
+    Flow, GameMode, Hand, Host, HostSide, HostTransaction, ITEM_ENERGY, ITEMS, InteractionResult,
+    ItemKey, ItemPart, ItemPlace, ItemResource, ItemStack, LevelHost, LevelRef, LevelSide,
+    MenuClickedEvent, MenuClosedEvent, MenuContainer, MenuPart, MenuRef, MenuReplace,
     MenuSlotBacking, MenuSlotRulesEvent, ModBlockEntityView, ModContainer, ModEnergyBuffer,
-    RegisterCommandsEvent, Registrar, RegistrationContext, RightClickBlockEvent,
-    RunModCommandEvent, Screen, ScreenEvent, ServerHost, ServerTickEvent, ServerTickPhase,
-    StateForPlacementEvent, Tag, Text, UseItemEvent, UseOnEvent, WorldPhase,
+    OnBlockPlacedByEvent, PlayerRef, RegisterCommandsEvent, Registrar, RegistrationContext,
+    RightClickBlockEvent, RunModCommandEvent, Screen, ScreenEvent, ServerHost, ServerTickEvent,
+    ServerTickPhase, StateForPlacementEvent, Tag, Text, UseItemEvent, UseOnEvent, WorldPhase,
 };
 
 use crate::runtime::{
@@ -85,7 +86,7 @@ const DRIVE_MENU: &str = "minecraft:generic_9x1";
 const GRID_MENU: &str = "minecraft:generic_9x6";
 /// The transmitter's upgrade slots: upstream's `UpgradeContainer` default size
 /// is 4, the container its `WirelessTransmitterBlockEntity` builds.
-const TRANSMITTER_SLOTS: usize = 4;
+const TRANSMITTER_SLOTS: usize = runtime::TRANSMITTER_SLOTS;
 /// The transmitter's menu: upstream's `WirelessTransmitterContainerMenu` shows
 /// the four upgrade slots beside the player's inventory. The pin's vanilla
 /// menus have no four-slot type, so the package declares its own (API 85).
@@ -93,9 +94,9 @@ const TRANSMITTER_MENU: &str = "refinedstorage:wireless_transmitter";
 /// A machine's filter entries: upstream's `ResourceContainerImpl.createForFilter`
 /// makes a nine-slot container (`AbstractSimpleFilterContainerMenu.addSlots`
 /// puts them first).
-const FILTER_SLOTS: usize = 9;
+const FILTER_SLOTS: usize = runtime::MACHINE_FILTERS;
 /// A machine's upgrade slots: upstream's `UpgradeContainer` default size (4).
-const MACHINE_UPGRADES: usize = 4;
+const MACHINE_UPGRADES: usize = runtime::MACHINE_UPGRADES;
 /// A machine's menu slots: the nine filter entries, then the four upgrades
 /// (upstream's `ImporterContainerMenu`/`ExporterContainerMenu` order).
 const MACHINE_SLOTS: usize = FILTER_SLOTS + MACHINE_UPGRADES;
@@ -105,6 +106,22 @@ const EXPORTER_MENU: &str = "refinedstorage:exporter";
 
 /// The saved compound key the grid's view marks live under.
 const VIEW_KEY: &str = "RefinedStorageView";
+
+/// The saved compound key a broken machine's slots travel under on its item
+/// (slice 10): the item's `minecraft:block_entity_data` carries them, and the
+/// key is this port's own, never vanilla's `Items` — the engine spills a mod
+/// container's `Items` on removal, so carrying them again would duplicate them.
+const CONTENTS_KEY: &str = "RefinedStorageContents";
+
+/// Vanilla's block-entity data component, the one `BlockItem` applies on
+/// placement (for a mod type id the engine's `canonical()` answers `None`, so
+/// this port's `on_block_placed_by` restores the slots itself).
+const BLOCK_ENTITY_DATA: &str = "minecraft:block_entity_data";
+
+/// How long a broken machine's pending carry waits for its own drop, in server
+/// ticks. The break's `block_drops` is the same call, so one tick would do; a
+/// small window keeps an op's queued break from inheriting nothing.
+const CARRY_TTL: u64 = 4;
 
 /// The saved compound key a controller's buffer lives under: the key the game's
 /// `block_energy` handler keeps the amount in (`ModEnergyBuffer`: "the amount is
@@ -132,6 +149,10 @@ struct Keys {
     creative_range_upgrade: ItemKey,
     speed_upgrade: ItemKey,
     stack_upgrade: ItemKey,
+    /// The three blocks whose own slots travel on their item (slice 10).
+    importer_item: ItemKey,
+    exporter_item: ItemKey,
+    transmitter_item: ItemKey,
 }
 
 impl Keys {
@@ -149,6 +170,27 @@ impl Keys {
         ]
         .into_iter()
         .find_map(|(key, kind)| (key == block).then_some(kind))
+    }
+
+    /// The kind whose item `item` is, for the three that carry their slots.
+    fn kind_of_item(self, item: ItemKey) -> Option<Kind> {
+        [
+            (self.importer_item, Kind::Importer),
+            (self.exporter_item, Kind::Exporter),
+            (self.transmitter_item, Kind::WirelessTransmitter),
+        ]
+        .into_iter()
+        .find_map(|(key, kind)| (key == item).then_some(kind))
+    }
+
+    /// The item the block of `kind` drops as.
+    fn item_of(self, kind: Kind) -> Option<ItemKey> {
+        match kind {
+            Kind::Importer => Some(self.importer_item),
+            Kind::Exporter => Some(self.exporter_item),
+            Kind::WirelessTransmitter => Some(self.transmitter_item),
+            Kind::Controller | Kind::Cable | Kind::DiskDrive | Kind::Grid => None,
+        }
     }
 }
 
@@ -177,9 +219,23 @@ pub(crate) fn register(registrar: &mut dyn Registrar, _cx: &RegistrationContext)
         creative_range_upgrade: registrar.item_key(CREATIVE_RANGE_UPGRADE),
         speed_upgrade: registrar.item_key(SPEED_UPGRADE),
         stack_upgrade: registrar.item_key(STACK_UPGRADE),
+        importer_item: registrar.item_key(IMPORTER),
+        exporter_item: registrar.item_key(EXPORTER),
+        transmitter_item: registrar.item_key(TRANSMITTER),
     };
     let _ = KEYS.set(keys);
     registrar.item_part(keys.wireless_grid, WirelessGrid);
+    // The three blocks that keep their own slots on their item: a placed
+    // machine takes back what its item carried (`BlockItemExtension
+    // .onBlockPlacedBy`, here because the engine merges `block_entity_data`
+    // only through `canonical()`, which answers `None` for a mod type id).
+    for item in [
+        keys.importer_item,
+        keys.exporter_item,
+        keys.transmitter_item,
+    ] {
+        registrar.item_part(item, CarriedContents);
+    }
     // The wireless grid's own energy buffer (slice 9): upstream's item is an
     // `ItemEnergyStorage` of `WIRELESS_GRID_CAPACITY`, charged 5 FE per open,
     // insert and extract. The buffer is the item's `refinedstorage:energy`
@@ -1533,6 +1589,15 @@ pub(crate) fn on_server_tick(host: &mut dyn ServerHost, event: &ServerTickEvent<
         return;
     }
     with_core(|core| core.ticks = core.ticks.wrapping_add(1));
+    // A carry nobody collected is stale: the break that made it printed no
+    // drop, so the next break at that position must not inherit it.
+    with_core(|core| {
+        if let Some(carried) = &core.carried
+            && core.ticks.wrapping_sub(carried.tick) > CARRY_TTL
+        {
+            core.carried = None;
+        }
+    });
     let open: Vec<(u128, i32, Binding)> = with_core(|core| {
         core.menus
             .iter()
@@ -2490,6 +2555,263 @@ fn drive_keys(dimension: &str, drives: &[[i32; 3]]) -> Vec<DiskKey> {
         .collect()
 }
 
+// --- a broken machine's slots on its item (slice 10) -----------------------
+
+/// A player is breaking a block: when it is a machine that owns its slots, take
+/// them out of the block entity **before** the removal, so the engine's own
+/// container spill finds nothing, and hold them for this break's `block_drops`.
+///
+/// The clear is verified: if any slot still holds something afterwards (a
+/// refused write), nothing is recorded and the engine's spill is the fallback —
+/// a machine's items are never both carried and spilled.
+pub(crate) fn on_break_block(host: &mut dyn ServerHost, event: &mut BreakBlockEvent<'_>) -> Flow {
+    let pos = event.pos;
+    let Some(kind) = kind_at(host, pos) else {
+        return Flow::Continue;
+    };
+    if !kind.carries_contents() {
+        return Flow::Continue;
+    }
+    // A creative break drops no loot at all (`playerDestroy` is skipped), so
+    // clearing here would destroy the contents instead of carrying them.
+    let creative = host
+        .players()
+        .acting_player()
+        .and_then(|player| player.game_mode(&*host))
+        == Some(GameMode::Creative);
+    if creative {
+        return Flow::Continue;
+    }
+    take_contents(host, pos, kind);
+    Flow::Continue
+}
+
+/// Empty the machine's own slots into the pending carry, in one transaction,
+/// and record them only when the read-back says they are gone.
+fn take_contents(host: &mut dyn ServerHost, pos: [i32; 3], kind: Kind) {
+    let Some(level) = host.level(host.dimension()) else {
+        return;
+    };
+    let Some(entity) = host.block_entity(level, pos) else {
+        return;
+    };
+    let count = kind.own_slots() as u32;
+    let held: Vec<Option<ItemStack>> = (0..count)
+        .map(|slot| entity.item_slot(&*host, slot).ok().flatten())
+        .collect();
+    let Some(carried) = runtime::carry(&held) else {
+        return;
+    };
+    let mut slots = Vec::with_capacity(carried.len());
+    for (slot, stack) in carried {
+        let Some(mut entry) = stack.to_nbt(&*host) else {
+            return;
+        };
+        let Ok(byte) = i8::try_from(slot) else {
+            return;
+        };
+        entry.insert("Slot".into(), Tag::Byte(byte));
+        slots.push((slot, entry));
+    }
+    let cleared = host
+        .transaction(|host, tx| {
+            for slot in 0..count {
+                entity.set_item_slot(host, tx, slot, None)?;
+            }
+            Ok::<(), BlockEntityItemError>(())
+        })
+        .is_ok();
+    let emptied = (0..count).all(|slot| matches!(entity.item_slot(&*host, slot), Ok(None)));
+    if !cleared || !emptied {
+        // The write was refused: the slots stay where they were and the engine's
+        // container spill carries them, as it did before this slice.
+        return;
+    }
+    with_core(|core| {
+        core.carried = Some(Carried {
+            dimension: host.dimension().to_owned(),
+            pos,
+            tick: core.ticks,
+            slots,
+        });
+    });
+}
+
+/// The block's own drop: put the pending carry on it as a **fresh** payload —
+/// this port's `RefinedStorageContents` under vanilla's `block_entity_data` —
+/// when the break was one of this mod's machines. The pre-removal snapshot is
+/// not copied: its `Items` list is what the engine has already spilled, and
+/// carrying vanilla's `Items` would hand the player both.
+pub(crate) fn on_block_drops(level: &dyn LevelHost, event: &mut BlockDropsEvent<'_>) -> Flow {
+    let Some(block) = level.state_block(event.state) else {
+        return Flow::Continue;
+    };
+    let Some(kind) = Kind::from_block(block) else {
+        return Flow::Continue;
+    };
+    if !kind.carries_contents() {
+        return Flow::Continue;
+    }
+    let dimension = event.dimension.key().id().to_owned();
+    let pos = [event.pos.x, event.pos.y, event.pos.z];
+    let Some(carried) = with_core(|core| {
+        core.carried
+            .take()
+            .filter(|carried| carried.dimension == dimension && carried.pos == pos)
+    }) else {
+        return Flow::Continue;
+    };
+    let Some(item) = keys().item_of(kind) else {
+        return Flow::Continue;
+    };
+    let restored = runtime::restore(&carried.slots, kind.own_slots());
+    if restored.is_empty() {
+        return Flow::Continue;
+    }
+    let list = restored
+        .into_iter()
+        .map(|(_, entry)| Tag::Compound(entry))
+        .collect();
+    let data = Tag::Compound(Compound::from([
+        ("id".into(), Tag::String(BE_TYPE.into())),
+        (CONTENTS_KEY.into(), Tag::List(list)),
+    ]));
+    let mut patch = Compound::new();
+    patch.insert(BLOCK_ENTITY_DATA.into(), data);
+    for drop in event.drops.iter_mut() {
+        if drop.stack.item() == item {
+            let _ = drop.stack.apply_components(&patch);
+        }
+    }
+    Flow::Continue
+}
+
+/// The three machines' item Part: a placed machine takes back the slots its
+/// item carried (upstream's `BlockEntityWithDrops` in reverse —
+/// `applyImplicitComponents`), because the engine applies
+/// `minecraft:block_entity_data` only through `canonical()`, which knows
+/// vanilla's types alone.
+struct CarriedContents;
+
+#[mod_api::horizon_part]
+impl ItemPart for CarriedContents {
+    fn on_block_placed_by(&self, host: &mut dyn ServerHost, event: &mut OnBlockPlacedByEvent<'_>) {
+        let Some(kind) = keys().kind_of_item(event.stack.item()) else {
+            return;
+        };
+        let Some(carried) = contents_of(event.stack) else {
+            return;
+        };
+        let decoded: Vec<(u32, ItemStack)> = carried
+            .iter()
+            .filter_map(|(slot, entry)| Some((*slot, ItemStack::from_nbt(&*host, entry)?)))
+            .collect();
+        let stored = runtime::restore(&decoded, kind.own_slots());
+        if stored.is_empty() {
+            return;
+        }
+        let Some(level) = event
+            .placer
+            .and_then(|player| player.level(&*host))
+            .or_else(|| host.level(host.dimension()))
+        else {
+            return;
+        };
+        let pos = event.pos;
+        let Some(entity) = host.block_entity(level, pos) else {
+            return;
+        };
+        let wrote = host
+            .transaction(|host, tx| {
+                for (slot, stack) in &stored {
+                    entity.set_item_slot(host, tx, *slot, Some(stack.clone()))?;
+                }
+                Ok::<(), BlockEntityItemError>(())
+            })
+            .is_ok();
+        if !wrote {
+            return;
+        }
+        // The item must not carry them twice: a creative placement keeps the
+        // stack, and placing it again would restore the same slots into a
+        // second machine.
+        strip_contents(host, event.placer, event.stack);
+    }
+}
+
+/// The slots a placed item carries: each entry of `RefinedStorageContents`, with
+/// the slot it names. A payload naming another type, or no payload at all, is
+/// nothing.
+fn contents_of(stack: &ItemStack) -> Option<Vec<(u32, Compound)>> {
+    let patch = stack.components()?.as_nbt();
+    let Some(Tag::Compound(data)) = field(patch, BLOCK_ENTITY_DATA) else {
+        return None;
+    };
+    match field(data, "id") {
+        Some(Tag::String(id)) if id.to_string_lossy() == BE_TYPE => {}
+        _ => return None,
+    }
+    let Some(Tag::List(entries)) = field(data, CONTENTS_KEY) else {
+        return None;
+    };
+    Some(
+        entries
+            .iter()
+            .filter_map(|entry| {
+                let Tag::Compound(entry) = entry else {
+                    return None;
+                };
+                let Some(Tag::Byte(slot)) = field(entry, "Slot") else {
+                    return None;
+                };
+                Some((u32::from(u8::try_from(*slot).ok()?), entry.clone()))
+            })
+            .collect(),
+    )
+}
+
+/// Take the contents off the held stack, so a creative placement cannot restore
+/// them again. The whole `minecraft:block_entity_data` goes when this port's
+/// list is all it held.
+fn strip_contents(host: &mut dyn ServerHost, placer: Option<PlayerRef>, stack: &ItemStack) {
+    let Some(player) = placer else {
+        return;
+    };
+    let Some(slot) = held_slot(&*host, &player, Hand::Main) else {
+        return;
+    };
+    let Some(patch) = stack.components() else {
+        return;
+    };
+    let mut patch = patch.as_nbt().clone();
+    let Some(Tag::Compound(data)) = field(&patch, BLOCK_ENTITY_DATA) else {
+        return;
+    };
+    let kept = without_key(data, CONTENTS_KEY);
+    if kept.iter().all(|(key, _)| key.to_string_lossy() == "id") {
+        // This port's list was all the component held: the whole component goes,
+        // and an empty patch is the right answer (it clears the stack's
+        // components) — not a reason to leave the payload on it.
+        patch = without_key(&patch, BLOCK_ENTITY_DATA);
+    } else {
+        patch.insert(BLOCK_ENTITY_DATA.into(), Tag::Compound(kept));
+    }
+    let mut stripped = stack.clone();
+    if stripped.set_components(patch).is_err() || stripped == *stack {
+        return;
+    }
+    let _ =
+        host.transaction(|host, _tx| player.set_inventory_slot(host, slot, Some(stripped.clone())));
+}
+
+/// A compound without `name`, in the order it had.
+fn without_key(data: &Compound, name: &str) -> Compound {
+    data.iter()
+        .filter(|(key, _)| key.to_string_lossy() != name)
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect()
+}
+
 // --- the port's cross-hook state ------------------------------------------
 
 /// Everything in the cache is derived from loaded blocks and their block
@@ -2526,6 +2848,20 @@ struct Core {
     /// counter the energy readout prints, so a fall over N ticks can be checked
     /// against N ticks rather than against a wall clock.
     ticks: u64,
+    /// The slots a machine broken this tick held, waiting for that break's own
+    /// `block_drops` (slice 10). One entry: two player breaks cannot interleave
+    /// inside one `destroyBlock`.
+    carried: Option<Carried>,
+}
+
+/// What a broken machine's drop carries: where it broke, which tick, and the
+/// slots it held — already in the item NBT `block_drops` puts on the drop,
+/// because that hook has no game host to convert a stack with.
+struct Carried {
+    dimension: String,
+    pos: [i32; 3],
+    tick: u64,
+    slots: Vec<(u32, Compound)>,
 }
 
 static CORE: Mutex<Option<Core>> = Mutex::new(None);

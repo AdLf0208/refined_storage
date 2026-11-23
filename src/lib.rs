@@ -25,9 +25,10 @@ mod runtime;
 mod support;
 
 use mod_api::{
-    self, ComponentTypesEvent, Flow, Hooks, HostSide, MenuClickedEvent, MenuClosedEvent,
-    RegisterCommandsEvent, Registrar, RegistrationContext, RightClickBlockEvent,
-    RunModCommandEvent, ServerHost, ServerStartedEvent, ServerTickEvent, WorldLifecycleEvent,
+    self, BlockDropsEvent, BreakBlockEvent, ComponentTypesEvent, Flow, Hooks, HostSide, LevelHost,
+    MenuClickedEvent, MenuClosedEvent, RegisterCommandsEvent, Registrar, RegistrationContext,
+    RightClickBlockEvent, RunModCommandEvent, ServerHost, ServerStartedEvent, ServerTickEvent,
+    WorldLifecycleEvent,
 };
 
 /// The mod holds no state of its own: everything the network needs is derived
@@ -65,6 +66,19 @@ impl Hooks for Mod {
     /// slot; every other click is the block's own (the menu opens).
     fn right_click_block(&self, host: HostSide<'_>, event: &mut RightClickBlockEvent<'_>) -> Flow {
         support::on_right_click_block(host, event)
+    }
+
+    /// A player breaks a block: a machine's own slots leave its block entity
+    /// before the removal, so its item carries them instead of the engine
+    /// spilling them onto the ground.
+    fn break_block(&self, host: &mut dyn ServerHost, event: &mut BreakBlockEvent<'_>) -> Flow {
+        support::on_break_block(host, event)
+    }
+
+    /// A block's drops are built: a machine carries the slots taken at the
+    /// break on its own item.
+    fn block_drops(&self, level: &dyn LevelHost, event: &mut BlockDropsEvent<'_>) -> Flow {
+        support::on_block_drops(level, event)
     }
 
     /// `/refinedstorage info|filter|wireless|bound`.

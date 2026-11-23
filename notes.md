@@ -19,13 +19,14 @@ the network; no entities, renderers, dimensions or new vanilla hooks.
 Ported now because it is the **#1 core base** of the core-first queue: 13
 pending ATM10 mods depend on it (`ports/tools/port_queue.py`).
 
-Status: **slice 9 — the wireless grid's own item buffer (0.2.9)** — the network core of slice 1, the
+Status: **slice 10 — a broken machine carries its own slots (0.2.10)** — the network core of slice 1, the
 crafting chain of slice 2, the finite-range, same-dimension transmitter of slice 3, the item that
 asks its admission (slice 4), the promise table keyed by network (slice 5), the transmitter's four
 upgrade slots with the range and creative range upgrades (slice 6), the two transfer machines with
-the speed and stack upgrades (slice 7), the network's energy model (slice 8), and now the grid item's
-own 1,000 FE buffer: 5 FE per open, per deposit and per withdrawal, through the item energy
-capability. Everything else is the gap list below, not a claim.
+the speed and stack upgrades (slice 7), the network's energy model (slice 8), the grid item's
+own 1,000 FE buffer (slice 9), and now the block drops: an importer, an exporter or a wireless
+transmitter broken in survival keeps its filter entries and upgrades on its own item, so they come
+back when it is placed again instead of vanishing. Everything else is the gap list below, not a claim.
 
 > The sections from `## Behaviour` to `### Verification after the repairs`
 > describe the **retired `.hnmod`** layout. They are kept as history: the
@@ -2307,4 +2308,210 @@ Evidence: `ports/_shared/evidence/refinedstorage/` — `plan-slice9-item-energy.
 `e2e-slice9-green.log` (green), `e2e-slice9-control.log`, `e2e-slice9-selftest-itemenergy.log`,
 `e2e-slice9-selftest-energy.log`, `e2e-slice9-selftest-networks.log`, and
 `launcher-build-0.2.9.log` (`Compiling refinedstorage (1 of 1)`, `native-0a875da-a3aab5050286` — the
+build every leg ran on).
+
+## Slice 10 — a broken machine carries its own slots (2026-11-23) — version 0.2.10
+
+### The gap lines this slice answers (verbatim)
+
+- §"Slice 6" coverage: *"the transmitter's upgrade drops when the block is broken | **not ported** —
+  the game's mod block entity drops an empty item (ARCHITECTURE §3's `block_drops` route is the fix, a
+  later slice)"*.
+- §"Slice 7" deviation 5: *"The machines' upgrade slots drop nothing when the block is broken … A
+  filter item held in a filter slot is lost the same way."*
+
+### What the pin actually does (measured, not assumed)
+
+1. **The engine spills a mod block entity's declared container and drops the block's item empty.**
+   `horizon-client/src/game/spill.rs::Pending::record` / `remove_entity` treats a
+   `BlockEntity::Mod(m)` with `!m.items.is_empty()` and a declared `mod_container(state)` as
+   `PreRemove::Contents`: every non-empty slot becomes an item entity. The block's own drop is built
+   from its loot table and never learns the slots, because `block_entity_nbt::canonical()` answers
+   `None` for a mod type id, so vanilla's `minecraft:block_entity_data` is never merged into the
+   placed block entity.
+2. That is visible in this port's own earlier log: `e2e-slice7-green.log:628`
+   `exporter drops: {"minecraft:gold_ingot":1,"refinedstorage:exporter":1}` — slice 7's "the filter
+   item is lost" was wrong; the filter **spilled**. What was lost is the *machine*: the item that
+   dropped carried nothing, so a re-placed machine was empty.
+3. **Upstream RS2 v2.0.9** (`BlockEntityWithDrops.getDrops()`,
+   `AbstractImporterBlockEntity.getDrops()` → `upgradeContainer.getDrops()`): the four upgrades leave
+   with the block item and the ghost filter container drops nothing. This port's filter slots hold
+   real items (its deviation 1), so they travel too.
+
+### What was implemented
+
+- **`Hooks::break_block`** (server, before the removal): for an importer, exporter or wireless
+  transmitter in a **non-creative** break, read the block entity's own slots, clear them in one
+  transaction, and read them back. Only a verified-empty container records a carry; a refused write
+  records nothing and the engine's ordinary spill stays the fallback — never both. Creative is skipped
+  because a creative break drops no loot at all, so clearing would destroy the contents.
+- **`Hooks::block_drops`** (server, level-read host): put a **fresh** payload on the block's own drop
+  — `{id: "refinedstorage:network", RefinedStorageContents: [{Slot, id, count, components}]}` under
+  vanilla `minecraft:block_entity_data`. It never copies the pre-removal snapshot (its `Items` list is
+  what the engine already spilled) and never writes a raw `Items` list: a whole-compound copy is
+  exactly the duplication that failed `actuallyadditions` #1557 in review, where the machine's
+  inventory rode on the item twice.
+- **`ItemPart::on_block_placed_by`** on the three items: read the placed stack's
+  `minecraft:block_entity_data`, require its `id` to be this block entity's type, clamp the list to the
+  container (`runtime::restore`) and write each slot in one transaction, then strip the payload from
+  the held stack so a creative placement cannot restore it a second time. The restore lives here, not
+  in the engine's component merge, because `canonical()` answers `None` for a mod type id.
+- A pending carry that no drop consumed is pruned on `server_tick` after `CARRY_TTL` (4 ticks), so a
+  later break at the same position can never inherit it.
+
+### The rules as tests (red first)
+
+`runtime.rs`: `Kind::carries_contents()` (importer/exporter/transmitter yes; controller, cable, drive,
+grid no — a drive's disks spill as items, as upstream drops them), `Kind::own_slots()` (13/13/4/0),
+`carry()` (only non-empty slots, each with its index; `None` for an empty container) and `restore()`
+(an index at or past the container is dropped, a slot named twice keeps its first entry).
+
+### Red proof — verbatim, before the glue
+
+`cargo test --offline`, 2026-11-22 08:24, `runtime-red-slice10-drops.log`
+(`ports/_shared/evidence/refinedstorage/runtime-red-slice10-drops.log`):
+
+```
+---- runtime::tests::the_slot_counts_are_what_the_content_registers stdout ----
+thread 'runtime::tests::the_slot_counts_are_what_the_content_registers' (1674503) panicked at src/runtime.rs:2970:9:
+assertion `left == right` failed: nine filters, four upgrades
+  left: 0
+ right: 13
+
+failures:
+    runtime::tests::a_doctored_carried_list_cannot_reach_past_the_container
+    runtime::tests::a_machines_slots_travel_on_its_item_and_a_drives_do_not
+    runtime::tests::an_empty_machine_carries_nothing
+    runtime::tests::the_slot_counts_are_what_the_content_registers
+
+test result: FAILED. 94 passed; 4 failed; 0 ignored; 0 measured; 0 filtered out
+```
+
+The four new tests failed against the stubs and pass after the implementation (98 total).
+
+### Green — the ladder and the in-game leg (one launcher build at `0a875da`)
+
+| Step | Command | Result |
+|---|---|---|
+| runtime + glue tests | `rm -f Cargo.lock && cargo test` | **98 passed**, 0 failed (`sdk-test.log`, 0.2.10) |
+| lints | `cargo clippy --all-targets --locked --offline -- -D warnings` | exit 0, **0 warnings** (`sdk-clippy.log`) |
+| formatting | `rustfmt --edition 2024 --check src/{lib,support,runtime}.rs` | clean, exit 0 (`sdk-fmt.log`) |
+| SDK check | `cargo horizon-mod check` | *"Refined Storage uses 643 items of the API (5 Part kinds, 1 associated item, 5 capabilitys, 188 fields or variants, 23 hooks, 58 hook arguments, 2 macros, 195 methods, 33 traits, 133 types). Made for 0a875da."* (`sdk-check-0.2.10.log`) |
+| package | `rm -f Cargo.lock && cargo horizon-mod build` ×2 | **byte-identical** (`cmp`, `CMP_EXIT:0`), **203,749 B**, SHA-256 `41c9810a2d6c33a032abc935cad389b56ec5330cfb34141847c620cf017ba922`, **244 entries**, no `Cargo.lock` (`sdk-build-0.2.10-{1,2}.log`, `sdk-build-0.2.10-cmp.log`) |
+| package check | `cargo horizon-mod check refinedstorage.hmod` | `0.2.10 (native-mod, format native-1/0a875da…/e59da909…, for 26.3) 203749 bytes`, `CHECK_FILE_EXIT:0` |
+| fits (pin) | `… fits refinedstorage.hmod --build 0a875da` | `0a875da  made for`, `FITS_PIN_EXIT:0` |
+| fits (other build) | `… fits refinedstorage.hmod --build 0b14f8a` | `0b14f8a  fits`, `FITS_OTHER_EXIT:0` (both in `sdk-check-fits-0.2.10.log`) |
+| launcher build | `launcher-game.sh build refinedstorage --rebuild` | exit 0, **`Compiling refinedstorage (1 of 1)`**, `native-0a875da-3bdf09dd1977` (`launcher-build-0.2.10.log`) |
+| in-game leg | `build-slot.sh run … --step e2e -- tools/e2e.sh` | **PASS** + **`EXIT:0`** (`e2e-slice10-green.log`) |
+| control (same Nightly, no package) | `GAME=$CONTROL_GAME …` | **FAIL** + **`EXIT:1`** — *"the block at 41,64,1 is minecraft:air, expected facing=north"* (`e2e-slice10-control.log`) |
+| counterfactual (this slice) | `SELFTEST=drops …` | **FAIL** + **`EXIT:1`** — *"the re-placed importer carried its slots back ([…4 speed…, stack…, dirt]); the empty drop it used to have is gone"* (`e2e-slice10-selftest-drops.log`) |
+| selftest (slice-8 network gate) | `SELFTEST=energy …` | **FAIL** + **`EXIT:1`** — *"… got 'Wireless access at 46,64,20: refused (not enough energy: 0 of 16 FE)'"* (`e2e-slice10-selftest-energy.log`) |
+| selftest (slice-5 promise rule) | `SELFTEST=networks …` | **FAIL** + **`EXIT:1`** — *"the grid's view is [{"count":3,"item":"minecraft:gold_ingot","slot":300}], expected []"* (`e2e-slice10-selftest-networks.log`) |
+| selftest (slice-9 item gate) | `SELFTEST=itemenergy …` | **FAIL** + **`EXIT:1`** — *"expected the 0-FE deposit to have moved the stack, it is still in the inventory"* (`e2e-slice10-selftest-itemenergy.log`) |
+| log gate | `check-e2e-logs.py refinedstorage-e2e --strict` | `logs=47 ok=47 missing-exit=0 bad-exit=0` |
+| package gate | `verify-sdk-package.py refinedstorage` | **1/1** |
+
+The new phase, quoted from `e2e-slice10-green.log` (the slice-7 machine network at z=16; the importer
+at 43,64,16 filled directly, broken in survival, picked up and placed back):
+
+```
+== a broken machine carries its own slots on its item ==
+  importer before the break: [{"slot":0,...speed_upgrade},{"slot":1,...speed_upgrade},{"slot":2,...speed_upgrade},{"slot":3,...speed_upgrade},{"slot":4,...stack_upgrade},{"slot":5,"item":"minecraft:dirt"}]
+  importer drops: {"refinedstorage:importer":1}
+  block(43,64,16): refinedstorage:importer[facing=down,open=false]
+  importer after the re-place: [{"slot":0,...speed_upgrade},{"slot":1,...speed_upgrade},{"slot":2,...speed_upgrade},{"slot":3,...speed_upgrade},{"slot":4,...stack_upgrade},{"slot":5,"item":"minecraft:dirt"}]
+  importer after a creative re-place: [{"slot":0,...speed_upgrade},{"slot":1,...speed_upgrade},{"slot":2,...speed_upgrade},{"slot":3,...speed_upgrade},{"slot":4,...stack_upgrade},{"slot":5,"item":"minecraft:dirt"}]
+  importer after placing the stripped item again: []
+== a broken transmitter carries its four upgrade slots ==
+  transmitter before the break: [{"slot":0,...range_upgrade},{"slot":1,...range_upgrade},{"slot":2,...range_upgrade},{"slot":3,...range_upgrade}]
+  transmitter drops: {"refinedstorage:wireless_transmitter":1}
+  transmitter after the re-place: [{"slot":0,...range_upgrade},{"slot":1,...range_upgrade},{"slot":2,...range_upgrade},{"slot":3,...range_upgrade}]
+```
+
+(`...` abbreviates `"count":1,"item":`; the log has the full objects.) The differentials:
+
+- **The drops list is the non-duplication proof.** Before this slice the same break answered
+  `{"minecraft:gold_ingot":1,"refinedstorage:exporter":1}` (`e2e-slice7-green.log:628`); now the break
+  answers `{"refinedstorage:importer":1}` — the six slot items are on the item *and* nowhere else. The
+  phase asserts `drops[<each of the six>] == 0` item by item, so a payload that also spilled cannot
+  pass.
+- **The re-place assertion is index-exact.** `slots_indexed` reads `slot` as well as `item`/`count`, so
+  a payload that restored the six items into the first free slots (0..5 in a different order) would
+  fail: slot 4 must still be the stack upgrade and slot 5 the dirt.
+- **The creative round is the anti-duplication proof for a kept stack.** A creative placement keeps
+  the item in hand, so the phase breaks the machine again, picks the payload item up **in creative**,
+  places it (restores the six), removes the block and places the *same* item a second time — the last
+  line is `[]`. Without `strip_contents` the second machine lists the six again, which is the
+  duplication that failed `actuallyadditions` #1557 in review.
+- **`SELFTEST=drops`** asserts the *old* answer (an empty re-placed machine) and fails on this build,
+  which is what makes the assertion fail-capable.
+- The control run (the same Nightly with no package) fails at the first phase, so the leg is not
+  passing on the engine alone.
+
+### Port defect found by this slice's own leg (fixed here, not upstream's)
+
+The first green run failed at the creative round with
+*"the same item restored its slots a second time … the payload was not taken off the stack"*: a
+creative placement restored the six slots once, and the item still carried them, so placing it again
+restored a second machine. The cause was a guard in `strip_contents` — when this port's list was the
+whole `minecraft:block_entity_data` value, stripping it left an **empty** component patch and the
+function returned instead of writing the stripped stack. An empty patch is the right answer (it clears
+the stack's components); removing that early return fixed it, and the assertion above is the proof
+(`importer after placing the stripped item again: []`).
+
+### Deviations and limits (recorded, not hidden)
+
+1. **A creative break carries nothing.** `playerDestroy` is skipped in creative, so no loot is built
+   and clearing the slots would destroy them; the engine's own spill still happens there (the
+   contents fall out, the item is empty). Upstream drops them in creative too; a creative break is a
+   build action, not a player keeping a machine.
+2. **Only a player's break carries.** A piston, an explosion, `setblock … destroy` and a mob break go
+   through the engine's spill (items on the ground, empty item), exactly as before this slice.
+3. **A carry waits four ticks for its drop.** The pending entry is keyed by dimension and position and
+   pruned on `server_tick`; a break whose `block_drops` never runs (a cancelled destruction) leaves
+   the slots out of the world — the same outcome the engine gave, not a duplication.
+4. **The payload is this port's own key.** `RefinedStorageContents` under `minecraft:block_entity_data`
+   is a harness-side shape (the pin has no `BlockEntityWithDrops` API and merges no mod block entity
+   data); a stack from another port's workspace cannot forge it without naming this block entity's id.
+5. **The drive is unchanged.** Its nine disks spill as items, as upstream's `DiskDriveBlockEntity`
+   drops them; the item is the drive, not the disks.
+
+### Coverage (parity rule) — every family this slice ships
+
+| family | state |
+|---|---|
+| the importer's 13 slots on a survival break | **tested** — four speed upgrades, a stack upgrade and a dirt entry are all listed after `ctl break`, at their own indices, and none is in `.drops` |
+| the exporter's 13 slots | **tested** — the same `break_block`/`block_drops` route (the kind check names both); the slice-7 phase's exporter filter now travels (its drop answer no longer lists the gold) |
+| the transmitter's 4 upgrade slots | **tested** — four range upgrades listed before and after the break, none spilled |
+| restore on placement | **tested** — pickup, `ctl place` at the same position, `ctl container` lists every slot where it was |
+| the item is not duplicated | **tested** — `.drops` has the block item only; the counterfactual (`SELFTEST=drops`) fails |
+| a creative placement cannot restore twice | **tested** — the same payload item picked up and placed in creative restores once and is stripped; placing it again yields an empty machine (`importer after placing the stripped item again: []`) |
+| a doctored slot index | **tested** — `restore` drops an index at or past the container (unit test `a_doctored_carried_list_cannot_reach_past_the_container`) |
+| a non-player break (piston, explosion, `setblock destroy`) | **not ported** — engine spill, recorded above as deviation 2 |
+| a creative break | **not ported** — recorded above as deviation 1 |
+| the exporter's creative round | **not tested** — the three items share one Part and one code path, which the importer's round exercises; the exporter's survival break is tested |
+
+### Harness facts learned here
+
+- **`ctl place` right-clicks, and a click that lands on the placed machine opens its menu.** The next
+  blocking command then answers `{"error":"the dead screen is open; close it first"}` once the block is
+  gone (the menu outlives the block). Every `ctl place` in this phase is followed by
+  `ctl close … || true`.
+- **`ctl container X Y Z ITEM 1` fills the first *empty* slot, one call one slot** — it does not merge
+  stacks, which is what lets the phase put four upgrades in four named slots and assert their indices
+  instead of their count.
+- **A dropped item is picked up by standing on its block position** (`tp` to the centre, `wait 20` for
+  the 10-tick pickup delay), including in creative — a payload item can only be obtained by breaking
+  the machine, never by `ctl give`.
+
+Skills: superpowers/using-superpowers,brainstorming,writing-plans,test-driven-development,systematic-debugging,verification-before-completion; BeautifulRust/rust-best-practices
+
+Evidence: `ports/_shared/evidence/refinedstorage/` — `plan-slice10-drops.md`,
+`runtime-red-slice10-drops.log`, `sdk-test.log`, `sdk-clippy.log`, `sdk-fmt.log`,
+`sdk-build-0.2.10-{1,2}.log`, `sdk-build-0.2.10-cmp.log`, `sdk-check-0.2.10.log`,
+`sdk-check-fits-0.2.10.log`, `refinedstorage.hmod` (the delivered bytes) — and
+`ports/_shared/evidence/refinedstorage-e2e/` — `e2e-slice10-green.log`, `e2e-slice10-control.log`,
+`e2e-slice10-selftest-drops.log`, `e2e-slice10-selftest-networks.log`,
+`e2e-slice10-selftest-energy.log`, `e2e-slice10-selftest-itemenergy.log`, and
+`launcher-build-0.2.10.log` (`Compiling refinedstorage (1 of 1)`, `native-0a875da-3bdf09dd1977` — the
 build every leg ran on).
