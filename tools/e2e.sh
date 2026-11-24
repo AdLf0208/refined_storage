@@ -93,7 +93,9 @@
 # fails now that it is; SELFTEST=payload asserts the unit that was not placed
 # lost its payload (its machine comes back empty), so the run fails now that it
 # is kept; SELFTEST=break asserts a creative break carried its slots (spilled
-# none), so the run fails now that the engine's spill is left intact.
+# none), so the run fails now that the engine's spill is left intact;
+# SELFTEST=relay asserts the old no-relay answer (0 items on the output network)
+# after the working relay has passed the input disk's 8, so the run fails.
 #
 # Slice 8 (the controller's energy model):
 #  - the controller's buffer is 1,000 FE, its `energy_type` is upstream's four
@@ -247,6 +249,19 @@ ctl() {
     esac
     sleep 1
     if out=$(ctl_raw "$@"); then printf '%s\n' "$out"; return 0; fi
+    case "$out" in
+        *screen*) ctl_raw close >/dev/null 2>&1 || true ;;
+    esac
+    # More tries under a loaded box (10 concurrent games were measured here): a
+    # wrong answer is still compared, so an extra attempt only absorbs a dropped
+    # socket read, never weakens a proof.
+    for attempt in 1 2 3; do
+        sleep 2
+        if out=$(ctl_raw "$@"); then printf '%s\n' "$out"; return 0; fi
+        case "$out" in
+            *screen*) ctl_raw close >/dev/null 2>&1 || true ;;
+        esac
+    done
     printf '%s\n' "$out"
     return 1
 }
@@ -474,7 +489,7 @@ launch() {
     cd "$SCRATCH"
     "$CTL" --socket "$SOCK" launch \
         --game "$GAME" --world "$WORLD" --seed 20261105 --creative --offscreen --wait \
-        --resources "$RES" >/dev/null
+        --resources "$RES" >"$SCRATCH/game-console.log" 2>&1
     ctl wait-ready 120
     ctl wait 40
 }
@@ -494,6 +509,11 @@ arena() {
     ctl command "execute in minecraft:the_end run fill 32 63 -8 56 63 24 minecraft:stone"
     ctl command "execute in minecraft:the_end run fill 32 64 -8 56 74 24 minecraft:air"
     ctl command "execute in minecraft:the_end run kill @e[type=item]"
+    # The End dragon otherwise flies through the arena and kills the player in
+    # the middle of unrelated phases (measured as intermittent FAILs under a
+    # loaded box). The arena is far from the exit podium, so removing it cannot
+    # trigger the end credits; no assertion in this leg names the dragon.
+    ctl command "execute in minecraft:the_end run kill @e[type=minecraft:ender_dragon]" >/dev/null 2>&1 || true
     ctl wait 20
 }
 
@@ -2711,6 +2731,100 @@ ctl command "data merge block 50 63 20 {Items:[]}" >/dev/null
 ctl wait 2
 ctl command "execute in minecraft:the_end run tp @s 40.5 64 3.5"
 
+echo "== the relay: two networks in one block, storage passed input to output =="
+# Slice 16, from §"Gaps / deviations (slice 1)" item 2: *"… interfaces, relays, …"*.
+# The 2.0.9 artefact has two nodes in one block: RelayInputNetworkNode joins every
+# face but its output face, RelayOutputNetworkNode only that face, and both cost
+# 8 FE/tick. With storage pass-through on, network B sees A's storage as its own.
+# A fresh arena row at z=19 keeps every earlier phase's network untouched
+# (z=12 already carries an earlier phase's controller, cable, drive and grid).
+ctl command "clear @s" >/dev/null
+net minecraft:the_end 32 64 19
+relay_charge() { charge_net; charge minecraft:the_end 38 64 19; }
+ctl command "execute in minecraft:the_end run setblock 32 64 19 refinedstorage:controller"
+ctl command "execute in minecraft:the_end run setblock 33 64 19 refinedstorage:cable"
+ctl command "execute in minecraft:the_end run setblock 34 64 19 refinedstorage:disk_drive"
+ctl command "execute in minecraft:the_end run setblock 35 64 19 refinedstorage:cable"
+ctl command "execute in minecraft:the_end run setblock 36 64 19 refinedstorage:relay[facing=east,pass_storage=true]"
+ctl command "execute in minecraft:the_end run setblock 37 64 19 refinedstorage:cable"
+ctl command "execute in minecraft:the_end run setblock 38 64 19 refinedstorage:controller"
+ctl command "execute in minecraft:the_end run setblock 39 64 19 refinedstorage:disk_drive"
+ctl command "execute in minecraft:the_end run setblock 40 64 19 refinedstorage:grid"
+ctl wait 16
+charge minecraft:the_end 32 64 19
+# A's disk holds 3 gold and 5 diamonds; B's own disk is empty. Only the relay can
+# put A's eight items on B's network.
+ctl command "data merge block 34 64 19 {Items:[{Slot:0b,id:\"refinedstorage:1k_storage_disk\",count:1,components:{\"refinedstorage:storage\":{capacity:1024,stacks:[{id:\"minecraft:gold_ingot\",count:3},{id:\"minecraft:diamond\",count:5}]}}}]}"
+ctl command "data merge block 39 64 19 {Items:[{Slot:0b,id:\"refinedstorage:1k_storage_disk\",count:1,components:{\"refinedstorage:storage\":{capacity:1024,stacks:[]}}}]}"
+ctl wait 8
+relay_charge
+expect_state 36 64 19 "active=true"
+expect_reply "refinedstorage info 36 64 19" "storage pass-through on"
+expect_reply "refinedstorage info 36 64 19" "8 FE/tick per node"
+expect_info 32 64 19 "8 items in 2 resources"
+expect_info 37 64 19 "8 items in 2 resources"
+echo "  the output network totals the input disk's 8 items through the relay while its own disk is empty"
+# The differential: the counterfactual asserts today's (pre-slice) answer — a
+# network with its own empty disk totals 0 — after the working relay has put 8
+# there. It fails now, so the positive assertion can fail.
+if [ "$SELFTEST" = relay ]; then
+    echo "(selftest: asserting the old no-relay answer — 0 items on the output network)"
+    [ "$(net_items 37 64 19)" = 0 ] \
+        || fail "expected the old no-relay answer (0 items), got $(net_items 37 64 19); storage passed through"
+fi
+# A grid on B lists what the relay exposes, not what B's drive holds.
+ctl command "execute in minecraft:the_end run tp @s 40.5 64 20.5"
+ctl wait 4
+relay_charge
+ctl interact 40 64 19
+ctl wait 8
+expect_slots '[{"slot":300,"item":"minecraft:gold_ingot","count":3},{"slot":301,"item":"minecraft:diamond","count":5}]'
+ctl wait 4
+# Withdraw the 3 gold through B's grid: they leave A's disk (the input network
+# loses them), B's own disk still holds nothing, and the player receives them.
+gold_view=$(ctl screen | jq -r '[.slots[] | select(.item == "minecraft:gold_ingot")][0].slot // empty')
+[ -n "$gold_view" ] || fail "no gold in the output network's grid view: $(ctl screen | jq -c '[.slots[] | select(.item != null)]')"
+relay_charge
+ctl click-slot "$gold_view" shift
+ctl wait 8
+relay_charge
+[ "$(net_items 32 64 19)" = 5 ] || fail "the input network did not lose the 3 gold: $(net_items 32 64 19)"
+[ "$(net_items 37 64 19)" = 5 ] || fail "the output network did not follow the withdrawal: $(net_items 37 64 19)"
+[ "$(count_of minecraft:gold_ingot)" = 3 ] || fail "the withdrawn gold did not reach the inventory: $(ctl inventory | jq -c '[.hotbar // [], .main // []]')"
+echo "  a withdrawal through the output grid took the 3 gold from the input disk, not from B's empty one"
+# Deposit them back through the same grid: a relay storage is first in B's list,
+# so the gold returns to A's disk while B's own disk stays empty.
+gold_slot=$(inv_slot minecraft:gold_ingot)
+[ -n "$gold_slot" ] || fail "no gold in the inventory to deposit back"
+ctl click-slot "$gold_slot" shift
+ctl wait 8
+relay_charge
+expect_slots '[{"slot":300,"item":"minecraft:gold_ingot","count":3},{"slot":301,"item":"minecraft:diamond","count":5}]'
+expect_info 32 64 19 "8 items in 2 resources"
+expect_drive 39 64 19 "slot 0: refinedstorage:1k_storage_disk 0/1024 items"
+ctl close
+ctl wait 4
+echo "  the deposit returned to the input disk; the output network's own disk stayed empty"
+# Differential: turn pass-storage off on the same block. B's grid now totals 0
+# although A still holds eight: an unconfigured relay moves nothing.
+expect_reply "refinedstorage relay 36 64 19 off" "storage pass-through off"
+ctl wait 8
+relay_charge
+expect_info 37 64 19 "0 items in 0 resources"
+[ "$(net_items 32 64 19)" = 8 ] || fail "turning pass-storage off changed the input network's stock"
+echo "  pass-through off: the output network sees nothing while the input keeps its 8"
+# Break the relay with pass-through on: the exposure stops exactly as upstream's
+# updateComponents removes the delegated component when the node leaves.
+expect_reply "refinedstorage relay 36 64 19 on" "storage pass-through on"
+ctl wait 4
+ctl command "execute in minecraft:the_end run setblock 36 64 19 minecraft:air"
+ctl wait 10
+relay_charge
+expect_info 37 64 19 "0 items in 0 resources"
+[ "$(net_items 32 64 19)" = 8 ] || fail "breaking the relay lost the input network's stock"
+echo "  relay broken: the output network sees nothing; breaking reverses the transfer"
+ctl command "execute in minecraft:the_end run tp @s 40.5 64 3.5"
+
 echo "== the disk keeps its contents across a relaunch =="
 net minecraft:the_end 40 64 0
 ctl command "execute in minecraft:the_end run tp @s 42.5 64 2.5"
@@ -2833,5 +2947,5 @@ echo "  the hand after charging a stick: $stick"
 case "$stick" in
     *"refinedstorage:energy"*) fail "a charge wrote an energy component onto a stick: $stick" ;;
 esac
-echo "PASS: the wireless transmitter joined its network through the facing side only (offline facing away, active facing the cable), /refinedstorage info named it and its range 16 blocks, a use 2.5 blocks away and one exactly 16 blocks away were accepted, 17 blocks away was refused naming the distance, an offline transmitter refused and a position without one answered so, a use from the End against the overworld transmitter was refused as a different dimension while the same command under execute in was accepted, the item placed against the clicked face and the block dropped itself, every carried recipe crafts in game with its declared output and count (40 now, each with its wrong-ingredient control), the machine casing places, reads back and drops itself, the wireless grid is unbound until it is used on a transmitter and then names it (dimension and position in its own component), a use inside the range opens the network's 9x6 view with 54 slots, a shift-click in the player inventory deposits 5 diamonds on the network and a shift-click on the view withdraws them back, 17 blocks out is refused naming the distance while 16 blocks out opens the view, the same item and binding is refused as a different dimension from the overworld and accepted in the End, the refinedstorage:wireless advancement is not granted by a transmitter alone and is granted by the grid and a transmitter together, two networks in one dimension each listed their own 3 gold while the other network held 3 too, two grids on one network never offered the same items twice, the cable follows its neighbours and the grid is active with a controller, the disk went into the drive and the grid listed what was deposited through its menu, the search filtered it, a shift-click withdrew the diamonds, breaking the controller took the network offline and putting it back restored the disk's gold, a network without a drive listed nothing, a stick did not enter the drive, a vanilla barrel is not a network block, a range upgrade in the transmitter's own upgrade slot raised its range to 24 blocks so the same 17.0-block use was accepted and the wireless grid opened its view naming 24 blocks, the transmitter's four-slot menu showed the upgrade and refused a diamond, a creative range upgrade gave unlimited range (70.5 blocks out accepted, another dimension still refused), the importer turned on its network moved 3 items in 20 ticks without an upgrade and emptied its source in one pass with a stack upgrade (64 in 20 ticks), four speed upgrades made the same 20 ticks move a stack and /refinedstorage info named the upgrade counts and the work interval (9 ticks down to 1), its filter blocked the resource it names while an empty filter imported everything, the exporter moved exactly the 4 gold its filter names into the chest it faces and an exporter with no filter moved nothing, a machine menu showed its 13 slots and its upgrade row refused a diamond, both machine items were given and read back, both machine blocks dropped themselves, the wireless grid's own 1,000 FE buffer fell by exactly 5 on the open, 5 on a deposit and 5 on a withdrawal with no drift over ticks, and at 0 item FE the same deposit was refused for the item's energy while the network stayed online and still printed its own energy line, a survival break of the importer carried its four speed upgrades, its stack upgrade and its dirt filter entry on the item with none of them spilled beside it and the re-placed machine listed every slot where it was, a broken transmitter's four range upgrades travelled the same way, a 4k disk cut a saved 5,000-item component to its own 4,096 and refused the 4,097th item deposited through the grid while its total stayed 4,096 over a 20-tick window, a 16k disk held 16,384 and a 64k disk 65,536, the creative disk took the same 1-item deposit the full 64k disk refused and kept ingesting past 65,536 with its readout saying unlimited, a 4k disk holding 4,096 cobblestone and a 16k storage part made a 16k disk in a crafting table with the 4k disk's contents and the destination's 16,384-item room, the 4k disk was consumed and its own 4k part came back in the cell it left, the crafted disk read 4096/16384 items in the drive and the network totalled 4,096, and the 1k disk's 3 gold and a 4k disk's 4,096 items both kept their contents across a relaunch, placing one of a stack of two payload importers left one item in the hand still carrying its own payload and each placement made a machine with all six slots where they were, a creative break spilled all five slot items on the ground, dropped no machine item and left no importer behind, and /refinedstorage charge and /refinedstorage energy were refused for a level-0 LAN guest that ran the mod's own level-0 info command first, without moving either buffer, while the owner's charge worked and a stick was refused as not a wireless grid with no energy component written, an external storage facing a chest with 8 stones made a grid list them next to an empty disk, a 5-gold deposit through the grid landed in that chest and a withdrawal took it back out, and removing the block or its faced chest dropped exactly the chest's remaining stock from the network while a fresh chest restored all 8, an interface with a diamond in its filter moved the five diamonds from the disk into its nine-slot buffer in one work tick and a hopper beneath the interface listed all five through the ITEMS capability, an unconfigured interface moved nothing, breaking the interface stopped the transfer while a freshly seeded disk kept its five, and re-placing it without a filter still moved nothing"
+echo "PASS: the wireless transmitter joined its network through the facing side only (offline facing away, active facing the cable), /refinedstorage info named it and its range 16 blocks, a use 2.5 blocks away and one exactly 16 blocks away were accepted, 17 blocks away was refused naming the distance, an offline transmitter refused and a position without one answered so, a use from the End against the overworld transmitter was refused as a different dimension while the same command under execute in was accepted, the item placed against the clicked face and the block dropped itself, every carried recipe crafts in game with its declared output and count (41 now, each with its wrong-ingredient control), the machine casing places, reads back and drops itself, the wireless grid is unbound until it is used on a transmitter and then names it (dimension and position in its own component), a use inside the range opens the network's 9x6 view with 54 slots, a shift-click in the player inventory deposits 5 diamonds on the network and a shift-click on the view withdraws them back, 17 blocks out is refused naming the distance while 16 blocks out opens the view, the same item and binding is refused as a different dimension from the overworld and accepted in the End, the refinedstorage:wireless advancement is not granted by a transmitter alone and is granted by the grid and a transmitter together, two networks in one dimension each listed their own 3 gold while the other network held 3 too, two grids on one network never offered the same items twice, the cable follows its neighbours and the grid is active with a controller, the disk went into the drive and the grid listed what was deposited through its menu, the search filtered it, a shift-click withdrew the diamonds, breaking the controller took the network offline and putting it back restored the disk's gold, a network without a drive listed nothing, a stick did not enter the drive, a vanilla barrel is not a network block, a range upgrade in the transmitter's own upgrade slot raised its range to 24 blocks so the same 17.0-block use was accepted and the wireless grid opened its view naming 24 blocks, the transmitter's four-slot menu showed the upgrade and refused a diamond, a creative range upgrade gave unlimited range (70.5 blocks out accepted, another dimension still refused), the importer turned on its network moved 3 items in 20 ticks without an upgrade and emptied its source in one pass with a stack upgrade (64 in 20 ticks), four speed upgrades made the same 20 ticks move a stack and /refinedstorage info named the upgrade counts and the work interval (9 ticks down to 1), its filter blocked the resource it names while an empty filter imported everything, the exporter moved exactly the 4 gold its filter names into the chest it faces and an exporter with no filter moved nothing, a machine menu showed its 13 slots and its upgrade row refused a diamond, both machine items were given and read back, both machine blocks dropped themselves, the wireless grid's own 1,000 FE buffer fell by exactly 5 on the open, 5 on a deposit and 5 on a withdrawal with no drift over ticks, and at 0 item FE the same deposit was refused for the item's energy while the network stayed online and still printed its own energy line, a survival break of the importer carried its four speed upgrades, its stack upgrade and its dirt filter entry on the item with none of them spilled beside it and the re-placed machine listed every slot where it was, a broken transmitter's four range upgrades travelled the same way, a 4k disk cut a saved 5,000-item component to its own 4,096 and refused the 4,097th item deposited through the grid while its total stayed 4,096 over a 20-tick window, a 16k disk held 16,384 and a 64k disk 65,536, the creative disk took the same 1-item deposit the full 64k disk refused and kept ingesting past 65,536 with its readout saying unlimited, a 4k disk holding 4,096 cobblestone and a 16k storage part made a 16k disk in a crafting table with the 4k disk's contents and the destination's 16,384-item room, the 4k disk was consumed and its own 4k part came back in the cell it left, the crafted disk read 4096/16384 items in the drive and the network totalled 4,096, and the 1k disk's 3 gold and a 4k disk's 4,096 items both kept their contents across a relaunch, placing one of a stack of two payload importers left one item in the hand still carrying its own payload and each placement made a machine with all six slots where they were, a creative break spilled all five slot items on the ground, dropped no machine item and left no importer behind, and /refinedstorage charge and /refinedstorage energy were refused for a level-0 LAN guest that ran the mod's own level-0 info command first, without moving either buffer, while the owner's charge worked and a stick was refused as not a wireless grid with no energy component written, an external storage facing a chest with 8 stones made a grid list them next to an empty disk, a 5-gold deposit through the grid landed in that chest and a withdrawal took it back out, and removing the block or its faced chest dropped exactly the chest's remaining stock from the network while a fresh chest restored all 8, an interface with a diamond in its filter moved the five diamonds from the disk into its nine-slot buffer in one work tick and a hopper beneath the interface listed all five through the ITEMS capability, an unconfigured interface moved nothing, breaking the interface stopped the transfer while a freshly seeded disk kept its five, and re-placing it without a filter still moved nothing, a relay bridging two networks in one block passed the input disk's 8 items to the output network while the output disk stayed empty, a withdrawal through the output grid took the 3 gold from the input disk and a deposit returned them there, turning pass-storage off or breaking the relay made the output network total 0 while the input kept its 8"
 # The cleanup trap prints EXIT:<status> as the last line.

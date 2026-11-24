@@ -176,7 +176,7 @@ def main():
         missing menu rather than on a recipe. Three asks, then the failure.
         """
         opened = None
-        for _ in range(3):
+        for _ in range(6):
             opened = ctl("interact", tx, ty, tz)
             ctl.wait(3)
             try:

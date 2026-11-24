@@ -46,6 +46,15 @@ pub const MAX_RANGE_UPGRADES: u32 = 4;
 /// `Integer.MAX_VALUE`, which no finite distance exceeds.
 pub const CREATIVE_RANGE: u32 = i32::MAX as u32;
 
+/// The relay's input-network charge, in FE per tick (upstream
+/// `DefaultEnergyUsage.RELAY_INPUT_NETWORK`). The input node pays it while its
+/// network is online, whether or not anything is passed through.
+pub const RELAY_INPUT_USAGE: u32 = 8;
+/// The relay's output-network charge, in FE per tick (upstream
+/// `DefaultEnergyUsage.RELAY_OUTPUT_NETWORK`). The output node pays it only
+/// while at least one component is delegated — see [`relay_output_usage`].
+pub const RELAY_OUTPUT_USAGE: u32 = 8;
+
 /// The interface's intermediate storage slots (upstream `EXPORT_SLOTS = 9` in
 /// `InterfaceBlockEntity`); its filter has the same nine entries.
 pub const INTERFACE_SLOTS: usize = 9;
@@ -68,6 +77,7 @@ pub enum Kind {
     Exporter,
     ExternalStorage,
     Interface,
+    Relay,
 }
 
 impl Kind {
@@ -83,6 +93,7 @@ impl Kind {
             Kind::Exporter => "refinedstorage:exporter",
             Kind::ExternalStorage => "refinedstorage:external_storage",
             Kind::Interface => "refinedstorage:interface",
+            Kind::Relay => "refinedstorage:relay",
         }
     }
 
@@ -98,6 +109,7 @@ impl Kind {
             Kind::Exporter,
             Kind::ExternalStorage,
             Kind::Interface,
+            Kind::Relay,
         ]
         .into_iter()
         .find(|kind| kind.block_id() == block)
@@ -199,14 +211,22 @@ impl Face {
 pub struct Node {
     pub kind: Kind,
     /// `Some` for a block that joins through one face only (upstream's
-    /// `WirelessTransmitterConnectionStrategy`), `None` for every other block.
+    /// `WirelessTransmitterConnectionStrategy`, or a relay's output node),
+    /// `None` for every other node.
     pub face: Option<Face>,
+    /// `Some` for a block that joins through every face **except** this one
+    /// (upstream's `RelayInputConnectionStrategy`), `None` for every other node.
+    pub except: Option<Face>,
 }
 
 impl Node {
     /// A node that joins on all six sides.
     pub fn plain(kind: Kind) -> Self {
-        Node { kind, face: None }
+        Node {
+            kind,
+            face: None,
+            except: None,
+        }
     }
 
     /// A node that joins through `face` only.
@@ -214,6 +234,17 @@ impl Node {
         Node {
             kind,
             face: Some(face),
+            except: None,
+        }
+    }
+
+    /// A node that joins through every face except `face` (the relay's input
+    /// node, upstream's `RelayInputConnectionStrategy` with pass-through off).
+    pub fn all_but(kind: Kind, face: Face) -> Self {
+        Node {
+            kind,
+            face: None,
+            except: Some(face),
         }
     }
 }
@@ -228,11 +259,41 @@ fn offset(from: [i32; 3], to: [i32; 3]) -> [i32; 3] {
 /// then only when the neighbour on that side is the one asking (upstream's
 /// `canAcceptIncomingConnection`: `incomingDirection == myDirection`).
 fn links(from: Node, to: Node, step: [i32; 3]) -> bool {
-    let leaves = from.face.is_none_or(|face| face.offset() == step);
-    let arrives = to
-        .face
-        .is_none_or(|face| face.offset() == [-step[0], -step[1], -step[2]]);
+    let back = [-step[0], -step[1], -step[2]];
+    let leaves = match from.face {
+        Some(face) => face.offset() == step,
+        None => from.except.is_none_or(|face| face.offset() != step),
+    };
+    let arrives = match to.face {
+        Some(face) => face.offset() == back,
+        None => to.except.is_none_or(|face| face.offset() != back),
+    };
     leaves && arrives
+}
+
+/// The nodes a position contributes to a flood fill. A single node and an
+/// `Option<Node>` convert straight into one; a position with two nodes (a relay
+/// block holds an input and an output node) contributes both.
+pub trait IntoNodes {
+    fn into_nodes(self) -> Vec<Node>;
+}
+
+impl IntoNodes for Node {
+    fn into_nodes(self) -> Vec<Node> {
+        vec![self]
+    }
+}
+
+impl IntoNodes for Option<Node> {
+    fn into_nodes(self) -> Vec<Node> {
+        self.into_iter().collect()
+    }
+}
+
+impl IntoNodes for Vec<Node> {
+    fn into_nodes(self) -> Vec<Node> {
+        self
+    }
 }
 
 /// The six face neighbours of a position, in the order
@@ -269,6 +330,15 @@ impl Network {
         self.nodes.iter().any(|(kind, _)| *kind == Kind::Controller)
     }
 
+    /// Whether this network contains a block at `pos`. A relay block appears in
+    /// both of the networks it bridges, once per node; the node's role is which
+    /// side's network contains its output-face neighbour (the output node's
+    /// connection rule). `/refinedstorage info` at the relay visits both roles,
+    /// so a caller must also deduplicate positions.
+    pub fn contains(&self, pos: [i32; 3]) -> bool {
+        self.nodes.iter().any(|(_, at)| *at == pos)
+    }
+
     /// The block positions of one kind, in visit order.
     pub fn of_kind(&self, kind: Kind) -> impl Iterator<Item = [i32; 3]> + '_ {
         self.nodes
@@ -295,34 +365,34 @@ impl Network {
 /// Flood fill the network `start` belongs to. `at` answers the node at a position
 /// from the world (none for a non-network or unloaded block); `start` itself must
 /// be a network block.
-pub fn network(start: [i32; 3], mut at: impl FnMut([i32; 3]) -> Option<Node>) -> Network {
+pub fn network<N: IntoNodes>(start: [i32; 3], mut at: impl FnMut([i32; 3]) -> N) -> Network {
     let mut out = Network::default();
-    if at(start).is_none() {
+    let start_nodes = at(start).into_nodes();
+    if start_nodes.is_empty() {
         return out;
     }
+    // Identity is (node, position): a relay block holds two distinct nodes at
+    // one position, and only the one a step actually reaches joins the fill.
     let mut seen = std::collections::HashSet::new();
     let mut queue = std::collections::VecDeque::new();
-    seen.insert(start);
-    queue.push_back(start);
-    while let Some(pos) = queue.pop_front() {
-        let Some(node) = at(pos) else {
-            continue;
-        };
+    for node in start_nodes {
+        seen.insert((node, start));
+        queue.push_back((node, start));
+    }
+    while let Some((node, pos)) = queue.pop_front() {
         if out.nodes.len() >= NETWORK_CAP {
             out.truncated = true;
             break;
         }
         out.nodes.push((node.kind, pos));
         for next in neighbours(pos) {
-            if seen.contains(&next) {
-                continue;
-            }
-            let Some(next_node) = at(next) else {
-                continue;
-            };
-            if links(node, next_node, offset(pos, next)) {
-                seen.insert(next);
-                queue.push_back(next);
+            let step = offset(pos, next);
+            for next_node in at(next).into_nodes() {
+                if seen.contains(&(next_node, next)) || !links(node, next_node, step) {
+                    continue;
+                }
+                seen.insert((next_node, next));
+                queue.push_back((next_node, next));
             }
         }
     }
@@ -1591,6 +1661,14 @@ pub const EXTERNAL_STORAGE_USAGE: u32 = 6;
 /// the external storage's 6 is a different node).
 pub const INTERFACE_USAGE: u32 = 4;
 
+/// The output half's charge: upstream's `RelayOutputNetworkNode.getEnergyUsage`
+/// answers the 8 FE only while at least one component is delegated, and 0 when
+/// nothing is passed through. The port delegates storage when the relay is
+/// configured to pass it, so that is the `passing` flag.
+pub fn relay_output_usage(passing: bool) -> u32 {
+    if passing { RELAY_OUTPUT_USAGE } else { 0 }
+}
+
 /// What each upgrade adds to the holder's charge (upstream `SPEED_UPGRADE`,
 /// `STACK_UPGRADE`, `RANGE_UPGRADE` and `CREATIVE_RANGE_UPGRADE`).
 pub const SPEED_UPGRADE_USAGE: u32 = 4;
@@ -1638,6 +1716,10 @@ pub fn usage(kind: Kind, fit: Fit, disks: u32) -> u32 {
         }
         Kind::ExternalStorage => EXTERNAL_STORAGE_USAGE,
         Kind::Interface => INTERFACE_USAGE,
+        // One relay block is two nodes; the tick charges each one separately
+        // (8 input + 8 output while storage is passed). `usage` is the input
+        // node's own charge, matching upstream's `RelayInputNetworkNode`.
+        Kind::Relay => RELAY_INPUT_USAGE,
     }
 }
 
@@ -1805,6 +1887,7 @@ impl Kind {
             | Kind::Grid
             | Kind::ExternalStorage => 0,
             Kind::Interface => INTERFACE_SLOTS * 2,
+            Kind::Relay => 0,
         }
     }
 }
@@ -2214,6 +2297,113 @@ mod tests {
             "the cable's network is the controller and itself"
         );
         assert!(cable.online());
+    }
+
+    // --- the relay (slice 16) ------------------------------------------------
+
+    /// A tiny world with two relay nodes at one position, as `node_at` answers
+    /// for the relay block: an input node joining every face but `output`, and
+    /// an output node joining only `output`.
+    fn relay_world(output: Face) -> impl FnMut([i32; 3]) -> Vec<Node> {
+        move |pos| match pos {
+            [0, 64, 0] => vec![Node::plain(Kind::Controller)],
+            [1, 64, 0] => vec![Node::plain(Kind::Cable)],
+            [2, 64, 0] => vec![
+                Node::all_but(Kind::Relay, output),
+                Node::facing(Kind::Relay, output),
+            ],
+            [3, 64, 0] => vec![Node::plain(Kind::Cable)],
+            [4, 64, 0] => vec![Node::plain(Kind::Controller)],
+            _ => Vec::new(),
+        }
+    }
+
+    #[test]
+    fn a_relay_keeps_the_two_networks_separate_through_its_two_faces() {
+        // Upstream's RelayInputConnectionStrategy joins every side except the
+        // output face; the output node joins only that face. With pass-through
+        // off, the controller at 0 and the controller at 4 are two networks.
+        let at = relay_world(Face::East);
+        let left = network([0, 64, 0], at);
+        assert_eq!(
+            left.nodes,
+            vec![
+                (Kind::Controller, [0, 64, 0]),
+                (Kind::Cable, [1, 64, 0]),
+                (Kind::Relay, [2, 64, 0]),
+            ],
+            "the input side reaches the relay's input node, never its output"
+        );
+        assert!(left.online());
+        let right = network([3, 64, 0], relay_world(Face::East));
+        assert_eq!(
+            right.nodes,
+            vec![
+                (Kind::Cable, [3, 64, 0]),
+                (Kind::Controller, [4, 64, 0]),
+                (Kind::Relay, [2, 64, 0]),
+            ],
+            "the output side reaches the relay's output node, never its input"
+        );
+        assert!(right.online());
+    }
+
+    #[test]
+    fn a_relay_in_pass_through_mode_joins_the_two_networks() {
+        // Pass-through on: the input node also connects the output face, so
+        // both faces are one network signal (upstream's default).
+        let at = |pos: [i32; 3]| match pos {
+            [2, 64, 0] => vec![
+                Node::plain(Kind::Relay),
+                Node::facing(Kind::Relay, Face::East),
+            ],
+            _ => relay_world(Face::East)(pos),
+        };
+        let net = network([0, 64, 0], at);
+        assert_eq!(
+            net.nodes.len(),
+            6,
+            "pass-through merges both faces: both relay nodes are reachable"
+        );
+        assert_eq!(net.count(Kind::Controller), 2);
+        assert_eq!(net.count(Kind::Relay), 2);
+    }
+
+    #[test]
+    fn only_the_output_side_of_a_relay_contains_its_output_face_neighbour() {
+        // The role is not carried in the census (`(Kind, pos)` for both nodes),
+        // so a reader recovers it from the network's block set: the output
+        // node's side contains the block on its output face, the input's does not.
+        let left = network([0, 64, 0], relay_world(Face::East));
+        let right = network([3, 64, 0], relay_world(Face::East));
+        let output_side = [3, 64, 0];
+        assert!(
+            !left.contains(output_side),
+            "the input side has no output neighbour"
+        );
+        assert!(right.contains(output_side), "the output side has it");
+        assert!(left.contains([2, 64, 0]) && right.contains([2, 64, 0]));
+    }
+
+    #[test]
+    fn a_relay_charges_eight_fe_per_node_and_the_output_only_when_passing() {
+        assert_eq!(RELAY_INPUT_USAGE, 8);
+        assert_eq!(RELAY_OUTPUT_USAGE, 8);
+        assert_eq!(
+            usage(Kind::Relay, Fit::default(), 0),
+            RELAY_INPUT_USAGE,
+            "one relay block is two nodes, charged once each by its tick"
+        );
+        assert_eq!(
+            relay_output_usage(true),
+            RELAY_OUTPUT_USAGE,
+            "a delegated component makes the output node pay"
+        );
+        assert_eq!(
+            relay_output_usage(false),
+            0,
+            "no delegation: upstream's output node answers 0 FE"
+        );
     }
 
     #[test]

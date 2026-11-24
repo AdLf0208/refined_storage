@@ -26,6 +26,9 @@ cargo clippy --all-targets -- -D warnings
 ../tools/build-slot.sh run --job sdk-refinedstorage --port ports/refinedstorage \
     --step check -- bash -c 'cd ports/refinedstorage && cargo horizon-mod check'
 
+# the relay's pass-storage toggle (slice 16; the command form of a GUI side button)
+# /refinedstorage relay <pos> [on|off]  -> "Relay at x,y,z: facing F, storage pass-through on/off"
+
 # the delivered package
 rm -f Cargo.lock && cargo horizon-mod build   # -> target/horizon-mod/refinedstorage.hmod
 cp target/horizon-mod/refinedstorage.hmod ./refinedstorage.hmod
@@ -44,9 +47,9 @@ command without a leading `cd`. The `--offscreen` in-game leg stays local (the f
 has no renderer); no game leg was forwarded for this slice.
 
 Pin **`0a875da91dbb0fdcb7ba8c42c11341aa229af51a`** + mixins
-`e59da9094f0c2fdda6c627fe9eff22dec6a906f0`. Delivered package (0.2.15):
-`refinedstorage.hmod`, **238,015 B**, SHA-256
-`78574d1a0ebe985e9bc7e4879821cac31d9fbff1882cbf5fb68052408d55785b`, 278 entries, no packed
+`e59da9094f0c2fdda6c627fe9eff22dec6a906f0`. Delivered package (0.2.16):
+`refinedstorage.hmod`, **250,331 B**, SHA-256
+`6b713d90a0f0391cb80cc0a4321a5db0249646983a015c7686a2908be0d9b576`, 293 entries, no packed
 `Cargo.lock`; a copy of the delivered bytes is at
 `ports/_shared/evidence/refinedstorage/refinedstorage.hmod`, which is the file both `fits`
 runs used.
@@ -76,6 +79,7 @@ SELFTEST=payload … tools/e2e.sh                                   # flipped: t
 SELFTEST=break … tools/e2e.sh                                     # flipped: a creative break spilled nothing: EXIT:1
 SELFTEST=external … tools/e2e.sh                                  # flipped external storage (0 items, no block): EXIT:1
 SELFTEST=interface … tools/e2e.sh                                 # flipped interface (0 diamonds in hopper): EXIT:1
+SELFTEST=relay … tools/e2e.sh                                     # flipped relay (0 items on the output network): EXIT:1
 # review round two's two remaining phases (evidence only, the same package):
 MODE=full … tools/review2.sh      # a full drive consumes no disk: PASS + EXIT:0
 MODE=refused … tools/review2.sh   # a refused placement keeps the item and its payload: PASS + EXIT:0
@@ -84,7 +88,7 @@ python3 ../tools/check-e2e-logs.py refinedstorage-e2e --strict
 ```
 
 `tools/recipe_check.py` is the recipe family's driver: it reads this package's own
-`data/refinedstorage/recipe/*.json` (38 recipes, including slice 3's `wireless_transmitter`,
+`data/refinedstorage/recipe/*.json` (41 recipes, including slice 3's `wireless_transmitter`,
 slice 4's `wireless_grid`, slice 6's `upgrade` and `range_upgrade`, slice 7's `importer`,
 `exporter`, `speed_upgrade` and `stack_upgrade`, and slice 11's `4k/16k/64k_storage_part` and
 `4k/16k/64k_storage_disk`, and slice 12's three `{4k,16k,64k}_storage_disk_upgrade` files, the

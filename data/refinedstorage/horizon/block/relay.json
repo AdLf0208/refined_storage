@@ -1,0 +1,90 @@
+{
+  "template": "minecraft:barrel",
+  "properties": {
+    "hardness": 2.0,
+    "explosion_resistance": 6.0,
+    "requires_tool": false,
+    "light": 0,
+    "map_color": 11,
+    "sounds": "minecraft:stone",
+    "occludes": true
+  },
+  "state_properties": {
+    "active": {
+      "type": "boolean"
+    },
+    "pass_storage": {
+      "type": "boolean"
+    }
+  },
+  "default_state": {
+    "active": "false",
+    "pass_storage": "true"
+  },
+  "shapes": {
+    "property": "facing",
+    "values": {
+      "north": [
+        [
+          0.375,
+          0.375,
+          0.0,
+          0.625,
+          0.625,
+          0.625
+        ]
+      ],
+      "east": [
+        [
+          0.375,
+          0.375,
+          0.375,
+          1.0,
+          0.625,
+          0.625
+        ]
+      ],
+      "south": [
+        [
+          0.375,
+          0.375,
+          0.375,
+          0.625,
+          0.625,
+          1.0
+        ]
+      ],
+      "west": [
+        [
+          0.0,
+          0.375,
+          0.375,
+          0.625,
+          0.625,
+          0.625
+        ]
+      ],
+      "up": [
+        [
+          0.375,
+          0.375,
+          0.375,
+          0.625,
+          1.0,
+          0.625
+        ]
+      ],
+      "down": [
+        [
+          0.375,
+          0.0,
+          0.375,
+          0.625,
+          0.625,
+          0.625
+        ]
+      ]
+    }
+  },
+  "item": true
+}

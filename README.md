@@ -1,4 +1,4 @@
-# Refined Storage for Horizon (slice 14)
+# Refined Storage for Horizon (slice 16)
 
 A clean-room Rust port of **Refined Storage 2.0.9**
 (`refinedmods/refinedstorage2`, MIT), scoped to the **item network core**:
@@ -22,6 +22,15 @@ A clean-room Rust port of **Refined Storage 2.0.9**
 - **External Storage**: exposes the inventory it faces to the network — a grid lists
   the chest's stock alongside the disks, deposits through the grid land in that chest,
   and breaking the block or removing the chest drops only that stock from the view;
+- **Interface**: exports up to 64 of each configured resource per tick into nine
+  intermediate slots that hoppers take through the `ITEMS` capability on every side,
+  and puts back what an external block inserts into an unconfigured slot (4 FE/tick);
+- **Relay**: two network nodes in one block — the input side joins every face but its
+  output face, the output side only that face. With storage pass-through on, the
+  output network sees the input network's disks and external inventories as its own
+  (a grid there lists them, and a withdrawal takes them from the input disk); turning
+  pass-through off with `/refinedstorage relay <pos> [on|off]` or breaking the relay
+  stops it. Each node costs 8 FE/tick;
 - **Upgrades**: range (+8 blocks each, up to four) and creative range for the
   transmitter; speed (two ticks off the work interval, up to four) and stack
   (64 items per pass) for the machines;
@@ -41,9 +50,9 @@ spill instead of emptying it. The two energy commands (`/refinedstorage energy`,
 `/refinedstorage charge`) are operator commands, and a charge names the item it
 fills: the wireless grid, or nothing.
 
-The rest of the mod (crafters, interfaces, relays, fluids, the portable grid,
-security, autocrafting, the coloured variants and the upgrades whose blocks are not
-ported) is the planned gap list in [notes.md](notes.md).
+The rest of the mod (crafters, the security manager, fluids, the portable grid,
+autocrafting, the coloured variants and the upgrades whose blocks are not ported)
+is the planned gap list in [notes.md](notes.md).
 
 One flat package, the SDK layout: `horizon-mod.toml` is the only manifest,
 `src/` is the code (compiled by the launcher against the pinned game build),

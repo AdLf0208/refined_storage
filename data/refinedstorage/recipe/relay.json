@@ -1,0 +1,12 @@
+{
+  "type": "minecraft:crafting_shapeless",
+  "ingredients": [
+    "refinedstorage:machine_casing",
+    "refinedstorage:cable",
+    "refinedstorage:advanced_processor",
+    "minecraft:redstone_torch"
+  ],
+  "result": {
+    "id": "refinedstorage:relay"
+  }
+}

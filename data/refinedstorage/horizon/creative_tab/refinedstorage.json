@@ -39,6 +39,7 @@
     "refinedstorage:external_storage",
     "refinedstorage:interface",
     "refinedstorage:speed_upgrade",
-    "refinedstorage:stack_upgrade"
+    "refinedstorage:stack_upgrade",
+    "refinedstorage:relay"
   ]
 }

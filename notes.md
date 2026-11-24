@@ -3759,3 +3759,202 @@ bytes) — and `ports/_shared/evidence/refinedstorage-e2e/` — `launcher-build-
 (`Compiling refinedstorage (1 of 1)`, `native-0a875da-5c2cc14dd68f`),
 `e2e-slice15-green.log`, `e2e-slice15-control.log`, `e2e-slice15-selftest-interface.log`,
 `check-e2e-logs-slice15.log`.
+## Slice 16 — the relay (2026-11-24) — version 0.2.16
+
+### The gap line this slice answers (verbatim)
+
+§"Gaps / deviations (slice 1)" item 2: *"… external storage, interfaces,
+**relays**, …"*, as slice 15 left it after carrying the interface. Class
+`content` / tier **deep**, shape **machines**: one block, two network nodes, a
+storage pass-through and an 8+8 FE/tick charge are below the tier. MIT, ours on
+`main` → **Update 0.2.16** (0.2.15 is staged on PR #1666). Pin
+`0a875da91dbb0fdcb7ba8c42c11341aa229af51a` + mixins
+`e59da9094f0c2fdda6c627fe9eff22dec6a906f0`, SDK `0a875da`, game 26.3. Rust
+steps forwarded to `AdLf-PC` (no `BUILD_LOCAL=1`); the `--offscreen` game leg
+stayed local.
+
+### The two-node rules and the energy cost, as read from the artefact
+
+Read from `refinedmods/refinedstorage2` tag `v2.0.9`, commit
+`0dec63affe8147702b020843c22748483ef18c01` (MIT), behaviour only. The 2.0.9
+artefact puts **two network nodes in one block**:
+
+- `RelayBlockEntity` builds a `RelayInputNetworkNode` (main container, name
+  `"input"`) and a `RelayOutputNetworkNode` (second container, name `"output"`).
+- `RelayInputConnectionStrategy`: the input node connects every side **except**
+  its `direction` (output) face; with `passThrough && active` it also connects
+  that face (the default, which merges the two networks into one signal).
+- `RelayOutputConnectionStrategy`: the output node connects **only** the output
+  face and never to the input container. The comment there is explicit that the
+  output container must always have an outgoing and incoming connection or the
+  graph cannot reassign networks downstream.
+- `RelayComponentType.{ENERGY,SECURITY,STORAGE,AUTOCRAFTING}` are the four
+  pass-through components. `RelayInputNetworkNode.updateComponents` applies the
+  input network's component to the output node only when the input node is
+  online and active. `RelayOutputStorage.compositeInsert/compositeExtract`
+  delegate to the input network's `StorageNetworkComponent`; its filter defaults
+  to blocklist with an empty filter exposing all resources.
+- `DefaultEnergyUsage.RELAY_INPUT_NETWORK = RELAY_OUTPUT_NETWORK = 8` FE/tick,
+  one per node. `RelayOutputNetworkNode.getEnergyUsage` answers 8 only while at
+  least one component is delegated, else 0.
+
+The port fixes pass-through **off** (two separate networks) and carries the
+**storage** pass-through with `/refinedstorage relay <pos> [on|off]` as the
+command form of the GUI's "Pass storage" side button (default on). The other
+toggles and the filter GUI are deviations below.
+
+### Red proof — the rules as tests, before the implementation
+
+`ports/_shared/evidence/refinedstorage/runtime-red-slice16-relay.log`, against
+stubs (`all_but` behaved as an all-faces node, `relay_output_usage` answered 0,
+`usage(Relay)` answered 0): **3 failed of 131**:
+
+```
+---- runtime::tests::a_relay_charges_eight_fe_per_node_and_the_output_only_when_passing stdout ----
+assertion `left == right` failed: one relay block is two nodes, charged once each by its tick
+  left: 0
+ right: 8
+---- runtime::tests::a_relay_in_pass_through_mode_joins_the_two_networks stdout ----
+assertion `left == right` failed: pass-through merges both faces
+  left: 6
+ right: 5
+---- runtime::tests::a_relay_keeps_the_two_networks_separate_through_its_two_faces stdout ----
+assertion `left == right` failed: the input side reaches the relay's input node, never its output
+  left: [(Controller, [0, 64, 0]), (Cable, [1, 64, 0]), (Relay, [2, 64, 0]), (Cable, [3, 64, 0]), (Controller, [4, 64, 0]), (Relay, [2, 64, 0])]
+ right: [(Controller, [0, 64, 0]), (Cable, [1, 64, 0]), (Relay, [2, 64, 0])]
+test result: FAILED. 128 passed; 3 failed; 0 ignored; 0 measured; 0 filtered out
+```
+
+The pass-through expectation was corrected to 6 nodes (both relay nodes are
+reachable when the input node also joins the output face) before the green run.
+Green after the rules: **132 passed, 0 failed** (`sdk-test-0.2.16.log`). A later
+green run found a **port defect** the first in-game leg exposed: `live_relay`
+matched a relay block by kind alone, so the input node present in network A was
+mistaken for an output node and A passed its own storage to itself (16 items
+instead of 8). The fix recovers the node's role from the output-face neighbour —
+the output node's connection rule — with `Network::contains`, deduplicates the
+position (a `/refinedstorage info` at the relay visits both nodes), and adds
+`only_the_output_side_of_a_relay_contains_its_output_face_neighbour` as a
+regression test. The in-game leg also needed its own arena row (z=19; z=12 was
+already used by an earlier phase), a charge for *both* controllers, a walk to
+the grid before `ctl interact`, and `expect_drive` for the drive's own chat line.
+
+### Green — the ladder and the in-game leg (one launcher build at `0a875da`)
+
+| Step | Command | Result |
+|---|---|---|
+| runtime + glue tests | `cargo test --offline` (forwarded) | **132 passed**, 0 failed (`sdk-test-0.2.16.log`) |
+| lints | `cargo clippy --all-targets --offline -- -D warnings` | exit 0, **0 warnings** (`sdk-clippy.log`) |
+| formatting | `rustfmt --edition 2024 --check src/{lib,support,runtime}.rs` | clean |
+| SDK check | `cargo horizon-mod check` | *"…681 items of the API (5 Part kinds, 23 hooks …). Made for 0a875da."* (`sdk-check-0.2.16.log`) |
+| package | `rm -f Cargo.lock && cargo horizon-mod build` ×2 | **byte-identical** (`CMP_EXIT:0`), **250,331 B**, SHA-256 `6b713d90a0f0391cb80cc0a4321a5db0249646983a015c7686a2908be0d9b576`, **293 entries**, no `Cargo.lock` (`sdk-final-0.2.16.log`) |
+| package check | `cargo horizon-mod check refinedstorage.hmod` | `0.2.16 (native-mod, format native-1/0a875da…/e59da909…, for 26.3)`, `CHECK_FILE_EXIT:0` |
+| fits (pin) | `… fits refinedstorage.hmod --build 0a875da` | `0a875da made for`, `FITS_PIN_EXIT:0` |
+| fits (other build) | `… fits refinedstorage.hmod --build 0b14f8a` | `0b14f8a fits`, `FITS_OTHER_EXIT:0` |
+| recipe types | `python3 ports/tools/check-recipe-types.py refinedstorage` | `refinedstorage: ok` |
+| launcher build | `ports/tools/launcher-game.sh build refinedstorage --rebuild` | exit 0, **`Compiling refinedstorage (1 of 1)`**, `native-0a875da-b11a0e9a6136` (`launcher-build-0.2.16.log`); the stale `native-0a875da-9f6a9a1a540b` tag carrying this mod was retired first |
+| in-game leg | `build-slot.sh run --step e2e -- bash tools/e2e.sh` | **PASS** + **`EXIT:0`** (`e2e-slice16-green.log`), 41 of 41 recipes crafted |
+| control (same Nightly, no package) | `GAME=$CONTROL_GAME …` | **FAIL** + `EXIT:1` — *"the block at 41,64,1 is minecraft:air, expected facing=north"* (`e2e-slice16-control.log`) |
+| counterfactual (this slice) | `SELFTEST=relay …` | **FAIL** + `EXIT:1` — *"expected the old no-relay answer (0 items), got 8; storage passed through"* (`e2e-slice16-selftest-relay.log`) |
+| log gate | `check-e2e-logs.py refinedstorage-e2e --strict` | `logs=99 ok=99 missing-exit=0 bad-exit=0`, exit 0 |
+| package gate | `verify-sdk-package.py refinedstorage` | **1/1** (132 tests, package matches the tree, no packed lock, R9 clean) |
+
+The relay phase, quoted from `e2e-slice16-green.log` (A at 32..35, relay at 36
+facing east, B at 37..40, all at y=19; A's disk holds 3 gold + 5 diamonds, B's
+own disk is empty):
+
+```
+  block(36,64,19): refinedstorage:relay[active=true,facing=east,open=false,pass_storage=true]
+  info(36,64,19): online (11 nodes, 3 controller, 2 drive, 1 grid, 2 relay); 2 disks, 16 items in 2 resources
+  Relay at 36,64,19: facing east, storage pass-through on, 8 FE/tick per node (16 FE/tick total)
+  info(32,64,19): online (6 nodes, 2 controller, 1 drive, 0 grid, 1 relay); 1 disks, 8 items in 2 resources
+  info(37,64,19): online (5 nodes, 1 controller, 1 drive, 1 grid, 1 relay); 1 disks, 8 items in 2 resources
+  grid view: [{"count":3,"item":"minecraft:gold_ingot","slot":300},{"count":5,"item":"minecraft:diamond","slot":301}]
+  a withdrawal through the output grid took the 3 gold from the input disk, not from B's empty one
+  info(39,64,19) drive: 1 disk, capacity slot 0: refinedstorage:1k_storage_disk 0/1024 items
+  /refinedstorage relay 36 64 19 off -> storage pass-through off
+  info(37,64,19): 1 disks, 0 items in 0 resources
+  /refinedstorage relay 36 64 19 on -> storage pass-through on
+  relay broken: the output network sees nothing; breaking reverses the transfer
+```
+
+Every assertion has a differential or counterfactual: B's empty own disk
+separates passed-through stock from locally stored stock; turning pass-storage
+off and breaking the relay both stop the transfer while A keeps its 8;
+`SELFTEST=relay` asserts the old, no-relay answer (0 items) *after* the working
+relay delivered 8, and exits 1; the control (same Nightly, no package) fails at
+the first phase. Fourteen earlier green-leg attempts were lost to transient
+game/ctl failures under a saturated box (10 concurrent games) and to two real
+harness defects fixed here — a stale arena row and a drive-line read with the
+wrong helper — and are kept as `e2e-slice16-green-flake{1..14}.log` and
+`e2e-slice16-attempt-fe-label.log`; none is counted as exit evidence.
+
+### Deviations (recorded, not defects)
+
+1. **Pass-through mode is fixed off.** Upstream defaults `passThrough = true`,
+   merging the two faces into one network; the port needs two networks for the
+   selective storage pass-through, so a relay always keeps its two faces apart
+   and passes the storage component. The pass-through mode toggle (and the other
+   four toggles) are GUI side buttons the pin's mod screens cannot draw.
+2. **Only storage passes.** Energy, security and autocrafting/patterns
+   pass-through are GUI toggles with no port equivalent: the network energy is
+   per-network NBT (slice 8), there is no security manager, and there is no
+   crafting task queue. `/refinedstorage relay` carries the one toggle that has
+   a behaviour behind it here.
+3. **No filter, access mode or priorities.** Upstream's relay menu has a
+   nine-slot resource filter (blocklist/allowlist, fuzzy) and insert/extract
+   priorities. The port exposes all input resources (upstream's empty-blocklist
+   default) with `INSERT_EXTRACT` access and equal priority; its storage comes
+   first in the output network so an empty disk cannot shadow it (the same
+   deviation external storage records).
+4. **No cycle rule.** Upstream forbids passing a component back to the input
+   network from the output network; with only storage passed in one direction
+   and no other pass-throughs, a cycle cannot be formed here.
+5. **Two nodes, one `active` state.** The block's `active` mirrors the input
+   node's activeness (upstream's `activenessChanged`); the output node's 8 FE is
+   drawn from the output network separately while storage is passed.
+
+### Coverage (parity rule) — every family this slice ships
+
+| family | state |
+|---|---|
+| the `relay` block and its `facing`/`active`/`pass_storage` states | **tested** — placed with `facing=east`, read back `active=true`, counted in each network's census, broken |
+| the two nodes' connection faces | **tested** — unit `a_relay_keeps_the_two_networks_separate_through_its_two_faces` plus the in-game separation of the two grids' totals |
+| storage pass-through | **tested** — B's grid lists A's 3 gold and 5 diamonds while B's own disk is empty; a withdrawal takes the gold from A's disk |
+| pass-storage off (unconfigured relay) | **tested** — `/refinedstorage relay … off` makes B total 0 while A keeps 8 |
+| breaking the relay | **tested** — B totals 0 again; A still holds its 8 |
+| the 8+8 FE/tick charge | **unit-tested** — `a_relay_charges_eight_fe_per_node_and_the_output_only_when_passing`; `info` names `8 FE/tick per node` |
+| the recipe, item, loot table, tag | **tested** — `recipe_check.py` crafts the shapeless relay from the four declared ingredients; the block drops itself |
+| energy/security/autocrafting pass-through and the filter GUI | **not ported** — deviations 2–3 |
+| the 16 dyed relay variants | **not ported** — no colour variants in this port |
+
+Skills: superpowers/using-superpowers,brainstorming,writing-plans,test-driven-development,systematic-debugging,verification-before-completion; BeautifulRust/rust-best-practices
+
+### Next slice (from this slice's own gap list)
+
+The **storage block** (`refinedstorage:1k_storage_block` and its 4k/16k/64k
+siblings) is the next `machines`-shaped node from the same gap line (§"Gaps /
+deviations (slice 1)" item 2: *"… fluid storage and disks, … storage blocks,
+…"*). Like the drive it is a network node holding a storage disk, but one disk
+per block, and the disk's capacity is fixed by the block's tier. It fits the
+tier: one block entity, one container slot and a read of the existing disk
+component — no new hook, entity or renderer. The recipe chain and the disk
+sizes already exist (slices 2, 11). The in-game assertion would place a 1k
+storage block on a network, insert a disk whose component holds 5 diamonds,
+open the network's grid with `ctl interact` and assert the parsed grid view
+contains exactly `{"count":5,"item":"minecraft:diamond"}` while `/refinedstorage
+info <pos>` names the block in the census and totals 5 items; breaking the
+block must drop the disk with its component intact, and placing it back on a
+different network must expose the same 5 there. The differential is an empty
+storage block (no disk) contributing 0, with `SELFTEST=storageblock` asserting
+the old no-block answer (0 items) after the block delivered 5.
+
+
+Evidence: `ports/_shared/evidence/refinedstorage/` — `plan-slice16-relay.md`,
+`runtime-red-slice16-relay.log`, `sdk-test-0.2.16.log` (132), `sdk-clippy.log`,
+`sdk-final-0.2.16.log`, `sdk-check-fits-0.2.16-final.log`, `refinedstorage.hmod`
+(the delivered bytes) — and `ports/_shared/evidence/refinedstorage-e2e/` —
+`launcher-build-0.2.16.log` (`Compiling refinedstorage (1 of 1)`,
+`native-0a875da-b11a0e9a6136`), `e2e-slice16-green.log`,
+`e2e-slice16-control.log`, `e2e-slice16-selftest-relay.log`,
+`check-e2e-logs-slice16.log` (99/99 green).

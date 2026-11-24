@@ -64,6 +64,9 @@ const EXTERNAL_STORAGE: &str = "refinedstorage:external_storage";
 /// The interface (slice 15): nine intermediate storage slots exposed as `ITEMS`
 /// on every side, into which the network exports its configured resources.
 const INTERFACE: &str = "refinedstorage:interface";
+/// The relay (slice 16): two network nodes in one block, joining the input
+/// network on every face but its `facing` and the output network on that face.
+const RELAY: &str = "refinedstorage:relay";
 /// The range upgrade (slice 6): +8 blocks each, at most four per transmitter
 /// (upstream `RangeUpgradeItem`, registered for `WIRELESS_TRANSMITTER`).
 const RANGE_UPGRADE: &str = "refinedstorage:range_upgrade";
@@ -129,6 +132,12 @@ const INTERFACE_SLOTS: usize = runtime::INTERFACE_SLOTS * 2;
 /// The saved compound key the grid's view marks live under.
 const VIEW_KEY: &str = "RefinedStorageView";
 
+/// The relay's pass-storage property. Upstream keeps this in NBT (`passstorage`)
+/// behind a GUI side button the pin cannot draw; the port carries it as a block
+/// state property that `/refinedstorage relay <pos> [on|off]` sets. The default
+/// is on, so a placed relay passes storage without configuration.
+const RELAY_STORAGE_PROPERTY: &str = "pass_storage";
+
 /// The saved compound key a broken machine's slots travel under on its item
 /// (slice 10): the item's `minecraft:block_entity_data` carries them, and the
 /// key is this port's own, never vanilla's `Items` — the engine spills a mod
@@ -167,6 +176,7 @@ struct Keys {
     exporter: BlockKey,
     external_storage: BlockKey,
     interface: BlockKey,
+    relay: BlockKey,
     /// The five storage disk items, upstream's `ItemStorageVariant`. Which one a
     /// stack is decides its capacity (`runtime::disk_capacity`); a drive takes
     /// any of them.
@@ -196,6 +206,7 @@ impl Keys {
             (self.exporter, Kind::Exporter),
             (self.external_storage, Kind::ExternalStorage),
             (self.interface, Kind::Interface),
+            (self.relay, Kind::Relay),
         ]
         .into_iter()
         .find_map(|(key, kind)| (key == block).then_some(kind))
@@ -223,7 +234,8 @@ impl Keys {
             | Kind::DiskDrive
             | Kind::Grid
             | Kind::ExternalStorage
-            | Kind::Interface => None,
+            | Kind::Interface
+            | Kind::Relay => None,
         }
     }
 }
@@ -249,6 +261,7 @@ pub(crate) fn register(registrar: &mut dyn Registrar, _cx: &RegistrationContext)
         exporter: registrar.block_key(EXPORTER),
         external_storage: registrar.block_key(EXTERNAL_STORAGE),
         interface: registrar.block_key(INTERFACE),
+        relay: registrar.block_key(RELAY),
         disks: [
             registrar.item_key(DISK),
             registrar.item_key(DISK_4K),
@@ -313,6 +326,7 @@ pub(crate) fn register(registrar: &mut dyn Registrar, _cx: &RegistrationContext)
             EXPORTER,
             EXTERNAL_STORAGE,
             INTERFACE,
+            RELAY,
         ])
         .build();
     registrar
@@ -1233,7 +1247,10 @@ fn open_wireless_grid(host: &mut dyn ServerHost, uuid: u128, stack: &ItemStack, 
         );
         return;
     };
-    if node_at(host, level, binding.pos()).map(|node| node.kind) != Some(Kind::WirelessTransmitter)
+    if node_at(host, level, binding.pos())
+        .first()
+        .map(|node| node.kind)
+        != Some(Kind::WirelessTransmitter)
     {
         tell(
             host,
@@ -1398,16 +1415,8 @@ fn disks_of(live: &[LiveDisk]) -> Vec<Disk<Net>> {
 }
 
 /// Write every disk whose contents changed back into its item, and that item
-/// into the drive's slot, in one transaction. The drive's own tick then re-reads
-/// the item (its cache is not dirty), so the block grid and this item agree.
-fn write_back(host: &mut dyn ServerHost, level: LevelRef, live: &[LiveDisk], disks: &[Disk<Net>]) {
-    let _ = host.transaction(|host, tx| {
-        write_back_in(host, tx, level, live, disks);
-        Ok::<(), mod_api::BlockEntityItemError>(())
-    });
-}
-
-/// [`write_back`] inside a transaction the caller already opened: a machine's
+/// into the drive's slot, inside a transaction the caller already opened: a
+/// machine's
 /// work pass moves items out of a neighbour and puts the disks back in one go,
 /// so a failure between the two cannot lose them.
 fn write_back_in(
@@ -1505,6 +1514,161 @@ fn network_disks(live: &[LiveDisk], external: &[LiveExternal]) -> Vec<Disk<Net>>
         .collect()
 }
 
+// --- the relay's storage pass-through (slice 16) ----------------------------
+
+/// A relay whose output node is in the network being used, passing the input
+/// network's storage through. Upstream's `RelayComponentType.STORAGE` applies
+/// network A's `StorageNetworkComponent` to network B's `RelayOutputStorage`;
+/// the port materialises it as A's live disks and external storages.
+struct LiveRelay {
+    live: Vec<LiveDisk>,
+    external: Vec<LiveExternal>,
+}
+
+/// Everything a network can store: relay pass-throughs first, then its own
+/// external storages, then its drives' disks. One `disks()` view and one
+/// `write_back()` keep every consumer (grid, machine, interface, wireless view
+/// and `/refinedstorage info`) agreeing about what a relay exposes.
+struct Storages {
+    relay: Vec<LiveRelay>,
+    live: Vec<LiveDisk>,
+    external: Vec<LiveExternal>,
+}
+
+const FACES: [Face; 6] = [
+    Face::North,
+    Face::East,
+    Face::South,
+    Face::West,
+    Face::Up,
+    Face::Down,
+];
+
+/// Whether a relay passes storage. Default on (upstream ships in pass-through
+/// mode); only an explicit `false` state turns it off.
+fn relay_storage_on(host: &dyn Host, level: LevelRef, pos: [i32; 3]) -> bool {
+    level
+        .block_property(host, pos, RELAY_STORAGE_PROPERTY)
+        .as_deref()
+        != Some("false")
+}
+
+/// The input network a relay at `pos` passes, read from a network block on any
+/// face but its output `facing` (upstream's input-node connection rule).
+fn relay_input_network(
+    host: &dyn Host,
+    level: LevelRef,
+    pos: [i32; 3],
+    output: Face,
+) -> Option<runtime::Network> {
+    FACES
+        .into_iter()
+        .filter(|face| *face != output)
+        .map(|face| neighbour(pos, face))
+        .find(|at| !node_at(host, level, *at).is_empty())
+        .map(|at| network_in(host, level, at))
+        .filter(|net| net.online())
+}
+
+/// Read every active relay pass-through of `net`, including the input networks'
+/// live disks and faced inventories.
+///
+/// A relay block contributes one node to each of its two networks: the input node
+/// to the network on its other faces, the output node to the network through its
+/// `facing` side. Only the **output** network passes storage through. The census
+/// stores `(Kind, pos)` and loses that role, so the role is recovered by asking
+/// whether the block on the output face belongs to `net` — exactly the rule the
+/// output node's connection strategy uses. Without this check a network would
+/// pass its own storage to itself and double every total. Both nodes can appear
+/// in one flood fill (a `/refinedstorage info` at the relay block visits both),
+/// so positions are deduplicated too.
+fn live_relay(
+    host: &mut dyn ServerHost,
+    level: LevelRef,
+    net: &runtime::Network,
+) -> Vec<LiveRelay> {
+    let mut out = Vec::new();
+    let mut seen = HashSet::new();
+    for pos in net.of_kind(Kind::Relay) {
+        if !seen.insert(pos) {
+            continue;
+        }
+        if !relay_storage_on(host, level, pos) {
+            continue;
+        }
+        let Some(face) = facing_in(host, level, pos) else {
+            continue;
+        };
+        let output_side = neighbour(pos, face);
+        if !net.contains(output_side) {
+            continue;
+        }
+        let Some(input) = relay_input_network(host, level, pos, face) else {
+            continue;
+        };
+        out.push(LiveRelay {
+            live: live_disks(host, level, &input),
+            external: live_external(host, level, &input),
+        });
+    }
+    out
+}
+
+/// The full storage view of `net`: relay pass-throughs, own external storages,
+/// own drives.
+fn storages(host: &mut dyn ServerHost, level: LevelRef, net: &runtime::Network) -> Storages {
+    Storages {
+        relay: live_relay(host, level, net),
+        live: live_disks(host, level, net),
+        external: live_external(host, level, net),
+    }
+}
+
+impl Storages {
+    fn disks(&self) -> Vec<Disk<Net>> {
+        self.relay
+            .iter()
+            .flat_map(|r| network_disks(&r.live, &r.external))
+            .chain(network_disks(&self.live, &self.external))
+            .collect()
+    }
+
+    /// Write every changed storage back to the container (or disk cache) it
+    /// came from, inside the caller's transaction. The disk order is the same
+    /// as `disks()`, so each segment belongs to the storage that produced it.
+    fn write_back(
+        &self,
+        host: &mut dyn ServerHost,
+        tx: &mod_api::Transaction,
+        level: LevelRef,
+        disks: &[Disk<Net>],
+    ) {
+        let mut at = 0;
+        for relay in &self.relay {
+            let len = relay.external.len() + relay.live.len();
+            let segment = &disks[at..at + len];
+            write_back_external_in(
+                host,
+                tx,
+                level,
+                &relay.external,
+                &segment[..relay.external.len()],
+            );
+            write_back_in(
+                host,
+                tx,
+                level,
+                &relay.live,
+                &segment[relay.external.len()..],
+            );
+            at += len;
+        }
+        let own = &disks[at..];
+        write_back_external_in(host, tx, level, &self.external, &own[..self.external.len()]);
+        write_back_in(host, tx, level, &self.live, &own[self.external.len()..]);
+    }
+}
+
 /// Write every external storage whose contents changed back into the container
 /// it faces, inside the caller's transaction. The whole container *is* the
 /// exposed storage, so the write replaces its contents with the resulting
@@ -1583,10 +1747,8 @@ pub(crate) fn on_menu_clicked(host: &mut dyn ServerHost, event: &MenuClickedEven
         return;
     };
     let net = network_in(host, level, binding.pos());
-    let live = live_disks(host, level, &net);
-    let external = live_external(host, level, &net);
-    let external_count = external.len();
-    let mut disks = network_disks(&live, &external);
+    let storages = storages(host, level, &net);
+    let mut disks = storages.disks();
     let carried = menu.carried(host).flatten();
     let slot_has = match view_slot {
         Some(index) => open.view.get(index).is_some_and(Option::is_some),
@@ -1631,9 +1793,8 @@ pub(crate) fn on_menu_clicked(host: &mut dyn ServerHost, event: &MenuClickedEven
     };
     let moved = apply_plan(host, &click, &plan, &mut disks);
     if moved {
-        write_back(host, level, &live, &disks[external_count..]);
         let _ = host.transaction(|host, tx| {
-            write_back_external_in(host, tx, level, &external, &disks[..external_count]);
+            storages.write_back(host, tx, level, &disks);
             Ok::<(), mod_api::PlayerDataRefusal>(())
         });
     }
@@ -1944,9 +2105,7 @@ fn refresh_menu(
     level: LevelRef,
 ) {
     let net = network_in(host, level, binding.pos());
-    let live = live_disks(host, level, &net);
-    let external = live_external(host, level, &net);
-    let disks = network_disks(&live, &external);
+    let disks = storages(host, level, &net).disks();
     let held = promises_elsewhere(
         &net,
         binding.dimension(),
@@ -2052,23 +2211,33 @@ fn kind_at(host: &dyn Host, pos: [i32; 3]) -> Option<Kind> {
     keys().kind_of(block)
 }
 
-/// The node at `pos` in `level`: its kind, and for a wireless transmitter the
-/// face its `facing` state points at (upstream joins the network through that
-/// side only).
-fn node_at(host: &dyn Host, level: mod_api::LevelRef, pos: [i32; 3]) -> Option<Node> {
+/// The nodes at `pos` in `level`. A wireless transmitter joins through its
+/// `facing` side only; a relay block holds **two** nodes: an input node joining
+/// every face but its `facing` (the output face) and an output node joining only
+/// that face (upstream's two network-node containers). Every other network block
+/// is one node joining all six sides.
+fn node_at(host: &dyn Host, level: mod_api::LevelRef, pos: [i32; 3]) -> Vec<Node> {
     if !level.is_loaded(host, pos) {
-        return None;
+        return Vec::new();
     }
-    let block = level.block(host, pos)?;
-    let kind = keys().kind_of(block)?;
-    if kind != Kind::WirelessTransmitter {
-        return Some(Node::plain(kind));
+    let Some(block) = level.block(host, pos) else {
+        return Vec::new();
+    };
+    let Some(kind) = keys().kind_of(block) else {
+        return Vec::new();
+    };
+    if kind == Kind::WirelessTransmitter {
+        return facing_in(host, level, pos)
+            .map(|face| vec![Node::facing(kind, face)])
+            .unwrap_or_default();
     }
-    let face = level
-        .block_property(host, pos, "facing")
-        .as_deref()
-        .and_then(Face::from_property)?;
-    Some(Node::facing(kind, face))
+    if kind == Kind::Relay {
+        return match facing_in(host, level, pos) {
+            Some(face) => vec![Node::all_but(kind, face), Node::facing(kind, face)],
+            None => Vec::new(),
+        };
+    }
+    vec![Node::plain(kind)]
 }
 
 /// The network the block at `start` belongs to in `level`, read from the
@@ -2247,7 +2416,11 @@ impl BlockPart for Network {
         if !matches!(
             Kind::from_block(block),
             Some(
-                Kind::WirelessTransmitter | Kind::Importer | Kind::Exporter | Kind::ExternalStorage,
+                Kind::WirelessTransmitter
+                    | Kind::Importer
+                    | Kind::Exporter
+                    | Kind::ExternalStorage
+                    | Kind::Relay,
             )
         ) {
             return None;
@@ -2311,6 +2484,7 @@ impl BlockEntityPart for Network {
                     | Kind::Exporter
                     | Kind::ExternalStorage
                     | Kind::Interface
+                    | Kind::Relay
             )
         );
     }
@@ -2329,6 +2503,7 @@ impl BlockEntityPart for Network {
             }
             Some(Kind::ExternalStorage) => external_storage_tick(host, pos),
             Some(Kind::Interface) => interface_tick(host, pos, &mut event.entity),
+            Some(Kind::Relay) => relay_tick(host, pos, &mut event.entity),
             None => {}
         }
     }
@@ -2430,7 +2605,7 @@ impl BlockEntityPart for Network {
                     ..Screen::default()
                 })
             }
-            Kind::Controller | Kind::Cable | Kind::ExternalStorage => None,
+            Kind::Controller | Kind::Cable | Kind::ExternalStorage | Kind::Relay => None,
         }
     }
 }
@@ -2640,13 +2815,21 @@ fn grid_tick(host: &mut dyn ServerHost, pos: [i32; 3], entity: &mut ModBlockEnti
             .map(|key| (key.clone(), core.disks[key].clone()))
             .unzip()
     });
-    // External storages are read live and come first, so a free disk slot
-    // cannot shadow the inventory the block exposes (no priority surface).
+    // Relay pass-throughs come first (the input networks' storage), then this
+    // network's own external storages, then its drives' tick cache. External
+    // storages lead the local disks so a free disk slot cannot shadow the
+    // inventory a block exposes (the port has no insertion-priority surface).
+    let relays = level.map_or_else(Vec::new, |level| live_relay(host, level, &net));
+    let relay_disks: Vec<Disk<Net>> = relays
+        .iter()
+        .flat_map(|r| network_disks(&r.live, &r.external))
+        .collect();
+    let relay_count = relay_disks.len();
     let external = level.map_or_else(Vec::new, |level| live_external(host, level, &net));
     let external_count = external.len();
-    let mut disks: Vec<Disk<Net>> = external
-        .iter()
-        .map(|storage| storage.disk.clone())
+    let mut disks: Vec<Disk<Net>> = relay_disks
+        .into_iter()
+        .chain(external.iter().map(|storage| storage.disk.clone()))
         .chain(drive_disks)
         .collect();
 
@@ -2713,7 +2896,10 @@ fn grid_tick(host: &mut dyn ServerHost, pos: [i32; 3], entity: &mut ModBlockEnti
     // disk's component from outside (a `/data merge`, another tool) was replaced
     // by the stale cache one tick later.
     with_core(|core| {
-        for (key, disk) in used.iter().zip(disks[external_count..].iter()) {
+        for (key, disk) in used
+            .iter()
+            .zip(disks[relay_count + external_count..].iter())
+        {
             let changed = core.disks.get(key) != Some(disk);
             if changed {
                 core.disks.insert(key.clone(), disk.clone());
@@ -2721,13 +2907,40 @@ fn grid_tick(host: &mut dyn ServerHost, pos: [i32; 3], entity: &mut ModBlockEnti
             }
         }
     });
-    // The external storages' changes go back to the containers they face in
-    // their own transaction; the drive caches above are in-memory only.
-    if external_count > 0
+    // A relay's input storage and the external storages' changes go back to the
+    // containers they face in their own transaction; the drive caches above are
+    // in-memory only. The relay segments are in `disks()` order.
+    if relay_count + external_count > 0
         && let Some(level) = level
     {
         let _ = host.transaction(|host, tx| {
-            write_back_external_in(host, tx, level, &external, &disks[..external_count]);
+            let mut at = 0;
+            for relay in &relays {
+                let len = relay.external.len() + relay.live.len();
+                let segment = &disks[at..at + len];
+                write_back_external_in(
+                    host,
+                    tx,
+                    level,
+                    &relay.external,
+                    &segment[..relay.external.len()],
+                );
+                write_back_in(
+                    host,
+                    tx,
+                    level,
+                    &relay.live,
+                    &segment[relay.external.len()..],
+                );
+                at += len;
+            }
+            write_back_external_in(
+                host,
+                tx,
+                level,
+                &external,
+                &disks[relay_count..relay_count + external_count],
+            );
             Ok::<(), mod_api::BlockEntityItemError>(())
         });
     }
@@ -2823,6 +3036,41 @@ fn external_storage_tick(host: &mut dyn ServerHost, pos: [i32; 3]) {
     }
 }
 
+/// A relay's tick (slice 16). Upstream's `RelayBlockEntity` holds two network
+/// nodes: the input node belongs to the network on every face but `facing` and
+/// the output node to the network through `facing`. Each charges 8 FE/tick;
+/// `RelayOutputNetworkNode.getEnergyUsage` only charges while a component is
+/// delegated, which here means the storage pass-through is enabled. The block's
+/// `active` state mirrors the input node's activeness (`activenessChanged`).
+fn relay_tick(host: &mut dyn ServerHost, pos: [i32; 3], _entity: &mut ModBlockEntityView<'_>) {
+    let Some(level) = host.level(host.dimension()) else {
+        return;
+    };
+    let Some(face) = facing_in(host, level, pos) else {
+        return;
+    };
+    let passing = relay_storage_on(host, level, pos);
+    let input = relay_input_network(host, level, pos, face).unwrap_or_default();
+    let output = network_in(host, level, neighbour(pos, face));
+    // The input half runs while its own network has a controller and can pay;
+    // the output half pays its 8 from the network on the facing side, but only
+    // while something is actually passed through.
+    let mut active = false;
+    if input.online() && pay(host, level, &input, runtime::RELAY_INPUT_USAGE) {
+        active = true;
+    }
+    let output_charge = runtime::relay_output_usage(passing && active);
+    if output_charge > 0 && output.online() {
+        let _ = pay(host, level, &output, output_charge);
+    }
+    let key = (host.dimension().to_owned(), pos);
+    let previous = with_core(|core| core.active.get(&key).copied());
+    if previous != Some(active) {
+        host.set_block_property(pos, "active", if active { "true" } else { "false" });
+        with_core(|core| core.active.insert(key, active));
+    }
+}
+
 /// An interface's tick (slice 15): pay its 4 FE/tick while the network is
 /// online, set `active` from that gate, then run one work pass per slot.
 ///
@@ -2860,10 +3108,8 @@ fn interface_tick(host: &mut dyn ServerHost, pos: [i32; 3], entity: &mut ModBloc
 
     // The network's storages, without this block's own buffer: extracting from
     // the buffer would just move items from a slot back into itself.
-    let live = live_disks(host, level, &net);
-    let external = live_external(host, level, &net);
-    let external_count = external.len();
-    let mut disks = network_disks(&live, &external);
+    let storages = storages(host, level, &net);
+    let mut disks = storages.disks();
 
     let wanted: Vec<Option<String>> = (0..runtime::INTERFACE_SLOTS)
         .map(|slot| {
@@ -2913,8 +3159,7 @@ fn interface_tick(host: &mut dyn ServerHost, pos: [i32; 3], entity: &mut ModBloc
     }
 
     let _ = host.transaction(|host, tx| {
-        write_back_in(host, tx, level, &live, &disks[external_count..]);
-        write_back_external_in(host, tx, level, &external, &disks[..external_count]);
+        storages.write_back(host, tx, level, &disks);
         Ok::<(), mod_api::PlayerDataRefusal>(())
     });
 }
@@ -3046,10 +3291,8 @@ fn machine_tick(
         return;
     }
     let target = neighbour(pos, face);
-    let live = live_disks(host, level, &net);
-    let external = live_external(host, level, &net);
-    let external_count = external.len();
-    let mut disks = network_disks(&live, &external);
+    let storages = storages(host, level, &net);
+    let mut disks = storages.disks();
     let work = Work {
         level,
         target,
@@ -3063,8 +3306,7 @@ fn machine_tick(
             Kind::Exporter => exporter_pass(host, tx, &work, &mut disks),
             _ => 0,
         };
-        write_back_in(host, tx, level, &live, &disks[external_count..]);
-        write_back_external_in(host, tx, level, &external, &disks[..external_count]);
+        storages.write_back(host, tx, level, &disks);
         Ok::<(), mod_api::PlayerDataRefusal>(())
     });
 }
@@ -3706,6 +3948,12 @@ pub(crate) fn on_register_commands(event: &mut RegisterCommandsEvent<'_>) {
     // client hook this port does not subscribe, so the readout is a command,
     // like `/refinedstorage info`).
     event.commands.push(Command::new("refinedstorage bound"));
+    // The relay's storage pass-through (slice 16): upstream toggles this on a
+    // GUI side button the pin cannot draw, so the same flag is read and written
+    // as a block state property by a command, like `/refinedstorage filter`.
+    event.commands.push(Command::new(
+        "refinedstorage relay <pos:block_pos> [state:text]",
+    ));
     // The network's buffer, filled through the capability an FE cable uses.
     // Upstream's controller is filled by its neighbours; the harness has no FE
     // generator, so this command is the source, as `/refinedstorage info` is
@@ -3746,6 +3994,19 @@ pub(crate) fn on_run_mod_command(
     }
     if sub == "grid" {
         grid_buffer(host, event.source);
+        return Flow::Cancel;
+    }
+    if sub == "relay" {
+        let Some(CommandArgumentValue::BlockPos(pos)) = event.command.argument("pos") else {
+            feedback(host, "Usage: /refinedstorage relay <x> <y> <z> [on|off]");
+            return Flow::Cancel;
+        };
+        let state = match event.command.argument("state") {
+            Some(CommandArgumentValue::String(s)) if s.eq_ignore_ascii_case("off") => Some(false),
+            Some(CommandArgumentValue::String(s)) if s.eq_ignore_ascii_case("on") => Some(true),
+            _ => None,
+        };
+        relay_config(host, *pos, state);
         return Flow::Cancel;
     }
     if sub == "charge" {
@@ -3955,6 +4216,39 @@ fn player_of(host: &mut dyn ServerHost, source: &CommandSource, why_not: &str) -
     }
 }
 
+/// `/refinedstorage relay <pos> [on|off]`: read or set the storage pass-through
+/// on a relay block (a harness/behaviour addition, the command form of the
+/// GUI's "Pass storage" side button).
+fn relay_config(host: &mut dyn ServerHost, pos: [i32; 3], set: Option<bool>) {
+    if kind_at(host, pos) != Some(Kind::Relay) {
+        feedback(host, "No relay there.");
+        return;
+    }
+    if let Some(on) = set {
+        host.set_block_property(
+            pos,
+            RELAY_STORAGE_PROPERTY,
+            if on { "true" } else { "false" },
+        );
+    }
+    let level = host.level(host.dimension());
+    let on = level.is_some_and(|level| relay_storage_on(host, level, pos));
+    let facing = level
+        .and_then(|level| facing_in(host, level, pos))
+        .map_or_else(|| "none".to_owned(), |face| face.property().to_owned());
+    feedback(
+        host,
+        &format!(
+            "Relay at {},{},{}: facing {}, storage pass-through {}",
+            pos[0],
+            pos[1],
+            pos[2],
+            facing,
+            if on { "on" } else { "off" }
+        ),
+    );
+}
+
 fn info(host: &mut dyn ServerHost, pos: [i32; 3]) {
     if kind_at(host, pos).is_none() {
         feedback(host, "No Refined Storage network block there.");
@@ -3972,11 +4266,16 @@ fn info(host: &mut dyn ServerHost, pos: [i32; 3]) {
                 .collect()
         });
         let disks = all.len();
-        // An external storage is network storage too: its faced container's
-        // stock is counted in the totals, while `disks` stays the drive's own
-        // census number.
+        // A relay's passed-through input network and an external storage are
+        // network storage too: their stock counts in the totals, while `disks`
+        // stays this network's own drive census.
         if let Some(level) = level {
-            all.extend(external_disks(&live_external(host, level, &net)));
+            all.extend(
+                live_relay(host, level, &net)
+                    .into_iter()
+                    .flat_map(|r| network_disks(&r.live, &r.external))
+                    .chain(external_disks(&live_external(host, level, &net))),
+            );
         }
         let items: u64 = all.iter().map(Disk::total).sum();
         let resources = runtime::aggregate(&all).len();
@@ -4015,6 +4314,7 @@ fn info(host: &mut dyn ServerHost, pos: [i32; 3]) {
         (Kind::Exporter, "exporter"),
         (Kind::ExternalStorage, "external storage"),
         (Kind::Interface, "interface"),
+        (Kind::Relay, "relay"),
     ] {
         let count = net.count(kind);
         if count > 0 {
@@ -4139,6 +4439,27 @@ fn info(host: &mut dyn ServerHost, pos: [i32; 3]) {
             ),
         );
     }
+    if kind_at(host, pos) == Some(Kind::Relay) {
+        let Some(level) = level else {
+            return;
+        };
+        let facing = facing_in(host, level, pos)
+            .map_or_else(|| "none".to_owned(), |face| face.property().to_owned());
+        let passing = relay_storage_on(host, level, pos);
+        let per_node = runtime::RELAY_INPUT_USAGE;
+        let total = per_node + runtime::relay_output_usage(passing);
+        feedback(
+            host,
+            &format!(
+                "Relay at {},{},{}: facing {}, storage pass-through {}, {per_node} FE/tick per node ({total} FE/tick total)",
+                pos[0],
+                pos[1],
+                pos[2],
+                facing,
+                if passing { "on" } else { "off" },
+            ),
+        );
+    }
     if let Some(Kind::Importer | Kind::Exporter) = kind_at(host, pos) {
         let Some(level) = host.level(host.dimension()) else {
             return;
@@ -4171,7 +4492,7 @@ fn wireless(
     pos: [i32; 3],
     level: LevelRef,
 ) {
-    if node_at(host, level, pos).map(|node| node.kind) != Some(Kind::WirelessTransmitter) {
+    if node_at(host, level, pos).first().map(|node| node.kind) != Some(Kind::WirelessTransmitter) {
         feedback(host, "No wireless transmitter there.");
         return;
     }
