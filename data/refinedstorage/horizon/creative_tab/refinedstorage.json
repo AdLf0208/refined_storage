@@ -40,6 +40,10 @@
     "refinedstorage:interface",
     "refinedstorage:speed_upgrade",
     "refinedstorage:stack_upgrade",
-    "refinedstorage:relay"
+    "refinedstorage:relay",
+    "refinedstorage:1k_storage_block",
+    "refinedstorage:4k_storage_block",
+    "refinedstorage:16k_storage_block",
+    "refinedstorage:64k_storage_block"
   ]
 }

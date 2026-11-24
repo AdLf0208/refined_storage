@@ -25,9 +25,10 @@ mod runtime;
 mod support;
 
 use mod_api::{
-    self, BlockDropsEvent, ComponentTypesEvent, Flow, Hooks, HostSide, LevelHost, MenuClickedEvent,
-    MenuClosedEvent, RegisterCommandsEvent, Registrar, RegistrationContext, RightClickBlockEvent,
-    RunModCommandEvent, ServerHost, ServerStartedEvent, ServerTickEvent, WorldLifecycleEvent,
+    self, BlockDropsEvent, ComponentTypesEvent, Flow, Hooks, HostSide, LevelHost, LootDropsEvent,
+    MenuClickedEvent, MenuClosedEvent, RegisterCommandsEvent, Registrar, RegistrationContext,
+    RightClickBlockEvent, RunModCommandEvent, ServerHost, ServerStartedEvent, ServerTickEvent,
+    WorldLifecycleEvent,
 };
 
 /// The mod holds no state of its own: everything the network needs is derived
@@ -71,6 +72,13 @@ impl Hooks for Mod {
     /// break on its own item.
     fn block_drops(&self, level: &dyn LevelHost, event: &mut BlockDropsEvent<'_>) -> Flow {
         support::on_block_drops(level, event)
+    }
+
+    /// Loot for a broken block or mob was rolled. This is the hook this pin
+    /// actually dispatches for a break: a storage block puts its contents on
+    /// the dropped block item here (upstream's `StorageBlockLootItemFunction`).
+    fn loot_drops(&self, host: &mut dyn ServerHost, event: &mut LootDropsEvent<'_>) {
+        support::on_loot_drops(host, event)
     }
 
     /// `/refinedstorage info|filter|wireless|bound`.

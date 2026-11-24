@@ -1,0 +1,17 @@
+{
+  "type": "minecraft:crafting_shaped",
+  "pattern": [
+    "EPE",
+    "EME",
+    "ERE"
+  ],
+  "key": {
+    "E": "refinedstorage:quartz_enriched_iron",
+    "P": "refinedstorage:16k_storage_part",
+    "M": "refinedstorage:machine_casing",
+    "R": "#c:dusts/redstone"
+  },
+  "result": {
+    "id": "refinedstorage:16k_storage_block"
+  }
+}

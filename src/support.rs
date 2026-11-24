@@ -22,9 +22,9 @@ use mod_api::{
     CommandArgumentValue, CommandInvocation, CommandSource, Component, Compound, CraftingGrid,
     CraftingRecipeCodec, CraftingRecipeKind, ENERGY, Flow, GameMode, Hand, Host, HostSide,
     HostTransaction, ITEM_ENERGY, ITEMS, InteractionResult, ItemDrop, ItemKey, ItemPart, ItemPlace,
-    ItemResource, ItemStack, LevelHost, LevelRef, LevelSide, MenuClickedEvent, MenuClosedEvent,
-    MenuContainer, MenuPart, MenuRef, MenuReplace, MenuSlotBacking, MenuSlotRulesEvent,
-    ModBlockEntityView, ModContainer, ModEnergyBuffer, OnBlockPlacedByEvent,
+    ItemResource, ItemStack, LevelHost, LevelRef, LevelSide, LootDropsEvent, MenuClickedEvent,
+    MenuClosedEvent, MenuContainer, MenuPart, MenuRef, MenuReplace, MenuSlotBacking,
+    MenuSlotRulesEvent, ModBlockEntityView, ModContainer, ModEnergyBuffer, OnBlockPlacedByEvent,
     OnDestroyedByPlayerEvent, PlayerRef, RegisterCommandsEvent, Registrar, RegistrationContext,
     RightClickBlockEvent, RunModCommandEvent, Screen, ScreenEvent, ServerHost, ServerTickEvent,
     ServerTickPhase, StateForPlacementEvent, Tag, Text, UseItemEvent, UseOnEvent, WorldPhase,
@@ -67,6 +67,11 @@ const INTERFACE: &str = "refinedstorage:interface";
 /// The relay (slice 16): two network nodes in one block, joining the input
 /// network on every face but its `facing` and the output network on that face.
 const RELAY: &str = "refinedstorage:relay";
+
+/// The four finite storage-block tiers (upstream `ItemStorageVariant`). A
+/// storage block has its own fixed-capacity storage, not a disk slot; its
+/// contents travel on the block item's `refinedstorage:storage` component.
+const STORAGE_BLOCKS: [&str; 4] = runtime::STORAGE_BLOCK_IDS;
 /// The range upgrade (slice 6): +8 blocks each, at most four per transmitter
 /// (upstream `RangeUpgradeItem`, registered for `WIRELESS_TRANSMITTER`).
 const RANGE_UPGRADE: &str = "refinedstorage:range_upgrade";
@@ -177,6 +182,10 @@ struct Keys {
     external_storage: BlockKey,
     interface: BlockKey,
     relay: BlockKey,
+    /// The four fixed-capacity storage blocks (slice 17).
+    storage_blocks: [BlockKey; 4],
+    /// The four blocks' items, whose component carries their storage.
+    storage_block_items: [ItemKey; 4],
     /// The five storage disk items, upstream's `ItemStorageVariant`. Which one a
     /// stack is decides its capacity (`runtime::disk_capacity`); a drive takes
     /// any of them.
@@ -210,6 +219,11 @@ impl Keys {
         ]
         .into_iter()
         .find_map(|(key, kind)| (key == block).then_some(kind))
+        .or_else(|| {
+            self.storage_blocks
+                .contains(&block)
+                .then_some(Kind::StorageBlock)
+        })
     }
 
     /// The kind whose item `item` is, for the three that carry their slots.
@@ -221,6 +235,11 @@ impl Keys {
         ]
         .into_iter()
         .find_map(|(key, kind)| (key == item).then_some(kind))
+        .or_else(|| {
+            self.storage_block_items
+                .contains(&item)
+                .then_some(Kind::StorageBlock)
+        })
     }
 
     /// The item the block of `kind` drops as.
@@ -235,7 +254,10 @@ impl Keys {
             | Kind::Grid
             | Kind::ExternalStorage
             | Kind::Interface
-            | Kind::Relay => None,
+            | Kind::Relay
+            // A storage block's contents ride on its item through the storage
+            // component, not through the machine-slots carry path.
+            | Kind::StorageBlock => None,
         }
     }
 }
@@ -262,6 +284,8 @@ pub(crate) fn register(registrar: &mut dyn Registrar, _cx: &RegistrationContext)
         external_storage: registrar.block_key(EXTERNAL_STORAGE),
         interface: registrar.block_key(INTERFACE),
         relay: registrar.block_key(RELAY),
+        storage_blocks: STORAGE_BLOCKS.map(|id| registrar.block_key(id)),
+        storage_block_items: STORAGE_BLOCKS.map(|id| registrar.item_key(id)),
         disks: [
             registrar.item_key(DISK),
             registrar.item_key(DISK_4K),
@@ -289,6 +313,12 @@ pub(crate) fn register(registrar: &mut dyn Registrar, _cx: &RegistrationContext)
         keys.exporter_item,
         keys.transmitter_item,
     ] {
+        registrar.item_part(item, CarriedContents);
+    }
+    // A storage block's item carries the block's storage component back to the
+    // placed block entity (`AbstractStorageContainerBlockItem`), the same
+    // placement moment the machines use for their slots.
+    for item in keys.storage_block_items {
         registrar.item_part(item, CarriedContents);
     }
     // The wireless grid's own energy buffer (slice 9): upstream's item is an
@@ -327,6 +357,10 @@ pub(crate) fn register(registrar: &mut dyn Registrar, _cx: &RegistrationContext)
             EXTERNAL_STORAGE,
             INTERFACE,
             RELAY,
+            STORAGE_BLOCKS[0],
+            STORAGE_BLOCKS[1],
+            STORAGE_BLOCKS[2],
+            STORAGE_BLOCKS[3],
         ])
         .build();
     registrar
@@ -772,6 +806,96 @@ fn write_disk(host: &dyn Host, stack: &mut ItemStack, disk: &Disk<Net>) {
             stacks: entries,
         },
     );
+}
+
+// --- the storage block (slice 17) ------------------------------------------
+
+/// The saved-data key holding a storage block's own storage. Upstream keeps it
+/// in a world-level `StorageRepository` by UUID (`StorageBlockBlockEntity.sid`);
+/// the port's stand-in is the block entity's own compound, which the API can
+/// write transactionally through `BlockEntityRef::merge_data`.
+const STORAGE_BLOCK_KEY: &str = "RefinedStorageStorage";
+
+/// One storage block in a network, read from its block entity's saved data.
+/// Its capacity is fixed by the block's tier, never by a component the player
+/// can doctor (upstream `ItemStorageBlockProvider.createStorage`).
+struct LiveStorageBlock {
+    pos: [i32; 3],
+    disk: Disk<Net>,
+}
+
+/// The four-tier storage of `net`, read where the blocks lie. Unlike a drive's
+/// disks there is no tick cache: a storage block's data is written back by the
+/// transaction that moved the items, so a grid and a machine always read the
+/// same value.
+fn live_blocks(
+    host: &dyn Host,
+    level: LevelRef,
+    net: &runtime::Network,
+    dimension: &str,
+) -> Vec<LiveStorageBlock> {
+    let mut out = Vec::new();
+    for pos in net.of_kind(Kind::StorageBlock) {
+        let Some(tier) = storage_tier_at(host, level, pos) else {
+            continue;
+        };
+        let capacity = runtime::storage_block_capacity(STORAGE_BLOCKS[tier])
+            .expect("every storage block id has a capacity");
+        let disk = with_core(|core| {
+            core.blocks
+                .get(&(dimension.to_owned(), pos))
+                .cloned()
+                .or_else(|| {
+                    let entity = host.block_entity(level, pos)?;
+                    let data = entity.data(host)?;
+                    let mut disk = Disk::new(capacity);
+                    if let Some(Tag::List(entries)) = field(&data, STORAGE_BLOCK_KEY) {
+                        let stored: Vec<Net> = compounds(entries)
+                            .iter()
+                            .filter_map(|entry| ItemStack::from_nbt(host, entry))
+                            .map(|stack| Net::of(host, &stack))
+                            .collect();
+                        disk.set_entries(stored);
+                    }
+                    core.blocks
+                        .insert((dimension.to_owned(), pos), disk.clone());
+                    Some(disk)
+                })
+        })
+        .unwrap_or_else(|| Disk::new(capacity));
+        out.push(LiveStorageBlock { pos, disk });
+    }
+    out
+}
+
+/// The saved payload of a storage block's disk: an empty list clears it.
+fn storage_block_data(host: &dyn Host, disk: &Disk<Net>) -> Compound {
+    let stacks: Vec<Tag> = disk
+        .entries()
+        .iter()
+        .filter_map(|entry| entry.stack().to_nbt(host))
+        .map(Tag::Compound)
+        .collect();
+    Compound::from([(STORAGE_BLOCK_KEY.into(), Tag::List(stacks))])
+}
+
+/// Write back every storage block whose contents changed, in the same
+/// transaction the grid or machine used for the move. The order matches
+/// [`live_blocks`], so each segment belongs to the block that produced it.
+/// The cache is what the block's own tick flushes into its saved payload: the
+/// engine rebuilds a mod block entity's payload from the tick's compound, so a
+/// write made through `/data merge` or `merge_data` is lost on the next tick
+/// (measured on 0.2.17's first in-game leg).
+fn write_back_blocks(live: &[LiveStorageBlock], disks: &[Disk<Net>], dimension: &str) {
+    for (block, entries) in live.iter().zip(disks.iter()) {
+        if &block.disk == entries {
+            continue;
+        }
+        with_core(|core| {
+            core.blocks
+                .insert((dimension.to_owned(), block.pos), entries.clone());
+        });
+    }
 }
 
 // --- the in-place disk upgrade (slice 12) ----------------------------------
@@ -1523,6 +1647,7 @@ fn network_disks(live: &[LiveDisk], external: &[LiveExternal]) -> Vec<Disk<Net>>
 struct LiveRelay {
     live: Vec<LiveDisk>,
     external: Vec<LiveExternal>,
+    blocks: Vec<LiveStorageBlock>,
 }
 
 /// Everything a network can store: relay pass-throughs first, then its own
@@ -1533,6 +1658,7 @@ struct Storages {
     relay: Vec<LiveRelay>,
     live: Vec<LiveDisk>,
     external: Vec<LiveExternal>,
+    blocks: Vec<LiveStorageBlock>,
 }
 
 const FACES: [Face; 6] = [
@@ -1609,6 +1735,7 @@ fn live_relay(
         out.push(LiveRelay {
             live: live_disks(host, level, &input),
             external: live_external(host, level, &input),
+            blocks: live_blocks(host, level, &input, host.dimension()),
         });
     }
     out
@@ -1621,6 +1748,7 @@ fn storages(host: &mut dyn ServerHost, level: LevelRef, net: &runtime::Network) 
         relay: live_relay(host, level, net),
         live: live_disks(host, level, net),
         external: live_external(host, level, net),
+        blocks: live_blocks(host, level, net, host.dimension()),
     }
 }
 
@@ -1628,8 +1756,13 @@ impl Storages {
     fn disks(&self) -> Vec<Disk<Net>> {
         self.relay
             .iter()
-            .flat_map(|r| network_disks(&r.live, &r.external))
+            .flat_map(|r| {
+                network_disks(&r.live, &r.external)
+                    .into_iter()
+                    .chain(r.blocks.iter().map(|block| block.disk.clone()))
+            })
             .chain(network_disks(&self.live, &self.external))
+            .chain(self.blocks.iter().map(|block| block.disk.clone()))
             .collect()
     }
 
@@ -1641,11 +1774,12 @@ impl Storages {
         host: &mut dyn ServerHost,
         tx: &mod_api::Transaction,
         level: LevelRef,
+        dimension: &str,
         disks: &[Disk<Net>],
     ) {
         let mut at = 0;
         for relay in &self.relay {
-            let len = relay.external.len() + relay.live.len();
+            let len = relay.external.len() + relay.live.len() + relay.blocks.len();
             let segment = &disks[at..at + len];
             write_back_external_in(
                 host,
@@ -1659,13 +1793,20 @@ impl Storages {
                 tx,
                 level,
                 &relay.live,
-                &segment[relay.external.len()..],
+                &segment[relay.external.len()..relay.external.len() + relay.live.len()],
+            );
+            write_back_blocks(
+                &relay.blocks,
+                &segment[relay.external.len() + relay.live.len()..],
+                dimension,
             );
             at += len;
         }
         let own = &disks[at..];
         write_back_external_in(host, tx, level, &self.external, &own[..self.external.len()]);
-        write_back_in(host, tx, level, &self.live, &own[self.external.len()..]);
+        let local = &own[self.external.len()..];
+        write_back_in(host, tx, level, &self.live, &local[..self.live.len()]);
+        write_back_blocks(&self.blocks, &local[self.live.len()..], dimension);
     }
 }
 
@@ -1794,7 +1935,8 @@ pub(crate) fn on_menu_clicked(host: &mut dyn ServerHost, event: &MenuClickedEven
     let moved = apply_plan(host, &click, &plan, &mut disks);
     if moved {
         let _ = host.transaction(|host, tx| {
-            storages.write_back(host, tx, level, &disks);
+            let dimension = host.dimension().to_owned();
+            storages.write_back(host, tx, level, &dimension, &disks);
             Ok::<(), mod_api::PlayerDataRefusal>(())
         });
     }
@@ -2377,6 +2519,10 @@ fn charge_of(host: &dyn Host, level: LevelRef, kind: Kind, pos: [i32; 3]) -> u32
     let fit = match kind {
         Kind::WirelessTransmitter => fit_at(host, level, pos, TRANSMITTER_SLOTS),
         Kind::Importer | Kind::Exporter => fit_at(host, level, pos, MACHINE_SLOTS),
+        Kind::StorageBlock => Fit {
+            storage_tier: storage_tier_at(host, level, pos).unwrap_or(0),
+            ..Fit::default()
+        },
         _ => Fit::default(),
     };
     let disks = if kind == Kind::DiskDrive {
@@ -2485,6 +2631,7 @@ impl BlockEntityPart for Network {
                     | Kind::ExternalStorage
                     | Kind::Interface
                     | Kind::Relay
+                    | Kind::StorageBlock
             )
         );
     }
@@ -2504,6 +2651,7 @@ impl BlockEntityPart for Network {
             Some(Kind::ExternalStorage) => external_storage_tick(host, pos),
             Some(Kind::Interface) => interface_tick(host, pos, &mut event.entity),
             Some(Kind::Relay) => relay_tick(host, pos, &mut event.entity),
+            Some(Kind::StorageBlock) => storage_block_tick(host, pos, &mut event.entity),
             None => {}
         }
     }
@@ -2605,7 +2753,13 @@ impl BlockEntityPart for Network {
                     ..Screen::default()
                 })
             }
-            Kind::Controller | Kind::Cable | Kind::ExternalStorage | Kind::Relay => None,
+            Kind::Controller
+            | Kind::Cable
+            | Kind::ExternalStorage
+            | Kind::Relay
+            // The artefact's storage-block screen is a nine-slot filter GUI the
+            // pin cannot draw; the storage is driven from the network's grid.
+            | Kind::StorageBlock => None,
         }
     }
 }
@@ -2822,15 +2976,24 @@ fn grid_tick(host: &mut dyn ServerHost, pos: [i32; 3], entity: &mut ModBlockEnti
     let relays = level.map_or_else(Vec::new, |level| live_relay(host, level, &net));
     let relay_disks: Vec<Disk<Net>> = relays
         .iter()
-        .flat_map(|r| network_disks(&r.live, &r.external))
+        .flat_map(|r| {
+            network_disks(&r.live, &r.external)
+                .into_iter()
+                .chain(r.blocks.iter().map(|block| block.disk.clone()))
+        })
         .collect();
     let relay_count = relay_disks.len();
     let external = level.map_or_else(Vec::new, |level| live_external(host, level, &net));
     let external_count = external.len();
+    // Storage blocks come last: their own storage is read from the cache the
+    // block's tick flushes into its saved payload, like a drive's disks.
+    let blocks = level.map_or_else(Vec::new, |level| live_blocks(host, level, &net, &dimension));
+    let block_count = blocks.len();
     let mut disks: Vec<Disk<Net>> = relay_disks
         .into_iter()
         .chain(external.iter().map(|storage| storage.disk.clone()))
         .chain(drive_disks)
+        .chain(blocks.iter().map(|block| block.disk.clone()))
         .collect();
 
     let mut state = view_state(host, entity);
@@ -2916,7 +3079,7 @@ fn grid_tick(host: &mut dyn ServerHost, pos: [i32; 3], entity: &mut ModBlockEnti
         let _ = host.transaction(|host, tx| {
             let mut at = 0;
             for relay in &relays {
-                let len = relay.external.len() + relay.live.len();
+                let len = relay.external.len() + relay.live.len() + relay.blocks.len();
                 let segment = &disks[at..at + len];
                 write_back_external_in(
                     host,
@@ -2930,7 +3093,12 @@ fn grid_tick(host: &mut dyn ServerHost, pos: [i32; 3], entity: &mut ModBlockEnti
                     tx,
                     level,
                     &relay.live,
-                    &segment[relay.external.len()..],
+                    &segment[relay.external.len()..relay.external.len() + relay.live.len()],
+                );
+                write_back_blocks(
+                    &relay.blocks,
+                    &segment[relay.external.len() + relay.live.len()..],
+                    &dimension,
                 );
                 at += len;
             }
@@ -2943,6 +3111,10 @@ fn grid_tick(host: &mut dyn ServerHost, pos: [i32; 3], entity: &mut ModBlockEnti
             );
             Ok::<(), mod_api::BlockEntityItemError>(())
         });
+    }
+    if block_count > 0 {
+        let from = relay_count + external_count + used.len();
+        write_back_blocks(&blocks, &disks[from..from + block_count], &dimension);
     }
 
     // Rebuild the view: the player's own stacks stay, the rest shows what the
@@ -3032,6 +3204,59 @@ fn external_storage_tick(host: &mut dyn ServerHost, pos: [i32; 3]) {
             level,
             &net,
             runtime::usage(Kind::ExternalStorage, Fit::default(), 0),
+        );
+    }
+}
+
+/// Which finite storage-block tier the block at `pos` is (0 = 1k … 3 = 64k).
+/// The four tiers share one `Kind`, so the charge and the info readout recover
+/// the tier from the block id rather than from the network census.
+fn storage_tier_at(host: &dyn Host, level: LevelRef, pos: [i32; 3]) -> Option<usize> {
+    let block = level.block(host, pos)?;
+    keys().storage_blocks.iter().position(|key| *key == block)
+}
+
+/// A storage block's tick (slice 17): upstream's `StorageBlock` ticker runs
+/// `updateActiveness` and `doWork` on the block's storage node, which pays its
+/// tier's FE per tick. The 2.0.9 blockstate declares no `active` property, so
+/// there is no state to write; the storage itself is read live by whichever
+/// grid or machine uses the network (the port's stand-in for upstream's
+/// world-level storage repository is the block entity's saved data).
+fn storage_block_tick(
+    host: &mut dyn ServerHost,
+    pos: [i32; 3],
+    entity: &mut ModBlockEntityView<'_>,
+) {
+    let dimension = host.dimension().to_owned();
+    let Some(level) = host.level(&dimension) else {
+        return;
+    };
+    let Some(tier) = storage_tier_at(&*host, level, pos) else {
+        return;
+    };
+    // Flush the cache the grids and machines wrote into this block's saved
+    // payload. The engine rebuilds a mod block entity's payload from the tick's
+    // compound, so this is the only write that survives the next tick.
+    let pending = with_core(|core| core.blocks.get(&(dimension.clone(), pos)).cloned());
+    if let Some(disk) = pending {
+        let data = storage_block_data(&*host, &disk);
+        if let Some(Tag::List(entries)) = field(&data, STORAGE_BLOCK_KEY) {
+            entity
+                .nbt
+                .insert(STORAGE_BLOCK_KEY.into(), Tag::List(entries.clone()));
+        }
+    }
+    let net = network_at(host, pos);
+    if net.online() {
+        let fit = Fit {
+            storage_tier: tier,
+            ..Fit::default()
+        };
+        pay(
+            host,
+            level,
+            &net,
+            runtime::usage(Kind::StorageBlock, fit, 0),
         );
     }
 }
@@ -3159,7 +3384,8 @@ fn interface_tick(host: &mut dyn ServerHost, pos: [i32; 3], entity: &mut ModBloc
     }
 
     let _ = host.transaction(|host, tx| {
-        storages.write_back(host, tx, level, &disks);
+        let dimension = host.dimension().to_owned();
+        storages.write_back(host, tx, level, &dimension, &disks);
         Ok::<(), mod_api::PlayerDataRefusal>(())
     });
 }
@@ -3306,7 +3532,8 @@ fn machine_tick(
             Kind::Exporter => exporter_pass(host, tx, &work, &mut disks),
             _ => 0,
         };
-        storages.write_back(host, tx, level, &disks);
+        let dimension = host.dimension().to_owned();
+        storages.write_back(host, tx, level, &dimension, &disks);
         Ok::<(), mod_api::PlayerDataRefusal>(())
     });
 }
@@ -3414,6 +3641,132 @@ fn drive_keys(dimension: &str, drives: &[[i32; 3]]) -> Vec<DiskKey> {
         .collect()
 }
 
+// --- a storage block's contents on its item (slice 17) ---------------------
+
+/// The capacity of a storage block tier, for the one storage node a grid reads.
+fn storage_block_capacity_of(tier: usize) -> u64 {
+    runtime::storage_block_capacity(STORAGE_BLOCKS[tier])
+        .expect("every declared storage block has a finite capacity")
+}
+
+/// A storage block item was placed: seed the block entity's saved storage with
+/// the component the item carried, so a block broken with items keeps them.
+/// An item with no component is an empty block.
+fn seed_storage_block(host: &mut dyn ServerHost, event: &mut OnBlockPlacedByEvent<'_>) {
+    let Some(tier) = keys()
+        .storage_block_items
+        .iter()
+        .position(|item| *item == event.stack.item())
+    else {
+        return;
+    };
+    let saved = event.stack.get(&StorageComponent);
+    let mut disk = Disk::new(storage_block_capacity_of(tier));
+    if let Some(saved) = saved {
+        let stored: Vec<Net> = saved
+            .stacks
+            .iter()
+            .filter_map(|entry| ItemStack::from_nbt(&*host, entry))
+            .map(|stack| Net::of(&*host, &stack))
+            .collect();
+        disk.set_entries(stored);
+    }
+    // Seed the cache; the block's own tick flushes it into its saved payload.
+    with_core(|core| {
+        core.blocks
+            .insert((host.dimension().to_owned(), event.pos), disk);
+    });
+    // In creative the stack is kept, so the payload just delivered comes off
+    // the hand — but only when the whole stack was the placed unit. In survival
+    // the engine consumes that unit and every other unit keeps its own payload.
+    let creative =
+        event.placer.and_then(|player| player.game_mode(&*host)) == Some(GameMode::Creative);
+    if runtime::placed_hand(creative, event.stack.count()) == runtime::PlacedHand::StripPlaced {
+        strip_storage_from_hand(host, event.placer, event.stack);
+    }
+}
+
+/// Clear the `refinedstorage:storage` component from the hand that placed a
+/// creative storage block, so the same payload cannot be delivered twice.
+fn strip_storage_from_hand(
+    host: &mut dyn ServerHost,
+    placer: Option<PlayerRef>,
+    stack: &ItemStack,
+) {
+    let Some(player) = placer else {
+        return;
+    };
+    let Some(slot) = hand_holding(host, &player, stack) else {
+        return;
+    };
+    let Some(patch) = stack.components() else {
+        return;
+    };
+    let mut patch = patch.as_nbt().clone();
+    if field(&patch, COMPONENT).is_none() {
+        return;
+    }
+    patch = without_key(&patch, COMPONENT);
+    let mut stripped = stack.clone();
+    if stripped.set_components(patch).is_err() || stripped == *stack {
+        return;
+    }
+    let _ = host.transaction(|host, _tx| player.set_inventory_slot(host, slot, Some(stripped)));
+}
+
+// --- the storage block's drop (slice 17) -----------------------------------
+
+/// The loot tables of the four storage blocks, as the engine names them in the
+/// dispatched `loot_drops` hook (`<namespace>:blocks/<id>`).
+const STORAGE_TABLES: [&str; 4] = [
+    "refinedstorage:blocks/1k_storage_block",
+    "refinedstorage:blocks/4k_storage_block",
+    "refinedstorage:blocks/16k_storage_block",
+    "refinedstorage:blocks/64k_storage_block",
+];
+
+/// Upstream's `StorageBlockLootItemFunction`: the block item a player gets on a
+/// break carries the block's storage. This pin dispatches `loot_drops` for a
+/// break, so the transfer happens here — read the cache the tick keeps flushed,
+/// put its `refinedstorage:storage` component on the drop, and supply the item
+/// if the loot table was not asked.
+pub(crate) fn on_loot_drops(host: &mut dyn ServerHost, event: &mut LootDropsEvent<'_>) {
+    let Some(tier) = STORAGE_TABLES
+        .iter()
+        .position(|table| *table == event.context.table)
+    else {
+        return;
+    };
+    let Some((pos, _state)) = event.context.block else {
+        return;
+    };
+    let disk = with_core(|core| {
+        core.blocks
+            .remove(&(event.context.dimension.to_owned(), pos))
+    })
+    .unwrap_or_else(|| Disk::new(storage_block_capacity_of(tier)));
+    let stacks: Vec<Compound> = disk
+        .entries()
+        .iter()
+        .filter_map(|entry| entry.stack().to_nbt(&*host))
+        .collect();
+    let mut patch = Compound::new();
+    patch.insert(
+        COMPONENT.into(),
+        StorageComponent.encode(SavedDisk {
+            capacity: Some(disk.capacity()),
+            stacks,
+        }),
+    );
+    let item = keys().storage_block_items[tier];
+    if let Some(drop) = event.drops.iter_mut().find(|drop| drop.item() == item) {
+        let _ = drop.apply_components(&patch);
+    } else if let Some(mut stack) = ItemStack::new(item, 1) {
+        let _ = stack.apply_components(&patch);
+        event.drops.push(stack);
+    }
+}
+
 // --- a broken machine's slots on its item (slice 10) -----------------------
 
 /// A player is breaking a block: when it is a machine that owns its slots, take
@@ -3498,6 +3851,8 @@ pub(crate) fn on_block_drops(level: &dyn LevelHost, event: &mut BlockDropsEvent<
     let Some(kind) = Kind::from_block(block) else {
         return Flow::Continue;
     };
+    // This pin's `block_drops` hook is not the one fired for a storage block's
+    // break; the contents travel on the drop through `on_loot_drops` below.
     if !kind.carries_contents() {
         return Flow::Continue;
     }
@@ -3569,6 +3924,10 @@ impl ItemPart for CarriedContents {
         let Some(kind) = keys().kind_of_item(event.stack.item()) else {
             return;
         };
+        if kind == Kind::StorageBlock {
+            seed_storage_block(host, event);
+            return;
+        }
         let Some(carried) = contents_of(event.stack) else {
             return;
         };
@@ -3719,6 +4078,9 @@ fn without_key(data: &Compound, name: &str) -> Compound {
 struct Core {
     /// Each loaded drive slot that holds a storage disk.
     disks: HashMap<DiskKey, Disk<Net>>,
+    /// Each loaded storage block's own storage, by dimension and position.
+    /// The block's tick flushes changes into its saved payload.
+    blocks: HashMap<(String, [i32; 3]), Disk<Net>>,
     /// Disk caches a grid changed and their drive has not written back yet.
     dirty: HashSet<DiskKey>,
     /// Each grid's transient search, by dimension and position (upstream's
@@ -3755,8 +4117,7 @@ struct Core {
 
 /// What a broken machine's drop carries: where it broke, which tick, and the
 /// slots it held — as the item NBT `block_drops` puts on the drop, and as the
-/// stacks its fallback spawns (that hook has no game host to convert one into
-/// the other).
+/// stacks its fallback spawns.
 struct Carried {
     dimension: String,
     pos: [i32; 3],
@@ -4273,8 +4634,17 @@ fn info(host: &mut dyn ServerHost, pos: [i32; 3]) {
             all.extend(
                 live_relay(host, level, &net)
                     .into_iter()
-                    .flat_map(|r| network_disks(&r.live, &r.external))
-                    .chain(external_disks(&live_external(host, level, &net))),
+                    .flat_map(|r| {
+                        network_disks(&r.live, &r.external)
+                            .into_iter()
+                            .chain(r.blocks.into_iter().map(|block| block.disk))
+                    })
+                    .chain(external_disks(&live_external(host, level, &net)))
+                    .chain(
+                        live_blocks(host, level, &net, &dimension)
+                            .into_iter()
+                            .map(|block| block.disk),
+                    ),
             );
         }
         let items: u64 = all.iter().map(Disk::total).sum();
@@ -4315,6 +4685,7 @@ fn info(host: &mut dyn ServerHost, pos: [i32; 3]) {
         (Kind::ExternalStorage, "external storage"),
         (Kind::Interface, "interface"),
         (Kind::Relay, "relay"),
+        (Kind::StorageBlock, "storage block"),
     ] {
         let count = net.count(kind);
         if count > 0 {
@@ -4391,6 +4762,35 @@ fn info(host: &mut dyn ServerHost, pos: [i32; 3]) {
                     "capacity "
                 },
                 found.join(", "),
+            ),
+        );
+    }
+    if kind_at(host, pos) == Some(Kind::StorageBlock) {
+        let Some(level) = level else {
+            return;
+        };
+        let Some(tier) = storage_tier_at(host, level, pos) else {
+            return;
+        };
+        let stored = live_blocks(host, level, &net, host.dimension())
+            .into_iter()
+            .find(|block| block.pos == pos)
+            .map_or(0, |block| block.disk.total());
+        let capacity = storage_block_capacity_of(tier);
+        let name = match tier {
+            0 => "1k",
+            1 => "4k",
+            2 => "16k",
+            _ => "64k",
+        };
+        feedback(
+            host,
+            &format!(
+                "Storage block at {},{},{}: {name}, {stored}/{capacity} items, {} FE/tick",
+                pos[0],
+                pos[1],
+                pos[2],
+                runtime::storage_block_usage(tier),
             ),
         );
     }

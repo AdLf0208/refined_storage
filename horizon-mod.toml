@@ -1,6 +1,6 @@
 id = "refinedstorage"
 name = "Refined Storage"
-version = "0.2.16"
+version = "0.2.17"
 description = """A port of Refined Storage 2.0.9 for Horizon, scoped to the item network core: a
 controller (a network is online when its connected component holds one), a cable with its six
 connection states, a disk drive with nine slots of storage disks, the 1k storage disk (1,024 items,
@@ -49,8 +49,12 @@ holds two network nodes in one block: its input side joins every face but its ou
 output side joins only that face, and with storage pass-through on the output network sees the input
 network's disks and external inventories as its own — a grid there lists them and a deposit lands
 in them, while turning pass-through off or breaking the relay stops it. Each of the two nodes costs
-8 FE a tick. Crafters, the security manager, the portable grid, autocrafting and fluid storage are
-the port's gap list, not this version."""
+8 FE a tick. A storage block holds its own fixed-capacity storage — 1k (1,024), 4k (4,096), 16k
+(16,384) or 64k (65,536) items, charged 2/4/6/8 FE a tick by tier, with no disk slot: a grid on the
+same network lists what the block holds and deposits into it, and breaking the block keeps its
+contents in the dropped block item so placing it again restores them. Crafters, the security
+manager, the portable grid, autocrafting and fluid storage are the port's gap list, not this
+version."""
 authors = ["Refined Mods", "AdLf0208"]
 license = "MIT"
 homepage = "https://github.com/AdLf0208/refinedstorage"

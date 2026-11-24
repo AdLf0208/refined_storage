@@ -96,6 +96,8 @@
 # none), so the run fails now that the engine's spill is left intact;
 # SELFTEST=relay asserts the old no-relay answer (0 items on the output network)
 # after the working relay has passed the input disk's 8, so the run fails.
+# SELFTEST=storageblock asserts the old no-block answer (0 items on the network)
+# after the working storage block has contributed 5, so the run fails.
 #
 # Slice 8 (the controller's energy model):
 #  - the controller's buffer is 1,000 FE, its `energy_type` is upstream's four
@@ -1460,10 +1462,17 @@ use_held
 ctl wait 10
 opened=$(ctl messages 8 | jq -r '.chat[]' | grep -m1 'Wireless grid .*: opened' || true)
 echo "  use 17 blocks out with the range upgrade: $opened"
+# The player drifts by up to a tenth of a block between `ctl tp` and the use
+# when the box is loaded (16.9 was measured). What proves the upgrade is that a
+# use this far opens at all and names the raised 24-block range: the base 16
+# refused the same use earlier in this leg.
 case "$opened" in
-    *"opened (17.0 of 24 blocks"*) ;;
-    *) fail "the wireless grid did not open 17.0 blocks out with the range upgrade: '$opened'" ;;
+    *"opened ("*" of 24 blocks"*) ;;
+    *) fail "the wireless grid did not open 17 blocks out with the range upgrade: '$opened'" ;;
 esac
+opened_at=$(printf '%s' "$opened" | sed -n 's/.*opened (\([0-9.]*\) of 24 blocks.*/\1/p')
+awk -v d="$opened_at" 'BEGIN { exit !(d >= 16.0 && d <= 17.5) }' \
+    || fail "the raised-range use reported $opened_at blocks, expected 16.0..17.5: '$opened'"
 ctl screen | jq -e '.screen == "container"' >/dev/null \
     || fail "the raised range did not open the grid's view: $(ctl screen | jq -c '{screen}')"
 charge_net
@@ -1610,18 +1619,29 @@ echo "  after 20 ticks at 0 FE: ${starved:-0} items on the network (was ${starve
 [ "${starved:-0}" = "${starved_base:-0}" ] \
     || fail "an importer its network cannot pay moved $((starved - starved_base)) items"
 charge minecraft:the_end 40 64 16
-# The un-upgraded machine moves one item per nine ticks: a 20-tick window sees
-# the first pass and one or two more, never a stack.
+# The un-upgraded machine moves one item per nine ticks. The window is measured
+# against the server's own tick counter, not wall time: under a loaded box the
+# `ctl wait 20` sleep lets far more than 20 ticks pass (7 passes were measured),
+# while an upper bound of 5 then fails a correct 9-tick machine. The assertion
+# is stronger per elapsed tick, not weaker, and SELFTEST=speed still fails it.
+tick_before=$(energy_of 42 64 16 | awk '{print $3}')
 charge_net
 ctl wait 20
+tick_after=$(energy_of 42 64 16 | awk '{print $3}')
+elapsed=$((tick_after - tick_before))
 slow=$(net_items 42 64 16)
-echo "  after 20 ticks without an upgrade: $slow items on the network, source $(slots 44 64 16)"
+echo "  after $elapsed ticks without an upgrade: $slow items on the network, source $(slots 44 64 16)"
 if [ "$SELFTEST" = speed ]; then
-    echo "(selftest: asserting the un-upgraded importer moved more than 15 items in 20 ticks)"
+    echo "(selftest: asserting the un-upgraded importer moved more than 15 items in the window)"
     slow=64
 fi
-[ "${slow:-0}" -ge 1 ] && [ "${slow:-0}" -le 5 ] \
-    || fail "the un-upgraded importer moved $slow items in 20 ticks, expected 1 to 5"
+# The info line's tick counter and the work ticker advance on different server
+# clocks under load (5 passes in 32 reported ticks were measured), so the upper
+# bound allows a generous 5 ticks a pass. A speed upgrade moves a whole stack in
+# the same window, far past this bound, so the assertion can still fail.
+slow_upper=$((elapsed / 5 + 2))
+[ "${slow:-0}" -ge 1 ] && [ "${slow:-0}" -le "$slow_upper" ] \
+    || fail "the un-upgraded importer moved $slow items in $elapsed ticks, expected 1 to $slow_upper"
 # The stack upgrade: one pass moves 64 instead of 1, so the source empties in a
 # single pass and the network holds all 64.
 ctl give refinedstorage:stack_upgrade 1 >/dev/null
@@ -2825,6 +2845,122 @@ expect_info 37 64 19 "0 items in 0 resources"
 echo "  relay broken: the output network sees nothing; breaking reverses the transfer"
 ctl command "execute in minecraft:the_end run tp @s 40.5 64 3.5"
 
+echo "== the storage block: a fixed-capacity storage node, no disk slot =="
+# Slice 17. The artefact has no disk slot: a storage block holds its own storage,
+# fixed by its tier (1k = 1,024 items, 2 FE/tick) and kept in the block entity's
+# saved data. A fresh arena row keeps every earlier phase's network untouched.
+ctl command "clear @s" >/dev/null
+net minecraft:the_end 32 64 22
+ctl command "execute in minecraft:the_end run setblock 32 64 22 refinedstorage:controller"
+ctl command "execute in minecraft:the_end run setblock 33 64 22 refinedstorage:cable"
+ctl command "execute in minecraft:the_end run setblock 34 64 22 refinedstorage:1k_storage_block"
+ctl command "execute in minecraft:the_end run setblock 35 64 22 refinedstorage:grid"
+ctl wait 16
+charge_net
+expect_info 32 64 22 "1 storage block"
+expect_reply "refinedstorage info 34 64 22" "1k, 0/1024 items"
+expect_reply "refinedstorage info 34 64 22" "2 FE/tick"
+# Differential: an empty block contributes nothing to its network.
+[ "$(net_items 32 64 22)" = 0 ] \
+    || fail "an empty storage block contributed items: $(net_items 32 64 22)"
+echo "  an empty 1k storage block contributes 0 items and is named in the census"
+# Seed the block through the real path: a deposit through this network's grid.
+# The grid's click writes the changed storage back into the block entity in one
+# transaction; a `/data merge` shortcut does not persist in a mod block entity
+# (measured), so it cannot prove the write-back the mod actually performs.
+ctl command "clear @s" >/dev/null
+ctl give minecraft:diamond 5 >/dev/null
+ctl wait 4
+ctl command "execute in minecraft:the_end run tp @s 35.5 64 23.5" >/dev/null
+ctl wait 4
+charge_net
+ctl interact 35 64 22
+ctl wait 8
+charge_net
+empty_view=$(ctl screen | jq -c '[.slots[] | select(.slot >= 300 and .item != null) | {count, item}]')
+[ "$empty_view" = '[]' ] \
+    || fail "an empty storage block's grid view is $empty_view, expected []"
+diamond_slot=$(inv_slot minecraft:diamond)
+[ -n "$diamond_slot" ] \
+    || fail "no diamonds in the grid menu's player inventory: $(ctl screen | jq -c '[.slots[] | select(.slot < 36 and .item != null)]')"
+charge_net
+ctl click-slot "$diamond_slot"
+ctl wait 2
+charge_net
+ctl click-slot 300
+ctl wait 8
+charge_net
+[ "$(net_items 32 64 22)" = 5 ] \
+    || fail "the network did not total the storage block's 5 items: $(net_items 32 64 22)"
+expect_reply "refinedstorage info 34 64 22" "5/1024 items"
+echo "  the block's own storage: 5 diamonds, total 5 on the network"
+storage_view=$(ctl screen | jq -c '[.slots[] | select(.slot >= 300 and .item != null) | {count, item}]')
+echo "  grid view: $storage_view"
+[ "$storage_view" = '[{"count":5,"item":"minecraft:diamond"}]' ] \
+    || fail "the grid's parsed view is $storage_view, expected [{\"count\":5,\"item\":\"minecraft:diamond\"}]"
+ctl close >/dev/null 2>&1 || true
+ctl wait 4
+# Counterfactual: the old, no-storage-block answer was 0 items for this network.
+# After the block delivered 5, asserting 0 must fail.
+if [ "$SELFTEST" = storageblock ]; then
+    echo "(selftest: asserting the old no-storage-block answer — 0 items)"
+    [ "$(net_items 32 64 22)" = 0 ] \
+        || fail "expected the old no-storage-block answer (0 items), got $(net_items 32 64 22); the block contributed 5"
+fi
+# Break the block in survival: its drop keeps the storage component, and
+# re-placing the same item on the same network restores the 5 diamonds.
+ctl command "gamemode survival" >/dev/null
+ctl give minecraft:diamond_pickaxe 1 >/dev/null
+ctl wait 4
+ctl select minecraft:diamond_pickaxe >/dev/null
+ctl wait 2
+# Stand due south: from the grid's side the ray to the storage block passes
+# through the grid itself and breaks the wrong block (measured).
+ctl command "execute in minecraft:the_end run tp @s 34.5 64 24.5" >/dev/null
+ctl wait 6
+ctl look-at block 34 64 22 south >/dev/null 2>&1 || true
+ctl wait 2
+broken=$(ctl break 34 64 22) || fail "cannot break the storage block: $broken"
+echo "  storage block drops: $(echo "$broken" | jq -c '.drops')"
+[ "$(echo "$broken" | jq -r '.drops["refinedstorage:1k_storage_block"] // 0')" -ge 1 ] \
+    || fail "the storage block did not drop itself: $(echo "$broken" | jq -c '.drops')"
+ctl command "execute in minecraft:the_end run tp @s 34.5 64 22.5" >/dev/null
+ctl wait 25
+[ "$(count_of refinedstorage:1k_storage_block)" = 1 ] \
+    || fail "the storage block's drop was not picked up: $(ctl inventory | jq -c '[.hotbar[], .main[]] | map(select(.item != null))')"
+[ "$(net_items 32 64 22)" = 0 ] \
+    || fail "breaking the storage block left its items on the network"
+ctl command "gamemode creative" >/dev/null
+ctl wait 4
+for _ in 1 2 3; do
+    ctl close >/dev/null 2>&1 || true
+    ctl wait 2
+done
+# Step out of the empty cell and stand due south: from the grid's side the
+# placement ray hits the grid and opens its menu instead of placing the block.
+ctl command "execute in minecraft:the_end run tp @s 34.5 64 24.5" >/dev/null
+ctl wait 4
+ctl select refinedstorage:1k_storage_block >/dev/null 2>&1 || true
+ctl wait 2
+ctl look-at block 34 64 22 south >/dev/null 2>&1 || true
+ctl wait 2
+placed=0
+for _ in 1 2 3; do
+    if ctl place 34 64 22 --item refinedstorage:1k_storage_block >/dev/null 2>&1; then
+        placed=1
+        break
+    fi
+    ctl close >/dev/null 2>&1 || true
+    ctl wait 3
+done
+[ "$placed" = 1 ] || fail "cannot re-place the storage block: $(ctl screen | jq -c '{screen}')"
+ctl wait 10
+charge_net
+[ "$(net_items 32 64 22)" = 5 ] \
+    || fail "the re-placed block lost its component: $(net_items 32 64 22)"
+expect_reply "refinedstorage info 34 64 22" "5/1024 items"
+echo "  breaking kept the component; re-placing the block restored all 5 diamonds"
+
 echo "== the disk keeps its contents across a relaunch =="
 net minecraft:the_end 40 64 0
 ctl command "execute in minecraft:the_end run tp @s 42.5 64 2.5"
@@ -2870,6 +3006,14 @@ ctl wait 30
 charge minecraft:the_end 48 64 8
 ctl give refinedstorage:wireless_grid 1 >/dev/null
 ctl wait 4
+# The charge commands read the held item; a give does not always select the
+# stack on a loaded box, so ask for it explicitly (retry, never assert on the
+# retry itself — the assertion is the charge reply below).
+for _ in 1 2 3 4 5; do
+    ctl select refinedstorage:wireless_grid >/dev/null 2>&1 && break
+    ctl wait 2
+done
+ctl wait 2
 charge_grid 1000
 ctl wait 4
 read -r item_charged _ _ <<<"$(grid_energy)"

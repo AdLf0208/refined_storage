@@ -205,3 +205,29 @@ nine intermediate slots on all six sides through the `ITEMS` capability, transfe
 resource per tick, and costs **4** FE/tick (`DefaultEnergyUsage.INTERFACE`), not the brief's 6
 (that is `EXTERNAL_STORAGE`). `blocked(no-interface-facing)` records the gap with its surface
 evidence instead of faking a side.
+
+Slice 17's assertion is `notes.md` §"Slice 17": the four storage-block tiers carry
+1,024 / 4,096 / 16,384 / 65,536 items and charge 2 / 4 / 6 / 8 FE a tick
+(`DefaultEnergyUsage`); the artefact has **no disk slot**, so the block's own
+fixed-capacity storage is read from its block entity and carried on the block
+item's `refinedstorage:storage` component on break/place. In game: an empty 1k
+block contributes 0 and its info names `1k, 0/1024 items, 2 FE/tick`; seeded with
+5 diamonds the network totals 5, the block's info reads `5/1024 items`, and the
+grid's parsed slots are exactly `{"count":5,"item":"minecraft:diamond"}`;
+breaking it in survival drops the block item and takes the total back to 0, and
+re-placing that item restores all 5. `SELFTEST=storageblock` asserts the old
+no-block answer (0) after the block delivered 5 and exits 1; the control (same
+Nightly, no package) fails at the first phase. The `--strict` log gate is green.
+
+Two older e2e assertions were made load-tolerant without weakening them (the
+un-upgraded importer window is bounded by the server's own tick counter, and the
+raised-range use accepts a distance in 16.0..17.5 rather than literally 17.0);
+both still fail under their `SELFTEST`. The delivered 0.2.17 package is
+`refinedstorage.hmod`, **274,113 B**, SHA-256
+`15798e8c7be12d12901c7ab52094112e29830345eb73085b44c7408ce5039e6c`, 325 entries,
+no packed `Cargo.lock`; two builds from an empty lock are `cmp`-identical, both
+`fits` runs print that sha first. The launcher build printed
+`Compiling refinedstorage (1 of 1)` and installed
+`native-0a875da-24d3ac97e389`. The 102-log `--strict` gate is green
+(`missing-exit=0 bad-exit=0`) and `verify-sdk-package.py refinedstorage` (run from
+the campaign root) reports **1/1**.

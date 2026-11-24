@@ -1,4 +1,4 @@
-# Refined Storage for Horizon (slice 16)
+# Refined Storage for Horizon (slice 17)
 
 A clean-room Rust port of **Refined Storage 2.0.9**
 (`refinedmods/refinedstorage2`, MIT), scoped to the **item network core**:
@@ -31,6 +31,10 @@ A clean-room Rust port of **Refined Storage 2.0.9**
   (a grid there lists them, and a withdrawal takes them from the input disk); turning
   pass-through off with `/refinedstorage relay <pos> [on|off]` or breaking the relay
   stops it. Each node costs 8 FE/tick;
+- **Storage Blocks**: 1k (1,024), 4k (4,096), 16k (16,384) and 64k (65,536) items of
+  fixed-capacity storage on the network, charged 2/4/6/8 FE/tick by tier. A grid on
+  the same network lists what a block holds and deposits into it; breaking the block
+  keeps its contents in the dropped block item, and placing it again restores them;
 - **Upgrades**: range (+8 blocks each, up to four) and creative range for the
   transmitter; speed (two ticks off the work interval, up to four) and stack
   (64 items per pass) for the machines;

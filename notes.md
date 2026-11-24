@@ -3958,3 +3958,178 @@ Evidence: `ports/_shared/evidence/refinedstorage/` — `plan-slice16-relay.md`,
 `native-0a875da-b11a0e9a6136`), `e2e-slice16-green.log`,
 `e2e-slice16-control.log`, `e2e-slice16-selftest-relay.log`,
 `check-e2e-logs-slice16.log` (99/99 green).
+
+## Slice 17 — the storage block (2026-11-24) — version 0.2.17
+
+### The gap line this slice answers (verbatim)
+
+§"Gaps / deviations (slice 1)" item 2: *"… fluid storage and disks, … **storage blocks**,
+…"*, as slice 16 left it. Class `content` / tier **deep**, shape **machines**: one
+block entity, one fixed-capacity storage node and one charge are below the tier —
+no new hook, entity or renderer. MIT, ours on `main` → **Update 0.2.17** (0.2.16 is
+staged on PR #1666). Pin `0a875da91dbb0fdcb7ba8c42c11341aa229af51a` + mixins
+`e59da9094f0c2fdda6c627fe9eff22dec6a906f0`, SDK `0a875da`, game 26.3. Rust
+steps forwarded to `AdLf-PC` (no `BUILD_LOCAL=1`); the `--offscreen` game leg
+stayed local.
+
+### The artefact wins over the brief's prose
+
+The brief described "one disk slot, a read of the existing disk component". The
+2.0.9 artefact has **no disk slot and no disk item** in a storage block:
+
+| upstream (`refinedmods/refinedstorage2` v2.0.9, MIT, commit `0dec63af`) | what this slice carries |
+|---|---|
+| `ItemStorageVariant` 1k 1024, 4k 4096, 16k 16384, 64k 65536 | the same four numbers the disks of slices 2/11 already use; no new capacity math |
+| `StorageBlockBlockEntity` creates `StorageTypes.ITEM.create(variant.capacity())` in a UUID-keyed world repository (`sid`), not a disk slot | the port's stand-in is a per-block `Disk<Net>` cache in `Core`, flushed into the block entity's saved `RefinedStorageStorage` list from the block's own tick and read live by grids, machines, the relay and `/refinedstorage info` |
+| `DefaultEnergyUsage` `ONE_K/FourK/SIXTEEN_K/SIXTY_FOUR_K_STORAGE_BLOCK` = 2/4/6/8 FE/t | `runtime::storage_block_usage`, charged from the block's tier in the BE tick |
+| `assets/…/blockstates/…_storage_block.json` declares only `""` | no `active`/`facing` state on the carried blocks |
+| `AbstractStorageContainerBlockItem` + `StorageBlockLootItemFunction` move the storage to the block item on break and back on place | the drop's `refinedstorage:storage` component (the same component the disks use) and the placement hook restore it |
+| `StorageBlockContainerMenu` — nine filter slots, a blocklist/allowlist GUI | **not ported** (deviation 1): the port has no filter/side-button surface and the storage is driven from the network's grid |
+
+The four blocks, their items, blockstates, models, the jar's four textures, loot
+tables (26.3 singular `condition` shape) and the four shaped recipes
+(`EPE/EME/ERE` with the tier's storage part, a machine casing and redstone dust)
+are carried from the jar byte-for-byte where they are textures.
+
+### Red proof — the rules as tests, before the implementation
+
+`ports/_shared/evidence/refinedstorage/runtime-red-slice17-storageblock.log`,
+against stubs (`storage_block_capacity` → `None`, `STORAGE_BLOCK_USAGE` → `[0;4]`,
+`storage_block_usage` → 0): **3 failed of 135**:
+
+```
+---- runtime::tests::a_storage_block_is_charged_by_its_tier stdout ----
+assertion `left == right` failed: DefaultEnergyUsage ONE_K/FourK/SIXTEEN_K/SIXTY_FOUR_K_STORAGE_BLOCK
+  left: [0, 0, 0, 0]
+ right: [2, 4, 6, 8]
+---- runtime::tests::a_storage_block_tier_names_its_own_capacity stdout ----
+assertion `left == right` failed: ItemStorageVariant's capacity for refinedstorage:1k_storage_block
+  left: None
+ right: Some(1024)
+---- runtime::tests::a_storage_blocks_disk_cannot_hold_more_than_the_block stdout ----
+a storage block has a capacity
+test result: FAILED. 132 passed; 3 failed; 0 ignored; 0 measured; 0 filtered out
+```
+
+Green after the rules: **135 passed, 0 failed** (`sdk-test-0.2.17.log`).
+
+### Green — the ladder and the in-game leg (one launcher build at `0a875da`)
+
+| Step | Command | Result |
+|---|---|---|
+| runtime + glue tests | `cargo test --offline` (forwarded) | **135 passed**, 0 failed (`sdk-test-0.2.17.log`) |
+| lints | `cargo clippy --all-targets --offline -- -D warnings` | exit 0, **0 warnings** |
+| formatting | `rustfmt --edition 2024 --check src/{lib,support,runtime}.rs` | `FMT_EXIT:0` |
+| SDK check | `cargo horizon-mod check` | *"…682 items of the API (5 Part kinds, 23 hooks …). Made for 0a875da."* |
+| package | `rm -f Cargo.lock && cargo horizon-mod build` ×2 | **byte-identical** (`CMP_EXIT:0`), **274,113 B**, SHA-256 `15798e8c7be12d12901c7ab52094112e29830345eb73085b44c7408ce5039e6c`, **325 entries**, no `Cargo.lock` |
+| package check | `cargo horizon-mod check refinedstorage.hmod` | `0.2.17 (native-mod, format native-1/0a875da…/e59da909…, for 26.3)` |
+| fits (pin) | `… fits refinedstorage.hmod --build 0a875da` | `0a875da made for` (sha printed in-log) |
+| fits (other build) | `… fits refinedstorage.hmod --build 0b14f8a` | `0b14f8a fits` (sha printed in-log) |
+| recipe types | `python3 ports/tools/check-recipe-types.py refinedstorage` | `refinedstorage: ok` |
+| launcher build | `launcher-game.sh build refinedstorage --rebuild` | exit 0, **`Compiling refinedstorage (1 of 1)`**, `native-0a875da-24d3ac97e389` |
+| in-game leg | `build-slot.sh run --step e2e -- bash tools/e2e.sh` | **PASS** + **`EXIT:0`**, 45 of 45 recipes crafted |
+| control (same Nightly, no package) | `GAME=$CONTROL_GAME …` | **FAIL** + `EXIT:1` — *"the block at 41,64,1 is minecraft:air, expected facing=north"* |
+| counterfactual (this slice) | `SELFTEST=storageblock …` | **FAIL** + `EXIT:1` — *"expected the old no-storage-block answer (0 items), got 5; the block contributed 5"* |
+| log gate | `check-e2e-logs.py refinedstorage-e2e --strict` | green (see evidence) |
+| package gate | `verify-sdk-package.py refinedstorage` | **1/1** |
+
+The phase, quoted from `e2e-slice17-green.log`:
+
+```
+  an empty 1k storage block contributes 0 items and is named in the census
+  Storage block at 34,64,22: 1k, 0/1024 items, 2 FE/tick
+  the block's own storage: 5 diamonds, total 5 on the network
+  grid view: [{"count":5,"item":"minecraft:diamond"}]
+  storage block drops: {"refinedstorage:1k_storage_block":1}
+  breaking kept the component; re-placing the block restored all 5 diamonds
+```
+
+The differential is the empty block's 0; the counterfactual is
+`SELFTEST=storageblock` asserting the old no-block answer after the block has
+already delivered 5.
+
+### Deviations (recorded, not defects)
+
+1. **No filter container or screen.** Upstream's storage block opens a nine-slot
+   filter menu with blocklist/allowlist, fuzzy mode, void-excess, access mode and
+   priorities. The pin can draw a mod menu but has no filter widget; the port
+   exposes all stored resources (upstream's empty-blocklist default) with equal
+   priority and drives the block through the network's grid. The same trade-off
+   the relay and the external storage record.
+2. **No `active` state.** Upstream's ticker calls `updateActiveness`, but the
+   jar's storage-block blockstate has no `active` property; the port writes none.
+3. **One writer at a time: a break hands its storage to the drop.** Upstream's
+   UUID repository outlives the block; here the saved data goes away with the
+   block entity, so the drop item becomes the only copy. The transfer runs in
+   the `loot_drops` hook — this pin dispatches that hook for a break, while the
+   `block_drops` hook the port already subscribes is never called for this
+   block (measured). A block replaced by a command (not a player break) drops
+   its contents with the engine's spill, as it does for every other block in
+   this port. There is one tick of exposure between a grid write and the block
+   tick's flush of the cache into the saved payload (the drive's own recorded
+   gap 10).
+4. **The creative storage block is not carried.** It has no capacity to clamp
+   and no recipe upstream; the four finite tiers cover the gap line.
+
+### Harness repairs made while proving it (the script, not the mod)
+
+The saturated box (five e2e slots plus a compile queue) made two older
+load-sensitive assertions flake before the storage-block phase could run, and
+four green-leg attempts were lost to them. Both are fixed in `tools/e2e.sh`
+without weakening what they prove:
+
+- the un-upgraded importer window is now bounded by the server tick counter the
+  `info` line prints (a speed upgrade still moves a whole stack in the window,
+  so `SELFTEST=speed` still exits 1), instead of a wall-clock sleep's fixed
+  `1..5` items — 6 passes in 32 reported ticks were measured;
+- the raised-range grid use accepts the reported distance in `16.0..17.5` rather
+  than the literal `17.0` — the player drifts by a tenth of a block under load,
+  while the base 16-block range still refuses the same use earlier in the leg;
+- the storage-block break and re-place stand due south of the block (`34.5 64
+  24.5`): from the adjacent grid's side the ray opens the grid's menu instead
+  of hitting the block, which made a correct break drop nothing and a correct
+  place no-op. The inventory is no longer cleared at the end of the phase, so
+  the later operator phase still has the wireless grid from slice 9.
+
+Fourteen earlier green-leg attempts were lost to these load- and ray-sensitive
+harness defects (plus the drop-hook discovery above) and are kept under their
+own names in the evidence folder; none is counted as exit evidence.
+
+### Coverage (parity rule) — every family this slice ships
+
+| family | state |
+|---|---|
+| the four storage blocks and their items | **tested in game** — 1k placed and read back, named in the census and its own info line; 4k/16k/64k capacities unit-tested from the artefact |
+| fixed capacity per tier and the FE/tick charge | **tested** — `0/1024 items, 2 FE/tick`, unit tests for `[2,4,6,8]` and `1024/4096/16384/65536` |
+| the block's own storage as network storage | **tested in game** — an empty block totals 0; seeded with 5 diamonds it totals 5 and its info reads `5/1024 items` |
+| the grid view of that storage | **tested in game** — the parsed slots are exactly `{"count":5,"item":"minecraft:diamond"}` (`SELFTEST=storageblock` asserts the old 0 and exits 1) |
+| break keeps the component, place restores it | **tested in game** — the survival break drops the block item, the network drops to 0, and re-placing that item restores all 5 |
+| the four recipes, items, loot tables and textures | **tested** — `recipe_check.py` crafts all 45 carried recipes with their wrong-ingredient controls; the block drops itself |
+| filter menu, blocklist/allowlist, priorities, creative block | **not ported** — deviations 1 and 4 |
+
+Skills: superpowers/using-superpowers,brainstorming,writing-plans,test-driven-development,systematic-debugging,verification-before-completion; BeautifulRust/rust-best-practices
+
+### Next slice (from this slice's own gap list)
+
+The **crafter** family (`refinedstorage:crafter` / the autocrafting chain) is the
+next `machines`-shaped node from the same gap line (§"Gaps / deviations (slice 1)"
+item 2: *"crafters, … autocrafting …"*), but it needs a pattern/crafting-task
+model the port does not yet have and a ` AUTOCRAFTING` component the relay's
+deviation 2 already records as absent — so the next *workable* slice is the
+**detector** or the **storage monitor** only after their pin surface is probed;
+if neither has a fail-capable assertion without the new crafting queue, stop and
+report `blocked(no-autocrafting-system)` rather than porting an inert block.
+The lower-cost, fully in-scope alternative is the **packed/creative storage
+block** (one more tier, same node and charge, 16 FE/tick upstream) if the
+orchestrator wants the family complete before moving on.
+
+Evidence: `ports/_shared/evidence/refinedstorage/` — `plan-slice17-storageblock.md`,
+`runtime-red-slice17-storageblock.log`, `sdk-test-0.2.17.log`, `sdk-clippy-0.2.17.log`,
+`sdk-fmt-0.2.17.log`, `sdk-check-0.2.17.log`, `sdk-build-0.2.17-{1,2}.log`,
+`sdk-check-file-0.2.17.log`, `sdk-fits-pin-0.2.17.log`, `sdk-fits-other-0.2.17.log`,
+`verify-sdk-package-0.2.17.log`, `recipe-types-0.2.17.log`, `refinedstorage.hmod`
+(the delivered bytes) — and `ports/_shared/evidence/refinedstorage-e2e/` —
+`launcher-build-0.2.17.log` (`Compiling refinedstorage (1 of 1)`,
+`native-0a875da-24d3ac97e389`), `e2e-slice17-green.log`,
+`e2e-slice17-control.log`, `e2e-slice17-selftest-storageblock.log`,
+`check-e2e-logs-slice17.log`.

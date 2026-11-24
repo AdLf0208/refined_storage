@@ -55,6 +55,36 @@ pub const RELAY_INPUT_USAGE: u32 = 8;
 /// while at least one component is delegated — see [`relay_output_usage`].
 pub const RELAY_OUTPUT_USAGE: u32 = 8;
 
+/// The four item-storage-block ids (upstream `Blocks.getItemStorageBlock` over
+/// `ItemStorageVariant`'s four finite tiers). A storage block holds its own
+/// fixed-capacity storage, not a storage disk (slice 17).
+pub const STORAGE_BLOCK_IDS: [&str; 4] = [
+    "refinedstorage:1k_storage_block",
+    "refinedstorage:4k_storage_block",
+    "refinedstorage:16k_storage_block",
+    "refinedstorage:64k_storage_block",
+];
+
+/// A storage block's capacity in items (upstream `ItemStorageVariant`, the same
+/// numbers the disks of slices 2 and 11 use). The four finite tiers share the
+/// disk capacities; the creative block has no recipe here and no ceiling, so it
+/// is not among the carried ids.
+pub fn storage_block_capacity(block: &str) -> Option<u64> {
+    STORAGE_BLOCK_IDS
+        .iter()
+        .zip([CAPACITY_1K, CAPACITY_4K, CAPACITY_16K, CAPACITY_64K])
+        .find_map(|(id, capacity)| (block == *id).then_some(capacity))
+}
+
+/// A storage block's FE per tick by tier (upstream `DefaultEnergyUsage`:
+/// ONE_K_STORAGE_BLOCK=2, FOUR_K=4, SIXTEEN_K=6, SIXTY_FOUR_K=8).
+pub const STORAGE_BLOCK_USAGE: [u32; 4] = [2, 4, 6, 8];
+
+/// The charge of storage-block tier `tier` (0 = 1k … 3 = 64k).
+pub fn storage_block_usage(tier: usize) -> u32 {
+    STORAGE_BLOCK_USAGE.get(tier).copied().unwrap_or(0)
+}
+
 /// The interface's intermediate storage slots (upstream `EXPORT_SLOTS = 9` in
 /// `InterfaceBlockEntity`); its filter has the same nine entries.
 pub const INTERFACE_SLOTS: usize = 9;
@@ -65,7 +95,8 @@ pub const INTERFACE_EXPORT_LIMIT: u32 = 64;
 
 /// The network blocks of the port: the slice's four, the wireless transmitter
 /// (slice 3), the two transfer machines (slice 7), the external storage
-/// (slice 14) and the interface (slice 15).
+/// (slice 14), the interface (slice 15), the relay (slice 16) and the four
+/// fixed-capacity storage blocks (slice 17).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Kind {
     Controller,
@@ -78,6 +109,7 @@ pub enum Kind {
     ExternalStorage,
     Interface,
     Relay,
+    StorageBlock,
 }
 
 impl Kind {
@@ -94,6 +126,7 @@ impl Kind {
             Kind::ExternalStorage => "refinedstorage:external_storage",
             Kind::Interface => "refinedstorage:interface",
             Kind::Relay => "refinedstorage:relay",
+            Kind::StorageBlock => STORAGE_BLOCK_IDS[0],
         }
     }
 
@@ -113,6 +146,11 @@ impl Kind {
         ]
         .into_iter()
         .find(|kind| kind.block_id() == block)
+        .or_else(|| {
+            STORAGE_BLOCK_IDS
+                .contains(&block)
+                .then_some(Kind::StorageBlock)
+        })
     }
 
     /// The human name a machine's info line leads with, for the two kinds that
@@ -1684,6 +1722,9 @@ pub struct Fit {
     pub stack: u32,
     pub range: u32,
     pub creative_range: bool,
+    /// Which of the four finite storage-block tiers a block is (0 = 1k …
+    /// 3 = 64k); the charge is `storage_block_usage(tier)`.
+    pub storage_tier: usize,
 }
 
 /// What one node charges: one tick for the always-on nodes (a grid, a drive, a
@@ -1720,6 +1761,9 @@ pub fn usage(kind: Kind, fit: Fit, disks: u32) -> u32 {
         // (8 input + 8 output while storage is passed). `usage` is the input
         // node's own charge, matching upstream's `RelayInputNetworkNode`.
         Kind::Relay => RELAY_INPUT_USAGE,
+        // One storage block is one storage node, charged by its own tier
+        // (DefaultEnergyUsage ONE_K..SIXTY_FOUR_K_STORAGE_BLOCK).
+        Kind::StorageBlock => storage_block_usage(fit.storage_tier),
     }
 }
 
@@ -1888,6 +1932,9 @@ impl Kind {
             | Kind::ExternalStorage => 0,
             Kind::Interface => INTERFACE_SLOTS * 2,
             Kind::Relay => 0,
+            // A storage block's storage is a fixed-capacity component, not a
+            // container of slots; it travels on its item through its own path.
+            Kind::StorageBlock => 0,
         }
     }
 }
@@ -4242,5 +4289,79 @@ mod tests {
             Kind::from_block("refinedstorage:interface"),
             Some(Kind::Interface)
         );
+    }
+
+    // --- slice 17: the storage block ---------------------------------------
+
+    #[test]
+    fn a_storage_block_tier_names_its_own_capacity() {
+        for (block, capacity) in [
+            ("refinedstorage:1k_storage_block", CAPACITY_1K),
+            ("refinedstorage:4k_storage_block", CAPACITY_4K),
+            ("refinedstorage:16k_storage_block", CAPACITY_16K),
+            ("refinedstorage:64k_storage_block", CAPACITY_64K),
+        ] {
+            assert_eq!(
+                storage_block_capacity(block),
+                Some(capacity),
+                "ItemStorageVariant's capacity for {block}"
+            );
+        }
+        assert_eq!(storage_block_capacity("refinedstorage:grid"), None);
+        assert_eq!(storage_block_capacity("minecraft:chest"), None);
+    }
+
+    #[test]
+    fn a_storage_block_is_charged_by_its_tier() {
+        assert_eq!(
+            STORAGE_BLOCK_USAGE,
+            [2, 4, 6, 8],
+            "DefaultEnergyUsage ONE_K/FourK/SIXTEEN_K/SIXTY_FOUR_K_STORAGE_BLOCK"
+        );
+        for (tier, fe) in [0, 1, 2, 3].into_iter().zip([2, 4, 6, 8]) {
+            assert_eq!(storage_block_usage(tier), fe, "tier {tier}");
+            assert_eq!(
+                usage(
+                    Kind::StorageBlock,
+                    Fit {
+                        storage_tier: tier,
+                        ..Fit::default()
+                    },
+                    0
+                ),
+                fe,
+                "the tick charges the tier, not a flat rate"
+            );
+        }
+        assert_eq!(
+            Kind::from_block("refinedstorage:16k_storage_block"),
+            Some(Kind::StorageBlock),
+            "every tier is a network node of one kind"
+        );
+    }
+
+    #[test]
+    fn a_storage_blocks_disk_cannot_hold_more_than_the_block() {
+        for (block, capacity) in [
+            ("refinedstorage:1k_storage_block", CAPACITY_1K),
+            ("refinedstorage:4k_storage_block", CAPACITY_4K),
+        ] {
+            let room = storage_block_capacity(block).expect("a storage block has a capacity");
+            let room_u32 = u32::try_from(room).expect("a storage capacity fits in u32");
+            let mut disk = Disk::new(room);
+            assert_eq!(
+                disk.insert(TestItem::new("minecraft:diamond", 1500)),
+                1500.min(room_u32),
+                "{block} takes no more than its capacity"
+            );
+            for _ in 0..3 {
+                assert_eq!(
+                    disk.insert(TestItem::new("minecraft:diamond", 1)),
+                    u32::from(room > 1500),
+                    "{block} must stop at its own capacity"
+                );
+            }
+            assert_eq!(disk.total(), capacity.min(1503));
+        }
     }
 }
