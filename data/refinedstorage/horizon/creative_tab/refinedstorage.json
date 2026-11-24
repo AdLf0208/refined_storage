@@ -36,6 +36,7 @@
     "refinedstorage:creative_range_upgrade",
     "refinedstorage:importer",
     "refinedstorage:exporter",
+    "refinedstorage:external_storage",
     "refinedstorage:speed_upgrade",
     "refinedstorage:stack_upgrade"
   ]

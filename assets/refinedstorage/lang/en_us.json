@@ -6,6 +6,7 @@
   "block.refinedstorage.controller": "Controller",
   "block.refinedstorage.disk_drive": "Disk Drive",
   "block.refinedstorage.exporter": "Exporter",
+  "block.refinedstorage.external_storage": "External Storage",
   "block.refinedstorage.grid": "Grid",
   "block.refinedstorage.importer": "Importer",
   "block.refinedstorage.machine_casing": "Machine Casing",
@@ -23,6 +24,7 @@
   "item.refinedstorage.destruction_core": "Destruction Core",
   "item.refinedstorage.disk_drive.help": "Accepts storage disks to provide the storage network with storage space.",
   "item.refinedstorage.exporter.help": "Exports resources from the storage network to an external destination.",
+  "item.refinedstorage.external_storage.help": "Exposes the inventory it faces to the storage network.",
   "item.refinedstorage.grid.help": "Allows for interacting with the storage network.",
   "item.refinedstorage.importer.help": "Imports resources from an external source to the storage network.",
   "item.refinedstorage.improved_processor": "Improved Processor",
@@ -45,6 +47,7 @@
   "item.refinedstorage.wireless_grid.help": "Use a Wireless Transmitter to bind it, then use it to open your storage network from anywhere inside the transmitter's range.",
   "item.refinedstorage.wireless_transmitter.help": "Provides wireless network access for items like the Wireless Grid. Multiple are allowed in an area for wider coverage.",
   "tag.item.refinedstorage.exporters": "Exporters",
+  "tag.item.refinedstorage.external_storages": "External Storages",
   "tag.item.refinedstorage.grids": "Grids",
   "tag.item.refinedstorage.importers": "Importers",
   "tag.item.refinedstorage.wireless_transmitters": "Wireless Transmitters"

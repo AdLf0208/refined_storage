@@ -1,0 +1,19 @@
+{
+  "type": "minecraft:crafting_shaped",
+  "pattern": [
+    "CED",
+    "HMH",
+    "EPE"
+  ],
+  "key": {
+    "C": "refinedstorage:construction_core",
+    "E": "refinedstorage:quartz_enriched_iron",
+    "D": "refinedstorage:destruction_core",
+    "H": "#c:chests",
+    "M": "refinedstorage:cable",
+    "P": "refinedstorage:improved_processor"
+  },
+  "result": {
+    "id": "refinedstorage:external_storage"
+  }
+}

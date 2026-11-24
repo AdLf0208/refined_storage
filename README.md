@@ -1,4 +1,4 @@
-# Refined Storage for Horizon (slice 13)
+# Refined Storage for Horizon (slice 14)
 
 A clean-room Rust port of **Refined Storage 2.0.9**
 (`refinedmods/refinedstorage2`, MIT), scoped to the **item network core**:
@@ -19,6 +19,9 @@ A clean-room Rust port of **Refined Storage 2.0.9**
   from its own 1,000 FE buffer;
 - **Importer / Exporter**: the two transfer machines, each with nine filter entries
   and four upgrade slots, working on the neighbour its facing names;
+- **External Storage**: exposes the inventory it faces to the network — a grid lists
+  the chest's stock alongside the disks, deposits through the grid land in that chest,
+  and breaking the block or removing the chest drops only that stock from the view;
 - **Upgrades**: range (+8 blocks each, up to four) and creative range for the
   transmitter; speed (two ticks off the work interval, up to four) and stack
   (64 items per pass) for the machines;
@@ -38,9 +41,9 @@ spill instead of emptying it. The two energy commands (`/refinedstorage energy`,
 `/refinedstorage charge`) are operator commands, and a charge names the item it
 fills: the wireless grid, or nothing.
 
-The rest of the mod (crafters, external storage, interfaces, relays, fluids, the
-portable grid, security, autocrafting, the coloured variants and the upgrades whose
-blocks are not ported) is the planned gap list in [notes.md](notes.md).
+The rest of the mod (crafters, interfaces, relays, fluids, the portable grid,
+security, autocrafting, the coloured variants and the upgrades whose blocks are not
+ported) is the planned gap list in [notes.md](notes.md).
 
 One flat package, the SDK layout: `horizon-mod.toml` is the only manifest,
 `src/` is the code (compiled by the launcher against the pinned game build),

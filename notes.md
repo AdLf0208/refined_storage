@@ -3303,3 +3303,251 @@ Evidence: `ports/_shared/evidence/refinedstorage/` — `plan-slice13-review2.md`
 `ports/_shared/evidence/refinedstorage-e2e/` — `e2e-slice13-green.log`, `e2e-slice13-control.log`,
 `e2e-slice13-selftest-{payload,break,stack-upgrade,drops}.log`, and `launcher-build-0.2.13.log`
 (`Compiling refinedstorage (1 of 1)`, `native-0a875da-7befb00f6e88` — the build every leg ran on).
+
+## Review round two — the two remaining in-game phases (2026-11-23, evidence only, **no version bump**)
+
+The reviewer's blocker 1 (placement and insertion losing or duplicating items) had two in-game
+cases the slice-13 leg did not exercise. Both were run against the **delivered** 0.2.13 package
+(sha256 `92858557af7dcf5bd4c88ce4f43a62fc666605c099bc373cfa8a4baa390cc21f`, 221,841 B — named in each
+transcript's `package:` line) with `tools/review2.sh`, a harness script that launches the launcher-
+built game and runs one phase per run; nothing in the package changed, so there is no new version
+(an evidence-only slice is not published — `AGENTS.md`, ruling 2026-11-21).
+
+**Phase 1 — a full drive consumes no disk** (`MODE=full`). Nine disks written into a fresh drive's
+nine slots; a tenth in the **main hand** (hotbar slot 1 — `ctl interact` clicks with the main hand)
+clicked into the drive:
+
+```
+  the drive before the click: 9 disks
+  the acting hand (main hand, hotbar slot 1, the hand ctl interact clicks with) before: {"count":1,"item":"refinedstorage:1k_storage_disk"}
+  item entities near the drive before the click: 0
+  the click: {"changed":false,"inventory_change":{},"screen":"playing"}
+  the drive after the click: 9 disks
+  the acting hand after the click: {"count":1,"item":"refinedstorage:1k_storage_disk"}
+  item entities near the drive after the click: 0
+```
+
+The differential, the same click on the same drive with one slot freed (eight disks): the drive
+reaches **9** and the acting hand is **empty** — so the refusal is the full drive and not a broken
+click. `SELFTEST=1` asserts the full drive *took* the tenth disk and fails
+(`e2e-review2-full-drive-selftest.log`, `EXIT:1`).
+
+**Phase 2 — a refused placement consumes nothing and keeps the payload** (`MODE=refused`). A
+payload importer (four speed upgrades, a stack upgrade, a dirt entry) is broken in survival and
+picked up; the server-side NBT of the acting hand's unit reads
+`{components: {"minecraft:block_entity_data": {RefinedStorageContents: [{count: 1, Slot: 0b, …},
+
+- **occupied target**: `ctl place` onto a position holding stone answers
+  `{"error":"[50, 64, 22] holds minecraft:stone; break it first"}`, the hand keeps `count: 1` and the
+  server-side `RefinedStorageContents` is still there;
+- **the server's own refusal**: in adventure the right-click on the floor places nothing
+  (`minecraft:air` above it), the hand keeps `count: 1` and the payload is still there;
+- **differential**: the same placement on open ground consumes the unit (empty hand) and restores all
+  six slots in the machine it makes.
+
+`SELFTEST=1` asserts a refused placement *consumed* the item and fails
+(`e2e-review2-refused-place-selftest.log`, `EXIT:1`).
+
+`check-e2e-logs.py refinedstorage-e2e --strict` → `logs=72 ok=72 missing-exit=0 bad-exit=0`;
+`verify-sdk-package.py refinedstorage` → **1/1** (the tree's packed bytes are unchanged).
+
+Skills: superpowers/using-superpowers,brainstorming,systematic-debugging,verification-before-completion; BeautifulRust/none (no Rust change)
+
+Evidence (this addendum): `ports/_shared/evidence/refinedstorage-e2e/e2e-review2-full-drive.log`,
+`e2e-review2-full-drive-selftest.log`, `e2e-review2-refused-place.log`,
+`e2e-review2-refused-place-selftest.log` — and the harness that produced them,
+`ports/refinedstorage/tools/review2.sh`.
+
+## Slice 14 — the external storage block (2026-11-24) — version 0.2.14
+
+### The gap line this slice answers (verbatim)
+
+§"Gaps / deviations (slice 1)" item 2: *"The rest of the mod does not exist: crafters,
+exporters/importers, **external storage**, interfaces, relays, …"*, as slice 7 left it
+after carrying the machines. Class `content` / tier **deep**, shape **machines**: one
+network node, one capability read and one 6 FE/tick charge, below the tier. No new pin
+API and no new hook; the pin's `ITEMS` capability is the one the importer's pass already
+uses. This is the first slice compiled and proven with the repaired remote CLI; every
+cargo step was forwarded to `AdLf-PC` (no `BUILD_LOCAL=1`), the `--offscreen` game leg
+stayed local.
+
+### The reference (read from the artefact, not guessed)
+
+| upstream (`refinedmods/refinedstorage2` v2.0.9, MIT, commit `0dec63af`) | what this slice carries |
+|---|---|
+| `ExternalStorageBlock extends AbstractDirectionalCableBlock` | a node that joins the network on **all six** sides, with one working face from `facing`/`FACE_CLICKED` — the shared `state_for_placement` (`.opposite()`), as the machines |
+| `AbstractExternalStorageBlockEntity.loadStorage` → `worldPosition.relative(direction)` | the neighbour the block faces is the storage, read through `ITEMS` from `direction.getOpposite()` (the importer/exporter's capability path) |
+| `DefaultEnergyUsage.EXTERNAL_STORAGE = 6` | 6 FE/tick while its network is online, drawn from the controller buffer like every other node |
+| recipe `CED/HMH/EPE` (`C` construction core, `E` quartz-enriched iron, `D` destruction core, `H` `#c:chests`, `M` cable, `P` improved processor) | the same recipe in the pin's `"id"`/`"#tag"` shape; `#c:chests` was already declared for no other recipe, so no new tag file was needed |
+| `external_storages` item tag; the plain block's models, blockstate and voxel shapes | carried (plain variant only, as every other block in this port) |
+
+### What was implemented
+
+- **runtime.rs** (tests first): `Kind::ExternalStorage`, `EXTERNAL_STORAGE_USAGE = 6`
+  (added to `usage`), and `External<T>` — the faced inventory as **one unlimited
+  network storage**: `of` trims empty slots and merges two slots of one resource,
+  the empty inventory contributes nothing, and the unlimited disk never refuses
+  an insertion.
+- **support.rs**: the block in the one block-entity type, its `facing` from the
+  shared placement rule, its 6 FE/tick charge, census/readout lines in
+  `/refinedstorage info`, and `live_external` reading the faced container's `ITEMS`
+  handler live on every use. Its storage is prepended to the network's disk list so
+  the grid's view, the block grid's reconciliation and both machine passes see it;
+  changes are written back through the same handler inside the caller's transaction.
+  `/refinedstorage info` totals external stock in `N items in M resources` while
+  `N disks` stays the drive's own census.
+- **Content** (from the jar, MIT): the block declaration (end-rod template, six
+  `facing` shapes in block units), its multipart blockstate, the jar's block and item
+  models, the item, loot table, pickaxe tag, `external_storages` tag, recipe, lang
+  keys and creative-tab entry.
+
+### Deviations (recorded, not defects)
+
+1. **External storages come first in the storage list.** The port has no insertion
+   priority surface (upstream's `StorageConfiguration.setInsertPriority`), so an
+   empty disk in a drive would shadow a chest forever and the block would be inert.
+   A deposit therefore lands in the chest while it has room; the in-game leg asserts
+   this is where the 5 gold go. No user-visible loss: the same network's disks still
+   take everything the chest refuses.
+2. **No filter, access mode, void-excess, fuzzy mode or redstone mode.** Upstream's
+   external-storage menu is a resource filter with configuration toggles; this
+   slice has no slots of its own (the brief's shape) and the pin's mod screens have
+   no such widgets, so the whole faced inventory is exposed with upstream's default
+   settings. There is no menu to open on this block.
+3. **The write replaces the faced container's contents.** The resulting storage is
+   materialised by clearing every slot and re-inserting the network's entries. A
+   container that accepts fewer entries than it held (a fully replaced hopper limit,
+   say) would lose the difference; the vanilla chests the port tests accept all of
+   them. Upstream tracks changes per slot instead.
+4. **Energy is charged but not gated here.** The 6 FE/tick is drawn by the new tick;
+   the block has no `active` state to darken, and the grid's own gate already stops
+   the view when the network cannot pay.
+
+### Red proof — the rules as tests, before the glue
+
+`ports/_shared/evidence/refinedstorage/runtime-red-slice14-external.log`, against stubs
+that exposed nothing and charged 0 (`External::of` ignored its entries, `resources()`
+answered 0, `EXTERNAL_STORAGE_USAGE = 0`): **3 failed of 120**:
+
+```
+---- runtime::tests::an_external_storage_exposes_what_it_faces stdout ----
+thread 'runtime::tests::an_external_storage_exposes_what_it_faces' panicked at src/runtime.rs:3823:9:
+assertion `left == right` failed: the chest's stock is on the network
+  left: 0
+ right: 8
+
+---- runtime::tests::an_external_storage_merges_slots_of_one_resource stdout ----
+thread 'runtime::tests::an_external_storage_merges_slots_of_one_resource' panicked at src/runtime.rs:3844:9:
+assertion `left == right` failed: two slots of stone are one resource
+  left: 0
+ right: 1
+
+---- runtime::tests::an_external_storage_charges_six_fe_per_tick stdout ----
+thread 'runtime::tests::an_external_storage_charges_six_fe_per_tick' panicked at src/runtime.rs:3858:9:
+assertion `left == right` failed: DefaultEnergyUsage.EXTERNAL_STORAGE
+  left: 0
+ right: 6
+
+test result: FAILED. 117 passed; 3 failed; 0 ignored; 0 measured; 0 filtered out
+```
+
+Honest note: the other two new tests (`an_external_storage_facing_air_contributes_nothing`,
+`an_external_storage_has_no_capacity_ceiling`) were **already green** against the stubs —
+the unlimited disk type already existed from the creative disk (slice 11), and nothing
+faced is trivially empty. They stay as regression guards. Green after the rules:
+**120 passed, 0 failed** (`sdk-test.log`, regenerated for 0.2.14).
+
+### In-game red proof against today's behaviour
+
+`SELFTEST=external` runs the new phase against this build but asserts the old answer
+(no such block, so the grid totals 0 while the chest holds 8) and fails:
+
+```
+(selftest: asserting today's behaviour — no external storage, 0 items)
+FAIL: expected the old no-external-storage answer (0 items), got 8; the chest's stock is now on the network
+EXIT:1
+```
+
+### Green — the ladder and the in-game leg (one launcher build at `0a875da`)
+
+| Step | Command | Result |
+|---|---|---|
+| runtime + glue tests | `cargo test --offline` (forwarded) | **120 passed**, 0 failed (`sdk-test.log`) |
+| lints | `cargo clippy --all-targets --offline -- -D warnings` (forwarded) | exit 0, **0 warnings** (`sdk-clippy.log`) |
+| formatting | `rustfmt --edition 2024 --check src/{lib,support,runtime}.rs` (forwarded) | clean, `FMT_EXIT:0` (`sdk-fmt.log`) |
+| SDK check | `cargo horizon-mod check` (forwarded) | *"…680 items of the API (…). Made for 0a875da."* (`sdk-check-0.2.14.log`) |
+| package | `rm -f Cargo.lock && cargo horizon-mod build` ×2 | **byte-identical** (`cmp`, `CMP_EXIT:0`), **228,152 B**, SHA-256 `7ace892b5e26622be1b89a8df071283119a59a9a8d135ca1bbfc062ab7a7341a`, **268 entries**, no `Cargo.lock` (`sdk-build-0.2.14-{1,2}.log`, `sdk-build-0.2.14-cmp.log`) |
+| package check | `cargo horizon-mod check refinedstorage.hmod` | `0.2.14 (native-mod, format native-1/0a875da…/e59da909…, for 26.3)`, `CHECK_FILE_EXIT:0` |
+| fits (pin) | `… fits refinedstorage.hmod --build 0a875da` | `0a875da made for`, `FITS_PIN_EXIT:0` |
+| fits (other build) | `… fits refinedstorage.hmod --build 0b14f8a` | `0b14f8a fits`, `FITS_OTHER_EXIT:0` (both after the delivered sha, `sdk-check-fits-0.2.14.log`) |
+| recipe types | `python3 ports/tools/check-recipe-types.py refinedstorage` | `refinedstorage: ok` (`recipe-types-0.2.14.log`) |
+| launcher build | `ports/tools/launcher-game.sh build refinedstorage --rebuild` | exit 0, **`Compiling refinedstorage (1 of 1)`**, `native-0a875da-0312f9b7421e` (`launcher-build-0.2.14.log`); no `native-*` tag carried this mod beforehand |
+| in-game leg | `build-slot.sh run --step e2e -- bash tools/e2e.sh` | **PASS** + **`EXIT:0`** (`e2e-slice14-green.log`) |
+| control (same Nightly, no package) | `GAME=$CONTROL_GAME …` | **FAIL** + `EXIT:1` — *"the block at 41,64,1 is minecraft:air, expected facing=north"* (`e2e-slice14-control.log`) |
+| counterfactual (this slice) | `SELFTEST=external …` | **FAIL** + `EXIT:1` — the old 0-item answer (`e2e-slice14-selftest-external.log`) |
+| log gate | `check-e2e-logs.py refinedstorage-e2e --strict` | `logs=75 ok=75 missing-exit=0 bad-exit=0` |
+| package gate | `verify-sdk-package.py refinedstorage` | **1/1** (120 tests, package matches the tree, no packed lock, R9 clean) |
+
+The new phase, quoted from `e2e-slice14-green.log` (network at 40..44,64,22, chest at
+45,64,22; the drive's one 1k disk stays empty throughout):
+
+```
+  info(44,64,22): External storage at 44,64,22: facing east, 1 resources
+  block(44,64,22): refinedstorage:external_storage[facing=east]
+  info(43,64,22): … online (5 nodes, 1 controller, 1 drive, 1 grid, 1 external storage); 1 disks, 8 items in 1 resources
+  grid view: [{"count":8,"item":"minecraft:stone","slot":300}]
+  the chest after the grid deposit: [{"count":8,"item":"minecraft:stone"},{"count":5,"item":"minecraft:gold_ingot"}]
+  info(43,64,22): … 1 disks, 13 items in 2 resources
+  the chest after the grid withdrawal: [{"count":8,"item":"minecraft:stone"}]
+  info(43,64,22): … 1 disks, 8 items in 1 resources
+  the chest's own stock is now 3; the grid's view follows it
+  info(43,64,22): … 1 disks, 3 items in 1 resources
+  external storage removed: net_items fell by exactly the 3 left in the chest
+  info(43,64,22): … 1 disks, 0 items in 0 resources
+  a chest back behind the same block restores all 8: the stock comes from the faced inventory
+  info(43,64,22): … 1 disks, 8 items in 1 resources
+```
+
+Every assertion has a differential or counterfactual: the empty disk beside the 8
+stones separates the chest's stock from the disks'; the deposit and withdrawal are
+read back from the chest's own container; removing the block drops exactly the 3 the
+chest held; facing air with the block present drops them too; a fresh chest restores
+8; and `SELFTEST=external` asserts the old, no-block answer and fails.
+
+### Coverage (parity rule) — every family this slice ships
+
+| family | state |
+|---|---|
+| the `external_storage` block | **tested** — placed with `facing=east`, read back, counted in the network census, and removed |
+| the faced inventory as network storage | **tested** — 8 stones in the chest counted by `/refinedstorage info` and listed by the grid while the disk held 0 |
+| a deposit through the grid landing in the chest | **tested** — `ctl container` lists 5 gold there and the disk stays empty |
+| a withdrawal through the grid taking it back | **tested** — the chest lists no gold and the player holds 5 |
+| the faced-block differential | **tested** — chest → 3, net_items 3; block removed → 0; block present facing air → 0; fresh chest → 8 |
+| the 6 FE/tick charge | **tested** — unit (`an_external_storage_charges_six_fe_per_tick`) and `info`'s `drawing 30/tick` for grid 10 + drive 14 + external 6 |
+| the recipe | **tested** — `recipe_check.py` crafts it with its declared output/count, consumes `#c:chests` and each other ingredient, and a wrong-ingredient control yields nothing |
+| its item, loot table, model, tag | **carried** — given/placed/read as `refinedstorage:external_storage`; the loot table and models follow the jar's plain variant |
+| the filter GUI, access/fuzzy/void/redstone modes | **not ported** — deviation 2 (no own slots, no widgets) |
+| fluid storage through an external tank | **not ported** — the fluid storage system is still a slice-1 gap |
+| the coloured variants | **not ported** — no colour variants in this port |
+
+### Next slice (from this slice's own gap list)
+
+The **interface** (`refinedstorage:interface`) is the next `machines`-shaped node: like
+external storage it is an `AbstractDirectionalCableBlock`, but it is the *inverse* — it
+makes the network's storage available through the `ITEMS` capability on the side it
+faces, so a machine can pull from the network. The exact gap line is §"Gaps / deviations
+(slice 1)" item 2, unchanged: *"… interfaces, relays, …"*. The in-game assertion would
+put a hopper on the interface's facing side, seed the network's disk with 5 diamonds,
+and `ctl container <hopper>` must list them after a work tick while breaking the
+interface stops the transfer and leaves the disk's 5 untouched.
+
+Skills: superpowers/using-superpowers,brainstorming,writing-plans,test-driven-development,systematic-debugging,verification-before-completion; BeautifulRust/rust-best-practices
+
+Evidence: `ports/_shared/evidence/refinedstorage/` — `plan-slice14-external-storage.md`,
+`runtime-red-slice14-external.log`, `sdk-test.log` (120), `sdk-clippy.log`, `sdk-fmt.log`,
+`sdk-check-0.2.14.log`, `sdk-build-0.2.14-{1,2}.log`, `sdk-build-0.2.14-cmp.log`,
+`sdk-check-fits-0.2.14.log`, `recipe-types-0.2.14.log`, `verify-sdk-package-0.2.14.log`,
+`refinedstorage.hmod` (the delivered bytes) — and
+`ports/_shared/evidence/refinedstorage-e2e/` — `e2e-slice14-green.log`,
+`e2e-slice14-control.log`, `e2e-slice14-selftest-external.log`,
+`launcher-build-0.2.14.log`, `check-e2e-logs-slice14.log`.

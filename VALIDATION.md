@@ -10,7 +10,9 @@ upgrades, slice 9's wireless-grid item buffer, slice 10's block drops that carry
 the broken machine's own slots, slice 11's five disk sizes, slice 12's in-place disk upgrade, and
 slice 13's review-round-two repairs: the placing hand and the payload on unplaced units, the
 insertion and its consumption in one transaction, the break's completion gate, and the two
-operator-only energy writes).
+operator-only energy writes, and slice 14's external storage: the inventory a network node faces
+as network storage, a grid listing it beside an empty disk, and deposits through the grid landing
+in (and withdrawing from) that chest).
 
 Quick reproduction (a build slot is required; see the campaign's AGENTS.md):
 
@@ -35,13 +37,16 @@ cargo horizon-mod fits refinedstorage.hmod --build 0b14f8a   # "fits" (a differe
 # retry the second run after the limit resets.
 ```
 
-The two `check`/`build`/`fits` steps need `BUILD_LOCAL=1` on the slot runner:
-the second build machine has no `cargo-horizon-mod`.
+**All cargo steps forward automatically to the second box (`AdLf-PC`)** — do **not**
+set `BUILD_LOCAL=1`; that was only correct while that box's `cargo-horizon-mod` was
+missing. The forwarded command runs in the port directory on the far box, so pass a
+command without a leading `cd`. The `--offscreen` in-game leg stays local (the far box
+has no renderer); no game leg was forwarded for this slice.
 
 Pin **`0a875da91dbb0fdcb7ba8c42c11341aa229af51a`** + mixins
-`e59da9094f0c2fdda6c627fe9eff22dec6a906f0`. Delivered package (0.2.12):
-`refinedstorage.hmod`, **221,841 B**, SHA-256
-`92858557af7dcf5bd4c88ce4f43a62fc666605c099bc373cfa8a4baa390cc21f`, 260 entries, no packed
+`e59da9094f0c2fdda6c627fe9eff22dec6a906f0`. Delivered package (0.2.14):
+`refinedstorage.hmod`, **228,152 B**, SHA-256
+`7ace892b5e26622be1b89a8df071283119a59a9a8d135ca1bbfc062ab7a7341a`, 268 entries, no packed
 `Cargo.lock`; a copy of the delivered bytes is at
 `ports/_shared/evidence/refinedstorage/refinedstorage.hmod`, which is the file both `fits`
 runs used.
@@ -69,6 +74,11 @@ SELFTEST=diskcap … tools/e2e.sh                                   # flipped 4k
 SELFTEST=upgrade … tools/e2e.sh                                   # flipped: the source part was NOT returned: EXIT:1
 SELFTEST=payload … tools/e2e.sh                                   # flipped: the unplaced unit lost its payload: EXIT:1
 SELFTEST=break … tools/e2e.sh                                     # flipped: a creative break spilled nothing: EXIT:1
+SELFTEST=external … tools/e2e.sh                                  # flipped external storage (0 items, no block): EXIT:1
+# review round two's two remaining phases (evidence only, the same package):
+MODE=full … tools/review2.sh      # a full drive consumes no disk: PASS + EXIT:0
+MODE=refused … tools/review2.sh   # a refused placement keeps the item and its payload: PASS + EXIT:0
+SELFTEST=1 … tools/review2.sh     # each phase's inverted assertion: FAIL + EXIT:1
 python3 ../tools/check-e2e-logs.py refinedstorage-e2e --strict
 ```
 
@@ -164,3 +174,13 @@ wrong-ingredient controls — including, per upgrade file, its own tier's disk a
 part, each yielding nothing). The five earlier selftests (`networks`, `energy`, `itemenergy`, `drops`,
 `diskcap`) were re-run on this package and each still exits 1 on its own assertion; the 62-log gate is
 green.
+
+Slice 14's assertions are `notes.md` §"Slice 14": an external storage placed with
+`facing=east` makes a grid list the 8 stones a chest holds while the drive's one disk stays empty
+(`1 disks, 8 items in 1 resources`); a 5-gold shift-click deposit through that grid lands in the
+**chest** (its container lists 5 gold and the 8 stone) and a withdrawal takes the gold back out;
+reducing the chest to 3 shows 3 on the network, removing the block drops exactly those 3 while the
+disk stays at 0, facing air with the block present also shows 0, and a fresh chest restores 8.
+`SELFTEST=external` asserts the old no-block answer (0 items) and exits 1; the control (same Nightly,
+no package) fails at the first phase. The 75-log `--strict` gate is green and the recipe driver
+crafts all 39 carried recipes.

@@ -58,6 +58,9 @@ const WIRELESS_GRID: &str = "refinedstorage:wireless_grid";
 /// each working on the neighbour its `facing` points at.
 const IMPORTER: &str = "refinedstorage:importer";
 const EXPORTER: &str = "refinedstorage:exporter";
+/// The external storage (slice 14): a network node that exposes the inventory
+/// it faces through the same `ITEMS` capability the transfer machines use.
+const EXTERNAL_STORAGE: &str = "refinedstorage:external_storage";
 /// The range upgrade (slice 6): +8 blocks each, at most four per transmitter
 /// (upstream `RangeUpgradeItem`, registered for `WIRELESS_TRANSMITTER`).
 const RANGE_UPGRADE: &str = "refinedstorage:range_upgrade";
@@ -150,6 +153,7 @@ struct Keys {
     transmitter: BlockKey,
     importer: BlockKey,
     exporter: BlockKey,
+    external_storage: BlockKey,
     /// The five storage disk items, upstream's `ItemStorageVariant`. Which one a
     /// stack is decides its capacity (`runtime::disk_capacity`); a drive takes
     /// any of them.
@@ -177,6 +181,7 @@ impl Keys {
             (self.transmitter, Kind::WirelessTransmitter),
             (self.importer, Kind::Importer),
             (self.exporter, Kind::Exporter),
+            (self.external_storage, Kind::ExternalStorage),
         ]
         .into_iter()
         .find_map(|(key, kind)| (key == block).then_some(kind))
@@ -199,7 +204,11 @@ impl Keys {
             Kind::Importer => Some(self.importer_item),
             Kind::Exporter => Some(self.exporter_item),
             Kind::WirelessTransmitter => Some(self.transmitter_item),
-            Kind::Controller | Kind::Cable | Kind::DiskDrive | Kind::Grid => None,
+            Kind::Controller
+            | Kind::Cable
+            | Kind::DiskDrive
+            | Kind::Grid
+            | Kind::ExternalStorage => None,
         }
     }
 }
@@ -223,6 +232,7 @@ pub(crate) fn register(registrar: &mut dyn Registrar, _cx: &RegistrationContext)
         transmitter: registrar.block_key(TRANSMITTER),
         importer: registrar.block_key(IMPORTER),
         exporter: registrar.block_key(EXPORTER),
+        external_storage: registrar.block_key(EXTERNAL_STORAGE),
         disks: [
             registrar.item_key(DISK),
             registrar.item_key(DISK_4K),
@@ -285,6 +295,7 @@ pub(crate) fn register(registrar: &mut dyn Registrar, _cx: &RegistrationContext)
             TRANSMITTER,
             IMPORTER,
             EXPORTER,
+            EXTERNAL_STORAGE,
         ])
         .build();
     registrar
@@ -1373,6 +1384,118 @@ fn write_back_in(
     }
 }
 
+// --- the external storage (slice 14) ---------------------------------------
+
+/// A network's external storage, read where it lies: the block, the container
+/// it faces, and that container's contents as one unlimited network storage.
+/// The inventory is read live on every use (upstream's external-storage node
+/// watches its source for changes), so a `/data merge` or a player's hand edit
+/// shows up on the next tick without a cache to invalidate.
+struct LiveExternal {
+    target: [i32; 3],
+    side: Face,
+    disk: Disk<Net>,
+}
+
+/// The `facing` state of a block in `level` (the level-aware form of
+/// [`facing_at`]: a wireless grid may read a network in another dimension).
+fn facing_in(host: &dyn Host, level: LevelRef, pos: [i32; 3]) -> Option<Face> {
+    level
+        .block_property(host, pos, "facing")
+        .as_deref()
+        .and_then(Face::from_property)
+}
+
+/// Every external storage of `net`, read from the container each one faces.
+fn live_external(
+    host: &mut dyn ServerHost,
+    level: LevelRef,
+    net: &runtime::Network,
+) -> Vec<LiveExternal> {
+    let mut out = Vec::new();
+    for pos in net.of_kind(Kind::ExternalStorage) {
+        let Some(face) = facing_in(host, level, pos) else {
+            continue;
+        };
+        let target = neighbour(pos, face);
+        let side = face.opposite();
+        let Some(handler) = level.capability(host, &ITEMS, target, Some(direction(side))) else {
+            continue;
+        };
+        let mut entries = Vec::new();
+        for slot in 0..handler.size(host) {
+            let Some(resource) = handler.resource(host, slot) else {
+                continue;
+            };
+            let amount = handler.amount(host, slot);
+            if amount > 0
+                && let Some(stack) = resource.to_stack(amount)
+            {
+                entries.push(Net::of(host, &stack));
+            }
+        }
+        let external = runtime::External::of(entries);
+        out.push(LiveExternal {
+            target,
+            side,
+            disk: external.disk().clone(),
+        });
+    }
+    out
+}
+
+/// The storages the network functions take. External storages come **first**:
+/// the port has no insertion-priority surface, so an empty disk in a drive
+/// would otherwise shadow the chest forever and the block would be inert.
+fn external_disks(live: &[LiveExternal]) -> Vec<Disk<Net>> {
+    live.iter().map(|storage| storage.disk.clone()).collect()
+}
+
+/// The storages the network functions take, external first (see above).
+fn network_disks(live: &[LiveDisk], external: &[LiveExternal]) -> Vec<Disk<Net>> {
+    external_disks(external)
+        .into_iter()
+        .chain(disks_of(live))
+        .collect()
+}
+
+/// Write every external storage whose contents changed back into the container
+/// it faces, inside the caller's transaction. The whole container *is* the
+/// exposed storage, so the write replaces its contents with the resulting
+/// disk's entries — never the pre-change snapshot (that would undo the move)
+/// and never a raw `Items` list on top of the engine's own spill.
+fn write_back_external_in(
+    host: &mut dyn ServerHost,
+    tx: &mod_api::Transaction,
+    level: LevelRef,
+    live: &[LiveExternal],
+    disks: &[Disk<Net>],
+) {
+    for (storage, disk) in live.iter().zip(disks.iter()) {
+        if &storage.disk == disk {
+            continue;
+        }
+        let Some(handler) =
+            level.capability(host, &ITEMS, storage.target, Some(direction(storage.side)))
+        else {
+            continue;
+        };
+        for slot in 0..handler.size(host) {
+            let Some(resource) = handler.resource(host, slot) else {
+                continue;
+            };
+            let amount = handler.amount(host, slot);
+            if amount > 0 {
+                let _ = handler.extract(host, tx, slot, &resource, amount);
+            }
+        }
+        for entry in disk.entries() {
+            let resource = ItemResource::of(entry.stack());
+            let _ = handler.insert_any(host, tx, &resource, entry.count());
+        }
+    }
+}
+
 /// The promises every other view of `net` makes, so this view never shows what
 /// one of them already shows. A view of another network in the same dimension
 /// is not one of them: it holds its own stock.
@@ -1415,7 +1538,9 @@ pub(crate) fn on_menu_clicked(host: &mut dyn ServerHost, event: &MenuClickedEven
     };
     let net = network_in(host, level, binding.pos());
     let live = live_disks(host, level, &net);
-    let mut disks = disks_of(&live);
+    let external = live_external(host, level, &net);
+    let external_count = external.len();
+    let mut disks = network_disks(&live, &external);
     let carried = menu.carried(host).flatten();
     let slot_has = match view_slot {
         Some(index) => open.view.get(index).is_some_and(Option::is_some),
@@ -1460,7 +1585,11 @@ pub(crate) fn on_menu_clicked(host: &mut dyn ServerHost, event: &MenuClickedEven
     };
     let moved = apply_plan(host, &click, &plan, &mut disks);
     if moved {
-        write_back(host, level, &live, &disks);
+        write_back(host, level, &live, &disks[external_count..]);
+        let _ = host.transaction(|host, tx| {
+            write_back_external_in(host, tx, level, &external, &disks[..external_count]);
+            Ok::<(), mod_api::PlayerDataRefusal>(())
+        });
     }
     refresh_menu(host, uuid, window, &binding, level);
 }
@@ -1770,7 +1899,8 @@ fn refresh_menu(
 ) {
     let net = network_in(host, level, binding.pos());
     let live = live_disks(host, level, &net);
-    let disks = disks_of(&live);
+    let external = live_external(host, level, &net);
+    let disks = network_disks(&live, &external);
     let held = promises_elsewhere(
         &net,
         binding.dimension(),
@@ -2070,7 +2200,9 @@ impl BlockPart for Network {
         let block = level.state_block(event.state)?;
         if !matches!(
             Kind::from_block(block),
-            Some(Kind::WirelessTransmitter | Kind::Importer | Kind::Exporter)
+            Some(
+                Kind::WirelessTransmitter | Kind::Importer | Kind::Exporter | Kind::ExternalStorage,
+            )
         ) {
             return None;
         }
@@ -2131,6 +2263,7 @@ impl BlockEntityPart for Network {
                     | Kind::WirelessTransmitter
                     | Kind::Importer
                     | Kind::Exporter
+                    | Kind::ExternalStorage
             )
         );
     }
@@ -2147,6 +2280,7 @@ impl BlockEntityPart for Network {
             Some(kind @ (Kind::Importer | Kind::Exporter)) => {
                 machine_tick(host, pos, kind, &mut event.entity);
             }
+            Some(Kind::ExternalStorage) => external_storage_tick(host, pos),
             None => {}
         }
     }
@@ -2227,7 +2361,7 @@ impl BlockEntityPart for Network {
                     ..Screen::default()
                 })
             }
-            Kind::Controller | Kind::Cable => None,
+            Kind::Controller | Kind::Cable | Kind::ExternalStorage => None,
         }
     }
 }
@@ -2417,8 +2551,9 @@ fn grid_tick(host: &mut dyn ServerHost, pos: [i32; 3], entity: &mut ModBlockEnti
     // The node works only when the network can pay its grid charge: a grid on a
     // 0-FE network is inactive and lists nothing, while the disks keep what they
     // hold (upstream's `calculateActive` + `doWork`).
+    let level = host.level(host.dimension());
     let mut works = false;
-    if online && let Some(level) = host.level(host.dimension()) {
+    if online && let Some(level) = level {
         works = pay(
             host,
             level,
@@ -2430,12 +2565,21 @@ fn grid_tick(host: &mut dyn ServerHost, pos: [i32; 3], entity: &mut ModBlockEnti
     let keys: Vec<DiskKey> = drive_keys(&dimension, &drives);
     // Only the slots the drives already mirror, in the same order, so a
     // change written back lands in the disk it came from.
-    let (used, mut disks): (Vec<DiskKey>, Vec<Disk<Net>>) = with_core(|core| {
+    let (used, drive_disks): (Vec<DiskKey>, Vec<Disk<Net>>) = with_core(|core| {
         keys.iter()
             .filter(|key| core.disks.contains_key(*key))
             .map(|key| (key.clone(), core.disks[key].clone()))
             .unzip()
     });
+    // External storages are read live and come first, so a free disk slot
+    // cannot shadow the inventory the block exposes (no priority surface).
+    let external = level.map_or_else(Vec::new, |level| live_external(host, level, &net));
+    let external_count = external.len();
+    let mut disks: Vec<Disk<Net>> = external
+        .iter()
+        .map(|storage| storage.disk.clone())
+        .chain(drive_disks)
+        .collect();
 
     let mut state = view_state(host, entity);
     let after: Vec<Option<Net>> = (0..GRID_SLOTS)
@@ -2500,7 +2644,7 @@ fn grid_tick(host: &mut dyn ServerHost, pos: [i32; 3], entity: &mut ModBlockEnti
     // disk's component from outside (a `/data merge`, another tool) was replaced
     // by the stale cache one tick later.
     with_core(|core| {
-        for (key, disk) in used.iter().zip(disks.iter()) {
+        for (key, disk) in used.iter().zip(disks[external_count..].iter()) {
             let changed = core.disks.get(key) != Some(disk);
             if changed {
                 core.disks.insert(key.clone(), disk.clone());
@@ -2508,6 +2652,16 @@ fn grid_tick(host: &mut dyn ServerHost, pos: [i32; 3], entity: &mut ModBlockEnti
             }
         }
     });
+    // The external storages' changes go back to the containers they face in
+    // their own transaction; the drive caches above are in-memory only.
+    if external_count > 0
+        && let Some(level) = level
+    {
+        let _ = host.transaction(|host, tx| {
+            write_back_external_in(host, tx, level, &external, &disks[..external_count]);
+            Ok::<(), mod_api::BlockEntityItemError>(())
+        });
+    }
 
     // Rebuild the view: the player's own stacks stay, the rest shows what the
     // network still has once every *other* grid's promise is set aside, in the
@@ -2580,6 +2734,23 @@ fn grid_tick(host: &mut dyn ServerHost, pos: [i32; 3], entity: &mut ModBlockEnti
     if previous != Some(works) {
         host.set_block_property(pos, "active", if works { "true" } else { "false" });
         with_core(|core| core.active.insert((dimension, pos), works));
+    }
+}
+
+/// An external storage's tick (slice 14): pay its 6 FE/tick while its network
+/// is online, as upstream's `doWork` does. The faced inventory itself is read
+/// live by whichever grid or machine is using the network.
+fn external_storage_tick(host: &mut dyn ServerHost, pos: [i32; 3]) {
+    let net = network_at(host, pos);
+    if net.online()
+        && let Some(level) = host.level(host.dimension())
+    {
+        pay(
+            host,
+            level,
+            &net,
+            runtime::usage(Kind::ExternalStorage, Fit::default(), 0),
+        );
     }
 }
 
@@ -2711,7 +2882,9 @@ fn machine_tick(
     }
     let target = neighbour(pos, face);
     let live = live_disks(host, level, &net);
-    let mut disks = disks_of(&live);
+    let external = live_external(host, level, &net);
+    let external_count = external.len();
+    let mut disks = network_disks(&live, &external);
     let work = Work {
         level,
         target,
@@ -2725,7 +2898,8 @@ fn machine_tick(
             Kind::Exporter => exporter_pass(host, tx, &work, &mut disks),
             _ => 0,
         };
-        write_back_in(host, tx, level, &live, &disks);
+        write_back_in(host, tx, level, &live, &disks[external_count..]);
+        write_back_external_in(host, tx, level, &external, &disks[..external_count]);
         Ok::<(), mod_api::PlayerDataRefusal>(())
     });
 }
@@ -3627,15 +3801,21 @@ fn info(host: &mut dyn ServerHost, pos: [i32; 3]) {
     let drives: Vec<[i32; 3]> = net.of_kind(Kind::DiskDrive).collect();
     let (disks, items, resources) = {
         let keys: Vec<DiskKey> = drive_keys(&dimension, &drives);
-        with_core(|core| {
-            let found: Vec<Disk<Net>> = keys
-                .iter()
+        let mut all: Vec<Disk<Net>> = with_core(|core| {
+            keys.iter()
                 .filter_map(|key| core.disks.get(key).cloned())
-                .collect();
-            let items: u64 = found.iter().map(Disk::total).sum();
-            let resources = runtime::aggregate(&found).len();
-            (found.len(), items, resources)
-        })
+                .collect()
+        });
+        let disks = all.len();
+        // An external storage is network storage too: its faced container's
+        // stock is counted in the totals, while `disks` stays the drive's own
+        // census number.
+        if let Some(level) = level {
+            all.extend(external_disks(&live_external(host, level, &net)));
+        }
+        let items: u64 = all.iter().map(Disk::total).sum();
+        let resources = runtime::aggregate(&all).len();
+        (disks, items, resources)
     };
     let online = net.online();
     // The buffer and what the network charges: the control readout a machine
@@ -3668,6 +3848,7 @@ fn info(host: &mut dyn ServerHost, pos: [i32; 3]) {
         (Kind::WirelessTransmitter, "transmitter"),
         (Kind::Importer, "importer"),
         (Kind::Exporter, "exporter"),
+        (Kind::ExternalStorage, "external storage"),
     ] {
         let count = net.count(kind);
         if count > 0 {
@@ -3744,6 +3925,23 @@ fn info(host: &mut dyn ServerHost, pos: [i32; 3]) {
                     "capacity "
                 },
                 found.join(", "),
+            ),
+        );
+    }
+    if kind_at(host, pos) == Some(Kind::ExternalStorage) {
+        let Some(level) = level else {
+            return;
+        };
+        let facing = facing_in(host, level, pos)
+            .map_or_else(|| "none".to_owned(), |face| face.property().to_owned());
+        let resources = live_external(host, level, &net)
+            .first()
+            .map_or(0, |storage| storage.disk.entries().len());
+        feedback(
+            host,
+            &format!(
+                "External storage at {},{},{}: facing {}, {} resources",
+                pos[0], pos[1], pos[2], facing, resources
             ),
         );
     }

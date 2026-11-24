@@ -47,7 +47,8 @@ pub const MAX_RANGE_UPGRADES: u32 = 4;
 pub const CREATIVE_RANGE: u32 = i32::MAX as u32;
 
 /// The network blocks of the port: the slice's four, the wireless transmitter
-/// (slice 3) and the two transfer machines (slice 7).
+/// (slice 3), the two transfer machines (slice 7) and the external storage
+/// (slice 14).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Kind {
     Controller,
@@ -57,6 +58,7 @@ pub enum Kind {
     WirelessTransmitter,
     Importer,
     Exporter,
+    ExternalStorage,
 }
 
 impl Kind {
@@ -70,6 +72,7 @@ impl Kind {
             Kind::WirelessTransmitter => "refinedstorage:wireless_transmitter",
             Kind::Importer => "refinedstorage:importer",
             Kind::Exporter => "refinedstorage:exporter",
+            Kind::ExternalStorage => "refinedstorage:external_storage",
         }
     }
 
@@ -83,6 +86,7 @@ impl Kind {
             Kind::WirelessTransmitter,
             Kind::Importer,
             Kind::Exporter,
+            Kind::ExternalStorage,
         ]
         .into_iter()
         .find(|kind| kind.block_id() == block)
@@ -1015,6 +1019,39 @@ pub fn aggregate<T: Stored>(disks: &[Disk<T>]) -> Vec<T> {
     out
 }
 
+/// The inventory an external storage exposes as one network storage.
+///
+/// The port reads the faced container live on every tick (upstream's
+/// `ExternalStorageNetworkNode` watches its source for changes), so the pure
+/// model only has to say that the whole inventory is one storage with no
+/// ceiling, and that a block facing nothing contributes no resources.
+#[derive(Clone, Debug, PartialEq)]
+pub struct External<T> {
+    disk: Disk<T>,
+}
+
+impl<T: Stored> External<T> {
+    /// Build the exposed storage from the occupied slots of the faced
+    /// container. Two slots of one resource are one entry, as on a disk.
+    pub fn of(entries: impl IntoIterator<Item = T>) -> Self {
+        let mut disk = Disk::unlimited();
+        // `set_entries` trims: empty slots are dropped and two slots of one
+        // resource become one entry, exactly what a grid's view needs.
+        disk.set_entries(entries.into_iter().collect());
+        Self { disk }
+    }
+
+    /// The storage as the network's insert/extract/view functions take it.
+    pub fn disk(&self) -> &Disk<T> {
+        &self.disk
+    }
+
+    /// How many distinct resources the faced inventory exposes.
+    pub fn resources(&self) -> usize {
+        self.disk.entries().len()
+    }
+}
+
 /// Whether a resource's key matches a grid search: a case-insensitive
 /// substring of the item id (`minecraft:diamond` matches `diamond`, `MI`,
 /// `minecraft`).
@@ -1472,6 +1509,10 @@ pub const EXPORTER_USAGE: u32 = 2;
 /// `WIRELESS_TRANSMITTER`).
 pub const TRANSMITTER_USAGE: u32 = 16;
 
+/// What an external storage charges per tick (upstream
+/// `DefaultEnergyUsage.EXTERNAL_STORAGE`).
+pub const EXTERNAL_STORAGE_USAGE: u32 = 6;
+
 /// What each upgrade adds to the holder's charge (upstream `SPEED_UPGRADE`,
 /// `STACK_UPGRADE`, `RANGE_UPGRADE` and `CREATIVE_RANGE_UPGRADE`).
 pub const SPEED_UPGRADE_USAGE: u32 = 4;
@@ -1517,6 +1558,7 @@ pub fn usage(kind: Kind, fit: Fit, disks: u32) -> u32 {
                 + SPEED_UPGRADE_USAGE * fit.speed.min(MAX_SPEED_UPGRADES)
                 + STACK_UPGRADE_USAGE * fit.stack.min(MAX_STACK_UPGRADES)
         }
+        Kind::ExternalStorage => EXTERNAL_STORAGE_USAGE,
     }
 }
 
@@ -1678,7 +1720,11 @@ impl Kind {
         match self {
             Kind::Importer | Kind::Exporter => MACHINE_FILTERS + MACHINE_UPGRADES,
             Kind::WirelessTransmitter => TRANSMITTER_SLOTS,
-            Kind::Controller | Kind::Cable | Kind::DiskDrive | Kind::Grid => 0,
+            Kind::Controller
+            | Kind::Cable
+            | Kind::DiskDrive
+            | Kind::Grid
+            | Kind::ExternalStorage => 0,
         }
     }
 }
@@ -3766,5 +3812,63 @@ mod tests {
         assert!(!may_write_energy(1), "a moderator may not charge");
         assert!(may_write_energy(2), "a game master may");
         assert!(may_write_energy(4), "an owner may");
+    }
+
+    // --- slice 14: the external storage ------------------------------------
+
+    #[test]
+    fn an_external_storage_exposes_what_it_faces() {
+        let external = External::of([TestItem::new("minecraft:stone", 8)]);
+        assert_eq!(
+            external.disk().total(),
+            8,
+            "the chest's stock is on the network"
+        );
+        assert_eq!(external.resources(), 1, "one resource in the faced chest");
+        let disks = [external.disk().clone()];
+        assert_eq!(view(&disks, "", GRID_SLOTS, |_| 64).len(), 1);
+    }
+
+    #[test]
+    fn an_external_storage_facing_air_contributes_nothing() {
+        let external = External::<TestItem>::of([]);
+        assert_eq!(external.disk().total(), 0, "nothing faced, nothing exposed");
+        assert_eq!(external.resources(), 0);
+        let disks = [external.disk().clone()];
+        assert!(view(&disks, "", GRID_SLOTS, |_| 64).is_empty());
+    }
+
+    #[test]
+    fn an_external_storage_merges_slots_of_one_resource() {
+        let external = External::of([
+            TestItem::new("minecraft:stone", 3),
+            TestItem::new("minecraft:stone", 5),
+        ]);
+        assert_eq!(
+            external.resources(),
+            1,
+            "two slots of stone are one resource"
+        );
+        assert_eq!(external.disk().total(), 8);
+    }
+
+    #[test]
+    fn an_external_storage_has_no_capacity_ceiling() {
+        let mut disk = Disk::unlimited();
+        assert_eq!(disk.free(), u64::MAX);
+        assert_eq!(
+            disk.insert(TestItem::new("minecraft:dirt", 100_000)),
+            100_000
+        );
+        assert_eq!(disk.total(), 100_000, "an external storage never refuses");
+    }
+
+    #[test]
+    fn an_external_storage_charges_six_fe_per_tick() {
+        assert_eq!(
+            EXTERNAL_STORAGE_USAGE, 6,
+            "DefaultEnergyUsage.EXTERNAL_STORAGE"
+        );
+        assert_eq!(usage(Kind::ExternalStorage, Fit::default(), 0), 6);
     }
 }
