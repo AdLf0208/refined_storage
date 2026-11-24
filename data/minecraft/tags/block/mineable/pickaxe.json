@@ -6,6 +6,7 @@
     "refinedstorage:machine_casing",
     "refinedstorage:wireless_transmitter",
     "refinedstorage:importer",
-    "refinedstorage:exporter"
+    "refinedstorage:exporter",
+    "refinedstorage:interface"
   ]
 }

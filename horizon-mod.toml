@@ -1,6 +1,6 @@
 id = "refinedstorage"
 name = "Refined Storage"
-version = "0.2.14"
+version = "0.2.15"
 description = """A port of Refined Storage 2.0.9 for Horizon, scoped to the item network core: a
 controller (a network is online when its connected component holds one), a cable with its six
 connection states, a disk drive with nine slots of storage disks, the 1k storage disk (1,024 items,
@@ -41,9 +41,12 @@ disk's own part is returned, and the creative disk is never a target (it has no 
 into). An external storage joins the network on any side and works through its facing side: the
 inventory it faces becomes network storage, so a grid lists what the chest holds and a deposit
 through the grid's menu lands in that chest, while breaking the block or removing the chest drops
-that stock from the network without touching the disks. Crafters, interfaces, relays, the security
-manager, the portable grid, autocrafting and fluid storage are the port's gap list, not this
-version."""
+that stock from the network without touching the disks. An interface exports up to 64 of each
+configured resource per tick from the network into nine intermediate slots that external blocks
+(such as hoppers) take through the `ITEMS` capability on every side, and inserts whatever an external
+block puts back into those slots when the filter does not name it; it charges 4 FE a tick. Crafters,
+relays, the security manager, the portable grid, autocrafting and fluid storage are the port's gap
+list, not this version."""
 authors = ["Refined Mods", "AdLf0208"]
 license = "MIT"
 homepage = "https://github.com/AdLf0208/refinedstorage"

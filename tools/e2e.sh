@@ -2064,7 +2064,12 @@ done
     || fail "the two importer items were not both picked up: $(ctl inventory | jq -c '[.hotbar[], .main[]] | map(select(.item != null))')"
 ctl command "execute in minecraft:the_end run tp @s 47.5 64 15.5" >/dev/null
 ctl wait 4
-ctl select refinedstorage:importer >/dev/null || fail "the payload importers are not in the hotbar"
+for _ in 1 2 3; do
+    ctl select refinedstorage:importer >/dev/null 2>&1 && break
+    ctl wait 4
+done
+ctl select refinedstorage:importer >/dev/null \
+    || fail "the payload importers are not in the hotbar: $(ctl inventory | jq -c '[.hotbar[], .main[]] | map(select(.item != null))')"
 ctl wait 2
 # The client's inventory mirror does not carry this item's components (measured:
 # a payload item reads as a bare `refinedstorage:importer` even while its
@@ -2619,6 +2624,93 @@ charge_net
 expect_info 43 64 22 "1 disks, 8 items in 1 resources"
 echo "  a chest back behind the same block restores all 8: the stock comes from the faced inventory"
 
+echo "== the interface: configured network stock is exposed to a hopper =="
+# Slice 15, from §"Gaps / deviations (slice 1)" item 2: *"… external storage,
+# interfaces, relays, …"*. The jar's `InterfaceBlock extends AbstractBaseBlock`
+# has only `active` (no `facing`), and `ModInitializer` registers its nine
+# exported-resource slots as `ITEMS` on every side (`side` ignored). The filter
+# names up to 64 of a resource per work tick (the item interface export limit),
+# the buffer is what a hopper takes, and the node charges 4 FE/tick. A fresh
+# network at z=20 keeps every earlier phase's total untouched.
+net minecraft:the_end 46 64 20
+ctl command "execute in minecraft:the_end run setblock 46 64 20 refinedstorage:controller"
+ctl command "execute in minecraft:the_end run setblock 47 64 20 refinedstorage:cable"
+ctl command "execute in minecraft:the_end run setblock 48 64 20 refinedstorage:disk_drive"
+ctl command "execute in minecraft:the_end run setblock 49 64 20 refinedstorage:grid"
+ctl command "execute in minecraft:the_end run setblock 50 64 20 refinedstorage:interface"
+ctl command "execute in minecraft:the_end run setblock 50 63 20 minecraft:hopper"
+ctl wait 16
+charge minecraft:the_end 46 64 20
+# One disk with five diamonds, the shape a player's data pack would write.
+ctl command "data merge block 48 64 20 {Items:[{Slot:0b,id:\"refinedstorage:1k_storage_disk\",count:1,components:{\"refinedstorage:storage\":{capacity:1024,stacks:[{id:\"minecraft:diamond\",count:5}]}}}]}"
+ctl wait 8
+charge_net
+expect_state 50 64 20 "active=true"
+expect_reply "refinedstorage info 50 64 20" "1 interface"
+hopper_diamonds() { ctl container 50 63 20 | jq -r '[.slots[] | select(.item == "minecraft:diamond") | .count] | add // 0'; }
+buffer_diamonds() { ctl container 50 64 20 | jq -r '[.slots | to_entries[] | select(.key >= 9 and .value.item == "minecraft:diamond") | .value.count] | add // 0'; }
+echo "  info(49,64,20) before the filter: $(net_items 49 64 20) items (the disk's five diamonds)"
+[ "$(net_items 49 64 20)" = 5 ] || fail "the seeded disk does not hold five diamonds: $(net_items 49 64 20)"
+[ "$(hopper_diamonds)" = 0 ] || fail "the hopper already held diamonds before the filter"
+# An empty filter exports nothing: the hopper stays empty even though the disk
+# holds five. This is the faithful counterpart of the brief's "facing air"
+# counterfactual (the artefact has no facing).
+ctl wait 40
+charge_net
+[ "$(hopper_diamonds)" = 0 ] || fail "an unconfigured interface exported $(hopper_diamonds) diamonds"
+echo "  unconfigured interface: the hopper took nothing while the disk kept five"
+# Configure slot 0 of the filter with one diamond: the interface now exports
+# the resource from the network into its buffer, capped at 64 per work tick.
+ctl container 50 64 20 minecraft:diamond 1 >/dev/null
+ctl wait 8
+charge_net
+echo "  the interface's filtered slots: $(slots 50 64 20)"
+# The hopper takes from the buffer while this runs, so the exact buffer count is
+# timing-dependent; the fail-capable assertion is that the work tick emptied the
+# disk (the five left the network into the interface) and that the hopper below
+# eventually holds all five. With no interface the disk keeps five and the
+# hopper gets none.
+[ "$(net_items 49 64 20)" = 0 ] \
+    || fail "the disk still holds $(net_items 49 64 20) items after the work tick: $(slots 50 64 20)"
+echo "  after the work tick the disk is empty: the five diamonds went into the interface' buffer"
+# A hopper under the interface takes them through the ITEMS capability.
+ctl wait 80
+charge_net
+echo "  the hopper after the transfer: $(ctl container 50 63 20 | jq -c '[.slots[] | select(. != null)]')"
+[ "$(hopper_diamonds)" = 5 ] \
+    || fail "the hopper has $(hopper_diamonds) diamonds, expected the buffer's five"
+echo "  the hopper on the interface's side lists all five after the work ticks"
+# The counterfactual: assert today's (pre-slice) answer — no interface block, so
+# nothing reaches the hopper — now that the working node has delivered all five.
+if [ "$SELFTEST" = interface ]; then
+    echo "(selftest: asserting today's behaviour — no interface, 0 diamonds in the hopper)"
+    [ "$(hopper_diamonds)" = 0 ] \
+        || fail "expected the old no-interface answer (0 diamonds), got $(hopper_diamonds); the network's stock is now exposed"
+fi
+# Break the interface: no transfer, and the disk keeps its own five (seed a new
+# disk after clearing the hopper so the assertion names a fresh stock).
+ctl command "data merge block 50 63 20 {Items:[]}" >/dev/null
+ctl command "execute in minecraft:the_end run setblock 50 64 20 minecraft:air"
+ctl wait 8
+ctl command "data merge block 48 64 20 {Items:[{Slot:0b,id:\"refinedstorage:1k_storage_disk\",count:1,components:{\"refinedstorage:storage\":{capacity:1024,stacks:[{id:\"minecraft:diamond\",count:5}]}}}]}"
+ctl wait 40
+charge_net
+[ "$(hopper_diamonds)" = 0 ] || fail "a broken interface still transferred $(hopper_diamonds) diamonds"
+[ "$(net_items 49 64 20)" = 5 ] || fail "the disk lost its five while the interface was broken: $(net_items 49 64 20)"
+echo "  interface broken: the hopper got nothing and the disk kept its five"
+# Re-place the same block with an empty filter: still nothing, so the positive
+# assertion is not an artifact of the hopper's placement.
+ctl command "execute in minecraft:the_end run setblock 50 64 20 refinedstorage:interface"
+ctl wait 8
+charge_net
+ctl wait 40
+charge_net
+[ "$(hopper_diamonds)" = 0 ] || fail "a re-placed unconfigured interface exported $(hopper_diamonds)"
+echo "  re-placed with no filter: still nothing; the hopper needs the configured resource"
+ctl command "data merge block 50 63 20 {Items:[]}" >/dev/null
+ctl wait 2
+ctl command "execute in minecraft:the_end run tp @s 40.5 64 3.5"
+
 echo "== the disk keeps its contents across a relaunch =="
 net minecraft:the_end 40 64 0
 ctl command "execute in minecraft:the_end run tp @s 42.5 64 2.5"
@@ -2741,5 +2833,5 @@ echo "  the hand after charging a stick: $stick"
 case "$stick" in
     *"refinedstorage:energy"*) fail "a charge wrote an energy component onto a stick: $stick" ;;
 esac
-echo "PASS: the wireless transmitter joined its network through the facing side only (offline facing away, active facing the cable), /refinedstorage info named it and its range 16 blocks, a use 2.5 blocks away and one exactly 16 blocks away were accepted, 17 blocks away was refused naming the distance, an offline transmitter refused and a position without one answered so, a use from the End against the overworld transmitter was refused as a different dimension while the same command under execute in was accepted, the item placed against the clicked face and the block dropped itself, every carried recipe crafts in game with its declared output and count (39 now, each with its wrong-ingredient control), the machine casing places, reads back and drops itself, the wireless grid is unbound until it is used on a transmitter and then names it (dimension and position in its own component), a use inside the range opens the network's 9x6 view with 54 slots, a shift-click in the player inventory deposits 5 diamonds on the network and a shift-click on the view withdraws them back, 17 blocks out is refused naming the distance while 16 blocks out opens the view, the same item and binding is refused as a different dimension from the overworld and accepted in the End, the refinedstorage:wireless advancement is not granted by a transmitter alone and is granted by the grid and a transmitter together, two networks in one dimension each listed their own 3 gold while the other network held 3 too, two grids on one network never offered the same items twice, the cable follows its neighbours and the grid is active with a controller, the disk went into the drive and the grid listed what was deposited through its menu, the search filtered it, a shift-click withdrew the diamonds, breaking the controller took the network offline and putting it back restored the disk's gold, a network without a drive listed nothing, a stick did not enter the drive, a vanilla barrel is not a network block, a range upgrade in the transmitter's own upgrade slot raised its range to 24 blocks so the same 17.0-block use was accepted and the wireless grid opened its view naming 24 blocks, the transmitter's four-slot menu showed the upgrade and refused a diamond, a creative range upgrade gave unlimited range (70.5 blocks out accepted, another dimension still refused), the importer turned on its network moved 3 items in 20 ticks without an upgrade and emptied its source in one pass with a stack upgrade (64 in 20 ticks), four speed upgrades made the same 20 ticks move a stack and /refinedstorage info named the upgrade counts and the work interval (9 ticks down to 1), its filter blocked the resource it names while an empty filter imported everything, the exporter moved exactly the 4 gold its filter names into the chest it faces and an exporter with no filter moved nothing, a machine menu showed its 13 slots and its upgrade row refused a diamond, both machine items were given and read back, both machine blocks dropped themselves, the wireless grid's own 1,000 FE buffer fell by exactly 5 on the open, 5 on a deposit and 5 on a withdrawal with no drift over ticks, and at 0 item FE the same deposit was refused for the item's energy while the network stayed online and still printed its own energy line, a survival break of the importer carried its four speed upgrades, its stack upgrade and its dirt filter entry on the item with none of them spilled beside it and the re-placed machine listed every slot where it was, a broken transmitter's four range upgrades travelled the same way, a 4k disk cut a saved 5,000-item component to its own 4,096 and refused the 4,097th item deposited through the grid while its total stayed 4,096 over a 20-tick window, a 16k disk held 16,384 and a 64k disk 65,536, the creative disk took the same 1-item deposit the full 64k disk refused and kept ingesting past 65,536 with its readout saying unlimited, a 4k disk holding 4,096 cobblestone and a 16k storage part made a 16k disk in a crafting table with the 4k disk's contents and the destination's 16,384-item room, the 4k disk was consumed and its own 4k part came back in the cell it left, the crafted disk read 4096/16384 items in the drive and the network totalled 4,096, and the 1k disk's 3 gold and a 4k disk's 4,096 items both kept their contents across a relaunch, placing one of a stack of two payload importers left one item in the hand still carrying its own payload and each placement made a machine with all six slots where they were, a creative break spilled all five slot items on the ground, dropped no machine item and left no importer behind, and /refinedstorage charge and /refinedstorage energy were refused for a level-0 LAN guest that ran the mod's own level-0 info command first, without moving either buffer, while the owner's charge worked and a stick was refused as not a wireless grid with no energy component written, an external storage facing a chest with 8 stones made a grid list them next to an empty disk, a 5-gold deposit through the grid landed in that chest and a withdrawal took it back out, and removing the block or its faced chest dropped exactly the chest's remaining stock from the network while a fresh chest restored all 8"
+echo "PASS: the wireless transmitter joined its network through the facing side only (offline facing away, active facing the cable), /refinedstorage info named it and its range 16 blocks, a use 2.5 blocks away and one exactly 16 blocks away were accepted, 17 blocks away was refused naming the distance, an offline transmitter refused and a position without one answered so, a use from the End against the overworld transmitter was refused as a different dimension while the same command under execute in was accepted, the item placed against the clicked face and the block dropped itself, every carried recipe crafts in game with its declared output and count (40 now, each with its wrong-ingredient control), the machine casing places, reads back and drops itself, the wireless grid is unbound until it is used on a transmitter and then names it (dimension and position in its own component), a use inside the range opens the network's 9x6 view with 54 slots, a shift-click in the player inventory deposits 5 diamonds on the network and a shift-click on the view withdraws them back, 17 blocks out is refused naming the distance while 16 blocks out opens the view, the same item and binding is refused as a different dimension from the overworld and accepted in the End, the refinedstorage:wireless advancement is not granted by a transmitter alone and is granted by the grid and a transmitter together, two networks in one dimension each listed their own 3 gold while the other network held 3 too, two grids on one network never offered the same items twice, the cable follows its neighbours and the grid is active with a controller, the disk went into the drive and the grid listed what was deposited through its menu, the search filtered it, a shift-click withdrew the diamonds, breaking the controller took the network offline and putting it back restored the disk's gold, a network without a drive listed nothing, a stick did not enter the drive, a vanilla barrel is not a network block, a range upgrade in the transmitter's own upgrade slot raised its range to 24 blocks so the same 17.0-block use was accepted and the wireless grid opened its view naming 24 blocks, the transmitter's four-slot menu showed the upgrade and refused a diamond, a creative range upgrade gave unlimited range (70.5 blocks out accepted, another dimension still refused), the importer turned on its network moved 3 items in 20 ticks without an upgrade and emptied its source in one pass with a stack upgrade (64 in 20 ticks), four speed upgrades made the same 20 ticks move a stack and /refinedstorage info named the upgrade counts and the work interval (9 ticks down to 1), its filter blocked the resource it names while an empty filter imported everything, the exporter moved exactly the 4 gold its filter names into the chest it faces and an exporter with no filter moved nothing, a machine menu showed its 13 slots and its upgrade row refused a diamond, both machine items were given and read back, both machine blocks dropped themselves, the wireless grid's own 1,000 FE buffer fell by exactly 5 on the open, 5 on a deposit and 5 on a withdrawal with no drift over ticks, and at 0 item FE the same deposit was refused for the item's energy while the network stayed online and still printed its own energy line, a survival break of the importer carried its four speed upgrades, its stack upgrade and its dirt filter entry on the item with none of them spilled beside it and the re-placed machine listed every slot where it was, a broken transmitter's four range upgrades travelled the same way, a 4k disk cut a saved 5,000-item component to its own 4,096 and refused the 4,097th item deposited through the grid while its total stayed 4,096 over a 20-tick window, a 16k disk held 16,384 and a 64k disk 65,536, the creative disk took the same 1-item deposit the full 64k disk refused and kept ingesting past 65,536 with its readout saying unlimited, a 4k disk holding 4,096 cobblestone and a 16k storage part made a 16k disk in a crafting table with the 4k disk's contents and the destination's 16,384-item room, the 4k disk was consumed and its own 4k part came back in the cell it left, the crafted disk read 4096/16384 items in the drive and the network totalled 4,096, and the 1k disk's 3 gold and a 4k disk's 4,096 items both kept their contents across a relaunch, placing one of a stack of two payload importers left one item in the hand still carrying its own payload and each placement made a machine with all six slots where they were, a creative break spilled all five slot items on the ground, dropped no machine item and left no importer behind, and /refinedstorage charge and /refinedstorage energy were refused for a level-0 LAN guest that ran the mod's own level-0 info command first, without moving either buffer, while the owner's charge worked and a stick was refused as not a wireless grid with no energy component written, an external storage facing a chest with 8 stones made a grid list them next to an empty disk, a 5-gold deposit through the grid landed in that chest and a withdrawal took it back out, and removing the block or its faced chest dropped exactly the chest's remaining stock from the network while a fresh chest restored all 8, an interface with a diamond in its filter moved the five diamonds from the disk into its nine-slot buffer in one work tick and a hopper beneath the interface listed all five through the ITEMS capability, an unconfigured interface moved nothing, breaking the interface stopped the transfer while a freshly seeded disk kept its five, and re-placing it without a filter still moved nothing"
 # The cleanup trap prints EXIT:<status> as the last line.

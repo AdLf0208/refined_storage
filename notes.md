@@ -3551,3 +3551,211 @@ Evidence: `ports/_shared/evidence/refinedstorage/` — `plan-slice14-external-st
 `ports/_shared/evidence/refinedstorage-e2e/` — `e2e-slice14-green.log`,
 `e2e-slice14-control.log`, `e2e-slice14-selftest-external.log`,
 `launcher-build-0.2.14.log`, `check-e2e-logs-slice14.log`.
+
+## Slice 15 — the interface (2026-11-24) — version 0.2.15
+
+### The gap line this slice answers (verbatim)
+
+§"Gaps / deviations (slice 1)" item 2: *"The rest of the mod does not exist: crafters,
+exporters/importers, external storage, **interfaces**, relays, …"*, as slice 14 left it after
+carrying external storage. Class `content` / tier **deep**, shape **machines**: one network node,
+a nine-slot filter, a nine-slot exposed buffer and a 4 FE/tick charge are below the tier. No new
+hook, no new pin API, no entity and no renderer. MIT, ours on `main` → **Update 0.2.15** (0.2.14
+is staged on PR #1666). Pin `0a875da91dbb0fdcb7ba8c42c11341aa229af51a` + mixins
+`e59da9094f0c2fdda6c627fe9eff22dec6a906f0`, SDK `0a875da`, game 26.3. Rust steps were forwarded
+to `AdLf-PC` (no `BUILD_LOCAL=1`); the `--offscreen` game leg stayed local.
+
+### The artefact wins over the brief's prose
+
+The brief described the interface as "the inverse of external storage … an
+`AbstractDirectionalCableBlock`-shaped node … on its facing side … the 6 FE/tick charge already
+proved", and told this slice to read the jar first rather than infer. The 2.0.9 artefact
+(`refinedmods/refinedstorage2`, commit `0dec63affe8147702b020843c22748483ef18c01`, MIT) says:
+
+| question | the brief's prose | the artefact (authority) | what the port carries |
+|---|---|---|---|
+| block shape | `AbstractDirectionalCableBlock`, a facing side | `InterfaceBlock extends AbstractBaseBlock`, only `active`; `blockstates/interface.json` has `active=true/false` and no `facing` | an `active`-only block, no facing |
+| exposed slots | network storage through `ITEMS` | nine *intermediate/exported-resource* slots, registered as `ITEMS` (`ModInitializer`: `registerBlockEntity(ItemHandler.BLOCK, InterfaceBlockEntity, (be, side) -> new InvWrapper(be.getExportedResourcesAsContainer()))` — `side` ignored, so **all six sides**); a separate nine-slot filter names what to export | 18 block-container slots: nine filter entries and nine buffer slots; hoppers reach the buffer row on every face, never the filter row |
+| transfer rate | not stated | `ItemResourceType.getInterfaceExportLimit() = 64` per resource per work tick; "instantly exports" (docs), no upgrade interval | up to 64 per slot per tick |
+| network cost | 6 FE/tick | `DefaultEnergyUsage.INTERFACE = 4` (6 is `EXTERNAL_STORAGE` and `DISK_INTERFACE`) | 4 FE/tick, charged like every other node |
+| upgrade | — | autocrafting (max 1) | **not ported** — `blocked(no-autocrafting-system)`: needs a crafting-task queue |
+
+**`blocked(no-interface-facing)`** is recorded, not faked: the jar's `InterfaceBlock` declares no
+`facing` state and the `ITEMS` capability ignores the side, so there is no side to face at air. The
+faithful counterpart of the brief's "facing air transfers nothing" differential is an interface
+whose filter is empty — an unconfigured slot exports nothing, which the in-game leg asserts. The
+6 FE/tick in the brief was the external storage's charge; this node costs 4.
+
+### What the jar says about the slots, and how the port models them
+
+`InterfaceBlockEntity` has `EXPORT_SLOTS = 9`: a `FilterWithFuzzyMode` over a nine-slot
+`ResourceContainer` (the top row, what to export) and an `ExportedResourcesContainer` (the bottom
+row, the intermediate slots external blocks take from). `InterfaceNetworkNode.doWork` visits each
+slot every tick: fill the exported amount up to the requested amount (capped by the 64-item item
+export limit) by extracting from the network's root storage, return overflow to the network, and
+insert what an external block put into an unconfigured slot. Fuzzy mode and the exporting
+indicators are GUI state this port's mod screens have no widget for.
+
+- **runtime.rs** (tests first): `Kind::Interface`, `INTERFACE_USAGE = 4` (in `usage`),
+  `INTERFACE_SLOTS = 9`, `INTERFACE_EXPORT_LIMIT = 64`, and the pure `interface_plan(want,
+  exported, available, quota)` → `InterfaceStep::{Nothing, Extract, Return}`, which is the
+  fill/return rule above. `Kind::Interface.own_slots()` is 18 (nine plus nine).
+- **support.rs**: the block in the mod's one block-entity type, an 18-slot `block_container`
+  (filter 0..9, buffer 9..18; all six faces reach only the buffer row, the menu is
+  `minecraft:generic_9x2`), a 9+9 `Screen` layout, `interface_tick` (pay 4 FE, set `active`, run
+  one fill/return pass per slot against the live network disks in one transaction), and the
+  network census/readout in `/refinedstorage info`.
+- **Content** (from the jar, MIT): the block declaration (`active`, stone template), its two
+  blockstate variants, the cube-all active/inactive models, both 16×16 textures, the item model,
+  loot table, pickaxe tag, `interfaces` item tag, the `UIU/RMR/UEU` recipe in the pin's
+  `"id"`/`"#tag"` shape, lang keys and the creative-tab entry.
+
+### Deviations (recorded, not defects)
+
+1. **No facing.** The artefact has none; see `blocked(no-interface-facing)` above. The interface
+   is not a `AbstractDirectionalCableBlock` and cannot be "faced at air".
+2. **The exposed `ITEMS` container is the buffer, not the whole network.** External blocks see the
+   nine intermediate slots; the network's disks appear there only as the configured resource is
+   exported into them, capped at 64 per tick. Upstream is the same — the interface is not external
+   storage. The brief's "inverse" analogy does not hold for the jar.
+3. **No filter GUI toggles** (fuzzy mode, exporting indicators, redstone mode) and no autocrafting
+   upgrade: the pin's mod screens have no widgets and there is no crafting queue.
+4. **A broken interface drops its slots through the engine's container spill**, not on its item:
+   upstream's `getDrops()` returns the exported resources and upgrades as loose items, which the
+   engine's spill already does. The port does not add it to the `carries_contents` route (that
+   route is for machines whose slots must travel *on* the item).
+5. **Energy is charged but not gated per slot.** The 4 FE/tick is paid and `active` darkens when
+   the network cannot pay; there is no per-resource charge.
+
+### Red proof — the rules as tests, before the implementation
+
+`ports/_shared/evidence/refinedstorage/runtime-red-slice15-interface.log`, against stubs
+(`interface_plan` always `Nothing`, `INTERFACE_USAGE = 0`): **6 failed of 128**:
+
+```
+---- runtime::tests::an_interface_charges_four_fe_per_tick stdout ----
+assertion `left == right` failed: DefaultEnergyUsage.INTERFACE (not EXTERNAL_STORAGE's 6)
+  left: 0
+ right: 4
+---- runtime::tests::an_interface_export_is_capped_by_the_transfer_quota stdout ----
+assertion `left == right` failed: ItemResourceType.getInterfaceExportLimit() is 64 for items
+  left: Nothing
+ right: Extract { key: "minecraft:diamond", amount: 64 }
+---- runtime::tests::an_interface_exports_a_requested_resource_from_the_network stdout ----
+assertion `left == right` failed: the five diamonds on the disk fill the empty buffer slot
+  left: Nothing
+ right: Extract { key: "minecraft:diamond", amount: 5 }
+---- runtime::tests::an_interface_refills_only_what_the_hopper_drained stdout ----
+assertion `left == right` failed: the buffer already holds three of the five
+  left: Nothing
+ right: Extract { key: "minecraft:diamond", amount: 2 }
+---- runtime::tests::an_interface_returns_a_replaced_resource stdout ----
+assertion `left == right` failed: a filter change returns the old resource before exporting the new one
+  left: Nothing
+ right: Return { key: "minecraft:diamond", amount: 5 }
+---- runtime::tests::an_interface_returns_a_resource_the_filter_no_longer_wants stdout ----
+assertion `left == right` failed: what an external block put in an unconfigured slot goes back to the network
+  left: Nothing
+ right: Return { key: "minecraft:diamond", amount: 5 }
+```
+
+Honest note: `an_interface_with_no_filter_exports_nothing` and
+`an_interface_exposes_nine_slots_in_each_row` were already green against the stubs (an empty
+filter is trivially empty and the slot counts are constants); they stay as regression guards. One
+test of my own was wrong in the first green run — `an_interface_refills_only_what_the_hopper_drained`
+passed `available = 5` while the buffer already held three, which the rule correctly answered as
+five more; the test now passes `available = 2` (three of the five are already in the buffer).
+
+### Green — the ladder and the in-game leg (one launcher build at `0a875da`)
+
+| Step | Command | Result |
+|---|---|---|
+| runtime + glue tests | `cargo test --offline` (forwarded) | **128 passed**, 0 failed (`sdk-test.log`, regenerated for 0.2.15) |
+| lints | `cargo clippy --all-targets --offline -- -D warnings` (forwarded) | exit 0, **0 warnings** (`sdk-ladder-0.2.15.log`) |
+| formatting | `rustfmt --edition 2024 --check src/{lib,support,runtime}.rs` (forwarded) | clean (`sdk-ladder-0.2.15.log`) |
+| SDK check | `cargo horizon-mod check` (forwarded) | *"…680 items of the API (5 Part kinds, 2 associated items, 5 capabilitys, 23 hooks …). Made for 0a875da."* (`sdk-check-fits-0.2.15.log`) |
+| package | `rm -f Cargo.lock && cargo horizon-mod build` ×2 | **byte-identical** (`CMP_EXIT:0`), **238,015 B**, SHA-256 `78574d1a0ebe985e9bc7e4879821cac31d9fbff1882cbf5fb68052408d55785b`, **278 entries**, no `Cargo.lock` (`sdk-build-0.2.15-{1,2}.log`) |
+| package check | `cargo horizon-mod check refinedstorage.hmod` | `0.2.15 (native-mod, format native-1/0a875da…/e59da909…, for 26.3)`, `CHECK_FILE_EXIT:0` |
+| fits (pin) | `… fits refinedstorage.hmod --build 0a875da` | `0a875da made for`, `FITS_PIN_EXIT:0` |
+| fits (other build) | `… fits refinedstorage.hmod --build 0b14f8a` | `0b14f8a fits`, `FITS_OTHER_EXIT:0` (both after the delivered sha, `sdk-check-fits-0.2.15.log`) |
+| recipe types | `python3 ports/tools/check-recipe-types.py refinedstorage` | `refinedstorage: ok` |
+| launcher build | `ports/tools/launcher-game.sh build refinedstorage --rebuild` | exit 0, **`Compiling refinedstorage (1 of 1)`**, `native-0a875da-5c2cc14dd68f` (`launcher-build-0.2.15.log`); the stale `native-0a875da-0312f9b7421e` tag carrying this mod was removed first |
+| in-game leg | `build-slot.sh run --step e2e -- bash tools/e2e.sh` | **PASS** + **`EXIT:0`** (`e2e-slice15-green.log`), 40 of 40 recipes crafted |
+| control (same Nightly, no package) | `GAME=$CONTROL_GAME …` | **FAIL** + `EXIT:1` — *"the block at 41,64,1 is minecraft:air, expected facing=north"* (`e2e-slice15-control.log`) |
+| counterfactual (this slice) | `SELFTEST=interface …` | **FAIL** + `EXIT:1` — *"expected the old no-interface answer (0 diamonds), got 5; the network's stock is now exposed"* (`e2e-slice15-selftest-interface.log`) |
+| log gate | `check-e2e-logs.py refinedstorage-e2e --strict` | `logs=80 ok=80 missing-exit=0 bad-exit=0`, exit 0 |
+| package gate | `verify-sdk-package.py refinedstorage` | **1/1** (128 tests, package matches the tree, no packed lock, R9 clean) |
+
+The new phase, quoted from `e2e-slice15-green.log` (network at 46..50,64,20, hopper in the floor at
+50,63,20; the drive's one 1k disk starts with 5 diamonds):
+
+```
+== the interface: configured network stock is exposed to a hopper ==
+  block(50,64,20): refinedstorage:interface[active=true]
+  info(49,64,20): online (7 nodes, 2 controller, 1 drive, 1 grid, 1 interface); 1 disks, 5 items in 1 resources; drawing 28/tick
+Interface at 50,64,20: 0 filter entries, 0 exported []
+  info(49,64,20) before the filter: 5 items (the disk's five diamonds)
+  unconfigured interface: the hopper took nothing while the disk kept five
+  the interface's filtered slots: [{"count":1,"item":"minecraft:diamond"},{"count":2,"item":"minecraft:diamond"}]
+  after the work tick the disk is empty: the five diamonds went into the interface' buffer
+  the hopper after the transfer: [{"count":5,"item":"minecraft:diamond"}]
+  interface broken: the hopper got nothing and the disk kept its five
+  re-placed with no filter: still nothing; the hopper needs the configured resource
+```
+
+Every assertion has a differential or counterfactual: the five diamonds move
+from disk → buffer → hopper only with a configured filter (an unconfigured
+interface exports nothing, and a re-placed one with no filter still exports
+nothing); breaking the interface stops the transfer while a freshly seeded disk
+keeps its five; `SELFTEST=interface` asserts the old, no-interface answer (0
+diamonds in the hopper) *after* the working node delivered five, and exits 1;
+the control (the same Nightly with no package) fails at the first phase. Two
+earlier green-leg attempts were lost to unrelated flakes and are kept as
+`e2e-slice15-green-flake1.log` (slice 13's `ctl select` during an Ender Dragon
+kill) and `e2e-slice15-green-flake2.log` (a timing-sensitive buffer-count
+assertion, replaced by the disk-empty assertion above); neither is counted as
+exit evidence for this slice.
+
+### Coverage (parity rule) — every family this slice ships
+
+| family | state |
+|---|---|
+| the `interface` block | **tested** — placed, read back with `active=true`, counted in the network census, broken |
+| nine exported slots exposed as `ITEMS` | **tested** — a hopper under the interface lists the five diamonds the network exported, while an empty filter and a broken interface transfer nothing |
+| nine filter entries | **tested** — a diamond in slot 0 makes the export happen; without it, the buffer stays empty |
+| the 64-per-tick transfer quota | **tested** — unit `an_interface_export_is_capped_by_the_transfer_quota`; the five-diamond leg is below the cap |
+| the return rule | **unit-tested** — `an_interface_returns_a_resource_the_filter_no_longer_wants` and `an_interface_returns_a_replaced_resource`; no GUI toggle in the leg (deviation 3) |
+| the 4 FE/tick charge | **tested** — unit `an_interface_charges_four_fe_per_tick`; `active=true` only while the network can pay |
+| the recipe | **tested** — `recipe_check.py` crafts `refinedstorage:interface` with its declared output/count and ingredients consumed, with a wrong-ingredient control |
+| its item, loot table, models, tag | **carried** — given/placed/read as `refinedstorage:interface`; the loot table follows the jar's plain variant |
+| `blocked(no-interface-facing)` | **blocked** — no `facing` state in `InterfaceBlock` and the `ITEMS` capability ignores the side; the empty-filter differential replaces the brief's "facing air" assertion |
+| autocrafting upgrade, fuzzy mode, exporting indicators | **not ported** — deviation 3 |
+| fluid interface / disk interface | **not ported** — the fluid storage system is still a slice-1 gap |
+
+### Next slice (from this slice's own gap list)
+
+The **relay** (`refinedstorage:relay`) is the next `machines`-shaped node from the same gap line
+(*"… interfaces, **relays**, …"*). The artefact gives two network nodes in one block:
+`RelayInputNetworkNode` and `RelayOutputNetworkNode` join network A through the input face and
+network B through the output face (`RelayInputConnectionStrategy`/`RelayOutputConnectionStrategy`),
+and `DefaultEnergyUsage.RELAY_INPUT_NETWORK = RELAY_OUTPUT_NETWORK = 8` is charged per half. Its
+pass-through toggles (storage, energy, security, autocrafting, patterns) are GUI side buttons the
+pin's mod screens cannot draw, so the port would carry the storage pass-through and record the
+others as deviations — reading the jar first rather than guessing. The parent surface this needs
+is the port's own multi-network model (slice 5's root-keyed `Promises`, slice 14's live external
+disks), not a foreign mod. The in-game assertion would build two networks with disks holding 3 gold
+and 5 diamonds respectively, place a relay bridging them, and assert on each grid's view and
+`/refinedstorage info` that the output network gained exactly the configured resource while the
+input network lost it; breaking the relay reverses the result. The concrete `ctl` reads are
+`ctl screen` on each grid and `ctl messages` after `/refinedstorage info <pos>`, with the disk
+counts asserted as parsed numbers.
+
+Skills: superpowers/using-superpowers,brainstorming,writing-plans,test-driven-development,systematic-debugging,verification-before-completion; BeautifulRust/rust-best-practices
+
+Evidence: `ports/_shared/evidence/refinedstorage/` — `plan-slice15-interface.md`,
+`runtime-red-slice15-interface.log`, `sdk-test.log` (128), `sdk-ladder-0.2.15.log`,
+`sdk-build-0.2.15-{1,2}.log`, `sdk-check-fits-0.2.15.log`, `refinedstorage.hmod` (the delivered
+bytes) — and `ports/_shared/evidence/refinedstorage-e2e/` — `launcher-build-0.2.15.log`
+(`Compiling refinedstorage (1 of 1)`, `native-0a875da-5c2cc14dd68f`),
+`e2e-slice15-green.log`, `e2e-slice15-control.log`, `e2e-slice15-selftest-interface.log`,
+`check-e2e-logs-slice15.log`.

@@ -44,9 +44,9 @@ command without a leading `cd`. The `--offscreen` in-game leg stays local (the f
 has no renderer); no game leg was forwarded for this slice.
 
 Pin **`0a875da91dbb0fdcb7ba8c42c11341aa229af51a`** + mixins
-`e59da9094f0c2fdda6c627fe9eff22dec6a906f0`. Delivered package (0.2.14):
-`refinedstorage.hmod`, **228,152 B**, SHA-256
-`7ace892b5e26622be1b89a8df071283119a59a9a8d135ca1bbfc062ab7a7341a`, 268 entries, no packed
+`e59da9094f0c2fdda6c627fe9eff22dec6a906f0`. Delivered package (0.2.15):
+`refinedstorage.hmod`, **238,015 B**, SHA-256
+`78574d1a0ebe985e9bc7e4879821cac31d9fbff1882cbf5fb68052408d55785b`, 278 entries, no packed
 `Cargo.lock`; a copy of the delivered bytes is at
 `ports/_shared/evidence/refinedstorage/refinedstorage.hmod`, which is the file both `fits`
 runs used.
@@ -75,6 +75,7 @@ SELFTEST=upgrade … tools/e2e.sh                                   # flipped: t
 SELFTEST=payload … tools/e2e.sh                                   # flipped: the unplaced unit lost its payload: EXIT:1
 SELFTEST=break … tools/e2e.sh                                     # flipped: a creative break spilled nothing: EXIT:1
 SELFTEST=external … tools/e2e.sh                                  # flipped external storage (0 items, no block): EXIT:1
+SELFTEST=interface … tools/e2e.sh                                 # flipped interface (0 diamonds in hopper): EXIT:1
 # review round two's two remaining phases (evidence only, the same package):
 MODE=full … tools/review2.sh      # a full drive consumes no disk: PASS + EXIT:0
 MODE=refused … tools/review2.sh   # a refused placement keeps the item and its payload: PASS + EXIT:0
@@ -184,3 +185,19 @@ disk stays at 0, facing air with the block present also shows 0, and a fresh che
 `SELFTEST=external` asserts the old no-block answer (0 items) and exits 1; the control (same Nightly,
 no package) fails at the first phase. The 75-log `--strict` gate is green and the recipe driver
 crafts all 39 carried recipes.
+
+Slice 15's assertions are `notes.md` §"Slice 15": an interface with one diamond in its filter moves
+the five diamonds a disk holds into its nine-slot buffer in one work tick, and a hopper beneath the
+interface lists all five through the `ITEMS` capability; with no filter the hopper takes nothing
+(the faithful counterpart of the brief's "facing air" assertion — the 2.0.9 block has no facing),
+breaking the interface stops the transfer while a freshly seeded disk keeps its five, and a
+re-placed unconfigured interface still moves nothing. `SELFTEST=interface` asserts the old,
+no-interface answer (0 diamonds in the hopper) and exits 1; the control (same Nightly, no package)
+fails at the first phase. The `--strict` log gate is green and the recipe driver crafts all 40
+carried recipes, including `refinedstorage:interface`.
+
+The artefact wins over this brief's prose: the interface has only `active` (no `facing`), exposes
+nine intermediate slots on all six sides through the `ITEMS` capability, transfers up to 64 of a
+resource per tick, and costs **4** FE/tick (`DefaultEnergyUsage.INTERFACE`), not the brief's 6
+(that is `EXTERNAL_STORAGE`). `blocked(no-interface-facing)` records the gap with its surface
+evidence instead of faking a side.

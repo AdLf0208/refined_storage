@@ -61,6 +61,9 @@ const EXPORTER: &str = "refinedstorage:exporter";
 /// The external storage (slice 14): a network node that exposes the inventory
 /// it faces through the same `ITEMS` capability the transfer machines use.
 const EXTERNAL_STORAGE: &str = "refinedstorage:external_storage";
+/// The interface (slice 15): nine intermediate storage slots exposed as `ITEMS`
+/// on every side, into which the network exports its configured resources.
+const INTERFACE: &str = "refinedstorage:interface";
 /// The range upgrade (slice 6): +8 blocks each, at most four per transmitter
 /// (upstream `RangeUpgradeItem`, registered for `WIRELESS_TRANSMITTER`).
 const RANGE_UPGRADE: &str = "refinedstorage:range_upgrade";
@@ -113,6 +116,15 @@ const MACHINE_SLOTS: usize = FILTER_SLOTS + MACHINE_UPGRADES;
 /// The importer's and exporter's menus (the package's own content menu types).
 const IMPORTER_MENU: &str = "refinedstorage:importer";
 const EXPORTER_MENU: &str = "refinedstorage:exporter";
+/// The interface's filter row and buffer row are eighteen slots, which the
+/// pin's generic 9x2 menu shows (upstream's `InterfaceContainerMenu` has the
+/// same two rows of nine).
+const INTERFACE_MENU: &str = "minecraft:generic_9x2";
+/// The interface's buffer slots in its block container: the first nine are the
+/// filter entries (the row an external hopper must not reach), the next nine
+/// the exported resources the whole `ITEMS` container exposes.
+const INTERFACE_FILTER_SLOTS: usize = runtime::INTERFACE_SLOTS;
+const INTERFACE_SLOTS: usize = runtime::INTERFACE_SLOTS * 2;
 
 /// The saved compound key the grid's view marks live under.
 const VIEW_KEY: &str = "RefinedStorageView";
@@ -154,6 +166,7 @@ struct Keys {
     importer: BlockKey,
     exporter: BlockKey,
     external_storage: BlockKey,
+    interface: BlockKey,
     /// The five storage disk items, upstream's `ItemStorageVariant`. Which one a
     /// stack is decides its capacity (`runtime::disk_capacity`); a drive takes
     /// any of them.
@@ -182,6 +195,7 @@ impl Keys {
             (self.importer, Kind::Importer),
             (self.exporter, Kind::Exporter),
             (self.external_storage, Kind::ExternalStorage),
+            (self.interface, Kind::Interface),
         ]
         .into_iter()
         .find_map(|(key, kind)| (key == block).then_some(kind))
@@ -208,7 +222,8 @@ impl Keys {
             | Kind::Cable
             | Kind::DiskDrive
             | Kind::Grid
-            | Kind::ExternalStorage => None,
+            | Kind::ExternalStorage
+            | Kind::Interface => None,
         }
     }
 }
@@ -233,6 +248,7 @@ pub(crate) fn register(registrar: &mut dyn Registrar, _cx: &RegistrationContext)
         importer: registrar.block_key(IMPORTER),
         exporter: registrar.block_key(EXPORTER),
         external_storage: registrar.block_key(EXTERNAL_STORAGE),
+        interface: registrar.block_key(INTERFACE),
         disks: [
             registrar.item_key(DISK),
             registrar.item_key(DISK_4K),
@@ -296,6 +312,7 @@ pub(crate) fn register(registrar: &mut dyn Registrar, _cx: &RegistrationContext)
             IMPORTER,
             EXPORTER,
             EXTERNAL_STORAGE,
+            INTERFACE,
         ])
         .build();
     registrar
@@ -363,6 +380,35 @@ pub(crate) fn register(registrar: &mut dyn Registrar, _cx: &RegistrationContext)
         };
         registrar.block_container(&block, container);
     }
+    // The interface (slice 15): nine filter entries, then nine intermediate
+    // storage slots. Upstream exposes only the exported-resources container as
+    // `ITEMS` (`ModInitializer` registers an `InvWrapper` over
+    // `getExportedResourcesAsContainer()` on every side, `side` ignored), so a
+    // hopper reaches the buffer row on all six faces and never the filter row.
+    // The artefact has no `facing` state (`InterfaceBlock extends
+    // AbstractBaseBlock`), which the port records as `blocked(no-interface-facing)`.
+    let all: Vec<usize> = (0..INTERFACE_SLOTS).collect();
+    let buffer: Vec<usize> = (INTERFACE_FILTER_SLOTS..INTERFACE_SLOTS).collect();
+    #[expect(
+        clippy::needless_update,
+        reason = "the update is for a field a later game build may add"
+    )]
+    let container = ModContainer {
+        slots: INTERFACE_SLOTS,
+        faces: [
+            buffer.clone(),
+            buffer.clone(),
+            buffer.clone(),
+            buffer.clone(),
+            buffer.clone(),
+            buffer.clone(),
+        ],
+        inputs: all.clone(),
+        outputs: all,
+        menu: Some(INTERFACE_MENU.to_owned()),
+        ..ModContainer::default()
+    };
+    registrar.block_container(&keys.interface, container);
     // The transmitter's four upgrade slots (upstream `UpgradeContainer`,
     // `WirelessTransmitterBlockEntity`) and the menu that shows them.
     let upgrades: Vec<usize> = (0..TRANSMITTER_SLOTS).collect();
@@ -2264,6 +2310,7 @@ impl BlockEntityPart for Network {
                     | Kind::Importer
                     | Kind::Exporter
                     | Kind::ExternalStorage
+                    | Kind::Interface
             )
         );
     }
@@ -2281,6 +2328,7 @@ impl BlockEntityPart for Network {
                 machine_tick(host, pos, kind, &mut event.entity);
             }
             Some(Kind::ExternalStorage) => external_storage_tick(host, pos),
+            Some(Kind::Interface) => interface_tick(host, pos, &mut event.entity),
             None => {}
         }
     }
@@ -2349,6 +2397,27 @@ impl BlockEntityPart for Network {
                     .collect();
                 slots.extend(
                     (0..MACHINE_UPGRADES).map(|index| Some([8.0 + 18.0 * index as f32, 40.0])),
+                );
+                Some(Screen {
+                    width: 176.0,
+                    height: 133.0,
+                    slots,
+                    inventory_y: 84.0,
+                    inventory_x: 8.0,
+                    own_labels: false,
+                    own_background: false,
+                    ..Screen::default()
+                })
+            }
+            Kind::Interface => {
+                // Upstream's `InterfaceScreen`: the nine configured resources
+                // in the top row, the nine intermediate slots below them.
+                let mut slots: Vec<Option<[f32; 2]>> = (0..runtime::INTERFACE_SLOTS)
+                    .map(|index| Some([8.0 + 18.0 * index as f32, 16.0]))
+                    .collect();
+                slots.extend(
+                    (0..runtime::INTERFACE_SLOTS)
+                        .map(|index| Some([8.0 + 18.0 * index as f32, 40.0])),
                 );
                 Some(Screen {
                     width: 176.0,
@@ -2752,6 +2821,102 @@ fn external_storage_tick(host: &mut dyn ServerHost, pos: [i32; 3]) {
             runtime::usage(Kind::ExternalStorage, Fit::default(), 0),
         );
     }
+}
+
+/// An interface's tick (slice 15): pay its 4 FE/tick while the network is
+/// online, set `active` from that gate, then run one work pass per slot.
+///
+/// Upstream's `InterfaceNetworkNode.doWork` fills the nine intermediate slots
+/// from the network with what the filter names (up to the 64-item item export
+/// limit), returns what the filter no longer names, and inserts what an
+/// external block put into an unconfigured slot — all instantly, with no
+/// upgrade interval. The buffer itself is the `ITEMS` container a hopper sees,
+/// read here from the block entity's own nine buffer slots.
+fn interface_tick(host: &mut dyn ServerHost, pos: [i32; 3], entity: &mut ModBlockEntityView<'_>) {
+    let net = network_at(host, pos);
+    let mut active = false;
+    if net.online()
+        && let Some(level) = host.level(host.dimension())
+    {
+        active = pay(
+            host,
+            level,
+            &net,
+            runtime::usage(Kind::Interface, Fit::default(), 0),
+        );
+    }
+    let key = (host.dimension().to_owned(), pos);
+    let previous = with_core(|core| core.active.get(&key).copied());
+    if previous != Some(active) {
+        host.set_block_property(pos, "active", if active { "true" } else { "false" });
+        with_core(|core| core.active.insert(key, active));
+    }
+    if !active {
+        return;
+    }
+    let Some(level) = host.level(host.dimension()) else {
+        return;
+    };
+
+    // The network's storages, without this block's own buffer: extracting from
+    // the buffer would just move items from a slot back into itself.
+    let live = live_disks(host, level, &net);
+    let external = live_external(host, level, &net);
+    let external_count = external.len();
+    let mut disks = network_disks(&live, &external);
+
+    let wanted: Vec<Option<String>> = (0..runtime::INTERFACE_SLOTS)
+        .map(|slot| {
+            entity.items[slot]
+                .as_ref()
+                .map(|stack| resource_key(host, stack))
+        })
+        .collect();
+    for (slot, want) in wanted.iter().enumerate() {
+        let buffer = INTERFACE_FILTER_SLOTS + slot;
+        let exported = entity.items[buffer]
+            .as_ref()
+            .map(|stack| (resource_key(host, stack), stack.count()));
+        let available = want
+            .as_deref()
+            .map_or(0, |key| runtime::amount(&disks, key) as u32);
+        let plan = runtime::interface_plan(
+            want.as_deref(),
+            exported.as_ref().map(|(key, count)| (key.as_str(), *count)),
+            available,
+            runtime::INTERFACE_EXPORT_LIMIT,
+        );
+        match plan {
+            runtime::InterfaceStep::Nothing => {}
+            runtime::InterfaceStep::Extract { key, amount } => {
+                let Some(got) = runtime::extract(&mut disks, &key, amount) else {
+                    continue;
+                };
+                let taken = got.count();
+                entity.items[buffer] = Some(match exported {
+                    Some((_, held)) => {
+                        let mut stack = got.owned();
+                        let _ = stack.set_count(held + taken);
+                        stack
+                    }
+                    None => got.owned(),
+                });
+            }
+            runtime::InterfaceStep::Return { key: _, amount: _ } => {
+                let Some(stack) = entity.items[buffer].clone() else {
+                    continue;
+                };
+                let put = Net::of(host, &stack);
+                entity.items[buffer] = runtime::insert(&mut disks, put).map(Net::owned);
+            }
+        }
+    }
+
+    let _ = host.transaction(|host, tx| {
+        write_back_in(host, tx, level, &live, &disks[external_count..]);
+        write_back_external_in(host, tx, level, &external, &disks[..external_count]);
+        Ok::<(), mod_api::PlayerDataRefusal>(())
+    });
 }
 
 /// A transmitter's tick: `active` is whether the network it joins has a
@@ -3849,6 +4014,7 @@ fn info(host: &mut dyn ServerHost, pos: [i32; 3]) {
         (Kind::Importer, "importer"),
         (Kind::Exporter, "exporter"),
         (Kind::ExternalStorage, "external storage"),
+        (Kind::Interface, "interface"),
     ] {
         let count = net.count(kind);
         if count > 0 {
@@ -3942,6 +4108,34 @@ fn info(host: &mut dyn ServerHost, pos: [i32; 3]) {
             &format!(
                 "External storage at {},{},{}: facing {}, {} resources",
                 pos[0], pos[1], pos[2], facing, resources
+            ),
+        );
+    }
+    if kind_at(host, pos) == Some(Kind::Interface) {
+        let Some(level) = host.level(host.dimension()) else {
+            return;
+        };
+        let Some(entity) = host.block_entity(level, pos) else {
+            return;
+        };
+        let filters: Vec<String> = (0..INTERFACE_FILTER_SLOTS as u32)
+            .filter_map(|slot| entity.item_slot(host, slot).ok().flatten())
+            .map(|stack| stack.item().id(host).to_owned())
+            .collect();
+        let exported: Vec<String> = (INTERFACE_FILTER_SLOTS as u32..INTERFACE_SLOTS as u32)
+            .filter_map(|slot| entity.item_slot(host, slot).ok().flatten())
+            .map(|stack| format!("{}:{}", stack.item().id(host), stack.count()))
+            .collect();
+        feedback(
+            host,
+            &format!(
+                "Interface at {},{},{}: {} filter entries, {} exported [{}]",
+                pos[0],
+                pos[1],
+                pos[2],
+                filters.len(),
+                exported.len(),
+                exported.join(", ")
             ),
         );
     }

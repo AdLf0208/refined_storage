@@ -46,9 +46,17 @@ pub const MAX_RANGE_UPGRADES: u32 = 4;
 /// `Integer.MAX_VALUE`, which no finite distance exceeds.
 pub const CREATIVE_RANGE: u32 = i32::MAX as u32;
 
+/// The interface's intermediate storage slots (upstream `EXPORT_SLOTS = 9` in
+/// `InterfaceBlockEntity`); its filter has the same nine entries.
+pub const INTERFACE_SLOTS: usize = 9;
+
+/// The most of one resource an interface slot transfers in a work tick
+/// (upstream `ItemResourceType.getInterfaceExportLimit() = 64`).
+pub const INTERFACE_EXPORT_LIMIT: u32 = 64;
+
 /// The network blocks of the port: the slice's four, the wireless transmitter
-/// (slice 3), the two transfer machines (slice 7) and the external storage
-/// (slice 14).
+/// (slice 3), the two transfer machines (slice 7), the external storage
+/// (slice 14) and the interface (slice 15).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Kind {
     Controller,
@@ -59,6 +67,7 @@ pub enum Kind {
     Importer,
     Exporter,
     ExternalStorage,
+    Interface,
 }
 
 impl Kind {
@@ -73,6 +82,7 @@ impl Kind {
             Kind::Importer => "refinedstorage:importer",
             Kind::Exporter => "refinedstorage:exporter",
             Kind::ExternalStorage => "refinedstorage:external_storage",
+            Kind::Interface => "refinedstorage:interface",
         }
     }
 
@@ -87,6 +97,7 @@ impl Kind {
             Kind::Importer,
             Kind::Exporter,
             Kind::ExternalStorage,
+            Kind::Interface,
         ]
         .into_iter()
         .find(|kind| kind.block_id() == block)
@@ -98,6 +109,7 @@ impl Kind {
         match self {
             Kind::Importer => Some("Importer"),
             Kind::Exporter => Some("Exporter"),
+            Kind::Interface => Some("Interface"),
             _ => None,
         }
     }
@@ -1052,6 +1064,68 @@ impl<T: Stored> External<T> {
     }
 }
 
+/// One slot's transfer in an interface work tick (upstream
+/// `InterfaceNetworkNode.updateSlot`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum InterfaceStep {
+    /// Nothing moves: both the filter and the buffer slot are empty, or the
+    /// buffer already holds the requested amount.
+    Nothing,
+    /// Take `amount` of `key` from the network into the buffer slot.
+    Extract { key: String, amount: u32 },
+    /// Put `amount` of `key` from the buffer slot back into the network.
+    Return { key: String, amount: u32 },
+}
+
+/// What one interface slot does in a work tick. `want` is the filter entry's
+/// resource (`None` for an unconfigured slot), `exported` is what the buffer slot
+/// currently holds, `available` is how much of `want` the network holds, and
+/// `quota` is the item interface export limit (64 for items).
+///
+/// Upstream's `InterfaceNetworkNode.updateSlot`: fill the buffer up to the
+/// requested amount (capped by the quota), return what the filter no longer
+/// wants, and insert what an external block put into an unconfigured slot.
+pub fn interface_plan(
+    want: Option<&str>,
+    exported: Option<(&str, u32)>,
+    available: u32,
+    quota: u32,
+) -> InterfaceStep {
+    match (want, exported) {
+        (None, None) => InterfaceStep::Nothing,
+        (None, Some((key, amount))) => InterfaceStep::Return {
+            key: key.to_owned(),
+            amount,
+        },
+        (Some(want), None) => {
+            let amount = quota.min(available);
+            if amount == 0 {
+                InterfaceStep::Nothing
+            } else {
+                InterfaceStep::Extract {
+                    key: want.to_owned(),
+                    amount,
+                }
+            }
+        }
+        (Some(want), Some((key, held))) if key != want => InterfaceStep::Return {
+            key: key.to_owned(),
+            amount: held,
+        },
+        (Some(want), Some((_, held))) => {
+            let amount = quota.saturating_sub(held).min(available);
+            if amount == 0 {
+                InterfaceStep::Nothing
+            } else {
+                InterfaceStep::Extract {
+                    key: want.to_owned(),
+                    amount,
+                }
+            }
+        }
+    }
+}
+
 /// Whether a resource's key matches a grid search: a case-insensitive
 /// substring of the item id (`minecraft:diamond` matches `diamond`, `MI`,
 /// `minecraft`).
@@ -1513,6 +1587,10 @@ pub const TRANSMITTER_USAGE: u32 = 16;
 /// `DefaultEnergyUsage.EXTERNAL_STORAGE`).
 pub const EXTERNAL_STORAGE_USAGE: u32 = 6;
 
+/// What an interface charges per tick (upstream `DefaultEnergyUsage.INTERFACE`;
+/// the external storage's 6 is a different node).
+pub const INTERFACE_USAGE: u32 = 4;
+
 /// What each upgrade adds to the holder's charge (upstream `SPEED_UPGRADE`,
 /// `STACK_UPGRADE`, `RANGE_UPGRADE` and `CREATIVE_RANGE_UPGRADE`).
 pub const SPEED_UPGRADE_USAGE: u32 = 4;
@@ -1559,6 +1637,7 @@ pub fn usage(kind: Kind, fit: Fit, disks: u32) -> u32 {
                 + STACK_UPGRADE_USAGE * fit.stack.min(MAX_STACK_UPGRADES)
         }
         Kind::ExternalStorage => EXTERNAL_STORAGE_USAGE,
+        Kind::Interface => INTERFACE_USAGE,
     }
 }
 
@@ -1725,6 +1804,7 @@ impl Kind {
             | Kind::DiskDrive
             | Kind::Grid
             | Kind::ExternalStorage => 0,
+            Kind::Interface => INTERFACE_SLOTS * 2,
         }
     }
 }
@@ -3870,5 +3950,107 @@ mod tests {
             "DefaultEnergyUsage.EXTERNAL_STORAGE"
         );
         assert_eq!(usage(Kind::ExternalStorage, Fit::default(), 0), 6);
+    }
+
+    // --- slice 15: the interface -------------------------------------------
+
+    const DIAMOND: &str = "minecraft:diamond";
+
+    #[test]
+    fn an_interface_exports_a_requested_resource_from_the_network() {
+        assert_eq!(
+            interface_plan(Some(DIAMOND), None, 5, INTERFACE_EXPORT_LIMIT),
+            InterfaceStep::Extract {
+                key: DIAMOND.to_owned(),
+                amount: 5,
+            },
+            "the five diamonds on the disk fill the empty buffer slot"
+        );
+    }
+
+    #[test]
+    fn an_interface_export_is_capped_by_the_transfer_quota() {
+        assert_eq!(
+            interface_plan(Some(DIAMOND), None, 100, INTERFACE_EXPORT_LIMIT),
+            InterfaceStep::Extract {
+                key: DIAMOND.to_owned(),
+                amount: 64,
+            },
+            "ItemResourceType.getInterfaceExportLimit() is 64 for items"
+        );
+    }
+
+    #[test]
+    fn an_interface_refills_only_what_the_hopper_drained() {
+        assert_eq!(
+            interface_plan(Some(DIAMOND), Some((DIAMOND, 3)), 2, INTERFACE_EXPORT_LIMIT),
+            InterfaceStep::Extract {
+                key: DIAMOND.to_owned(),
+                amount: 2,
+            },
+            "three of the five are already in the buffer, so the network holds two"
+        );
+    }
+
+    #[test]
+    fn an_interface_with_no_filter_exports_nothing() {
+        assert_eq!(
+            interface_plan(None, None, 5, INTERFACE_EXPORT_LIMIT),
+            InterfaceStep::Nothing,
+            "an unconfigured slot has no resource to export"
+        );
+    }
+
+    #[test]
+    fn an_interface_returns_a_resource_the_filter_no_longer_wants() {
+        assert_eq!(
+            interface_plan(None, Some((DIAMOND, 5)), 0, INTERFACE_EXPORT_LIMIT),
+            InterfaceStep::Return {
+                key: DIAMOND.to_owned(),
+                amount: 5,
+            },
+            "what an external block put in an unconfigured slot goes back to the network"
+        );
+    }
+
+    #[test]
+    fn an_interface_returns_a_replaced_resource() {
+        assert_eq!(
+            interface_plan(
+                Some("minecraft:stone"),
+                Some((DIAMOND, 5)),
+                8,
+                INTERFACE_EXPORT_LIMIT
+            ),
+            InterfaceStep::Return {
+                key: DIAMOND.to_owned(),
+                amount: 5,
+            },
+            "a filter change returns the old resource before exporting the new one"
+        );
+    }
+
+    #[test]
+    fn an_interface_charges_four_fe_per_tick() {
+        assert_eq!(
+            INTERFACE_USAGE, 4,
+            "DefaultEnergyUsage.INTERFACE (not EXTERNAL_STORAGE's 6)"
+        );
+        assert_eq!(usage(Kind::Interface, Fit::default(), 0), 4);
+    }
+
+    #[test]
+    fn an_interface_exposes_nine_slots_in_each_row() {
+        assert_eq!(INTERFACE_SLOTS, 9, "InterfaceBlockEntity.EXPORT_SLOTS");
+        assert_eq!(
+            Kind::Interface.own_slots(),
+            18,
+            "nine filter entries plus nine buffer slots"
+        );
+        assert_eq!(Kind::Interface.block_id(), "refinedstorage:interface");
+        assert_eq!(
+            Kind::from_block("refinedstorage:interface"),
+            Some(Kind::Interface)
+        );
     }
 }
